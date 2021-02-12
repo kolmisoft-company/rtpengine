@@ -32,11 +32,13 @@ struct sdp_ng_flags {
 	sockaddr_t parsed_received_from;
 	sockaddr_t parsed_media_address;
 	str direction[2];
+	str interface;
 	sockfamily_t *address_family;
 	int tos;
 	str record_call_str;
 	str metadata;
 	str label;
+	str to_label;
 	str address;
 	sockaddr_t xmlrpc_callback;
 	GQueue codec_strip;
@@ -109,6 +111,7 @@ struct sdp_ng_flags {
 	             loop_protect:1,
 	             original_sendrecv:1,
 	             single_codec:1,
+		     allow_transcoding:1,
 	             inject_dtmf:1,
 	             t38_decode:1,
 	             t38_force:1,
@@ -173,6 +176,10 @@ const char *call_stop_media_ng(bencode_item_t *, bencode_item_t *);
 const char *call_play_dtmf_ng(bencode_item_t *, bencode_item_t *);
 void ng_call_stats(struct call *call, const str *fromtag, const str *totag, bencode_item_t *output,
 		struct call_stats *totals);
+const char *call_publish_ng(bencode_item_t *, bencode_item_t *);
+const char *call_subscribe_request_ng(bencode_item_t *, bencode_item_t *);
+const char *call_subscribe_answer_ng(bencode_item_t *, bencode_item_t *);
+const char *call_unsubscribe_ng(bencode_item_t *, bencode_item_t *);
 
 int call_interfaces_init(void);
 void call_interfaces_free(void);
