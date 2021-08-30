@@ -1660,11 +1660,15 @@ static void ng_stats_media(bencode_item_t *list, const struct call_media *m,
 		goto stats;
 
 	dict = bencode_list_add_dictionary(list);
+	
+	const struct rtp_payload_type *rtp_pt = __rtp_stats_codec((struct call_media *)m);
 
 	bencode_dictionary_add_integer(dict, "index", m->index);
 	bencode_dictionary_add_str(dict, "type", &m->type);
 	if (m->protocol)
 		bencode_dictionary_add_string(dict, "protocol", m->protocol->name);
+	if (rtp_pt)
+		bencode_dictionary_add_string(dict, "codec", &rtp_pt->encoding_with_params);
 
 	streams = bencode_dictionary_add_list(dict, "streams");
 
