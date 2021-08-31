@@ -1632,7 +1632,7 @@ static void media_packet_rtp(struct packet_handler_ctx *phc)
 		if (G_UNLIKELY(!rtp_s) || G_UNLIKELY(rtp_s->payload_type != phc->payload_type))
 			rtp_s = g_hash_table_lookup(phc->mp.stream->rtp_stats, GINT_TO_POINTER(phc->payload_type));
 		if (!rtp_s) {
-			ilog(LOG_WARNING | LOG_FLAG_LIMIT,
+			ilog(LOG_NOTICE | LOG_FLAG_LIMIT,
 					"RTP packet with unknown payload type %u received from %s%s%s",
 					phc->payload_type,
 					FMT_M(endpoint_print_buf(&phc->mp.fsin)));
