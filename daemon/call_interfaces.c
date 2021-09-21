@@ -1691,7 +1691,7 @@ static void ng_stats_media(bencode_item_t *list, const struct call_media *m,
 	bencode_item_t *dict, *streams = NULL, *flags;
 	GList *l;
 	struct packet_stream *ps;
-	onst struct rtp_payload_type *rtp_pt = NULL;
+	const struct rtp_payload_type *rtp_pt = NULL;
 
 	if (!list)
 		goto stats;
