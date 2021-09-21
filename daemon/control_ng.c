@@ -38,13 +38,16 @@ const char *ng_command_strings[NGC_COUNT] = {
 	"ping", "offer", "answer", "delete", "query", "list", "start recording",
 	"stop recording", "start forwarding", "stop forwarding", "block DTMF",
 	"unblock DTMF", "block media", "unblock media", "play media", "stop media",
-	"play DTMF", "statistics",
+	"play DTMF", "statistics", "silence media", "unsilence media",
+	"publish", "subscribe request",
+	"subscribe answer", "unsubscribe",
 };
 const char *ng_command_strings_short[NGC_COUNT] = {
 	"Ping", "Offer", "Answer", "Delete", "Query", "List", "StartRec",
 	"StopRec", "StartFwd", "StopFwd", "BlkDTMF",
 	"UnblkDTMF", "BlkMedia", "UnblkMedia", "PlayMedia", "StopMedia",
-	"PlayDTMF", "Stats",
+	"PlayDTMF", "Stats", "SlnMedia", "UnslnMedia",
+	"Pub", "SubReq", "SubAns", "Unsub",
 };
 
 static void timeval_update_request_time(struct request_time *request, const struct timeval *offer_diff) {
@@ -282,6 +285,14 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 			errstr = call_unblock_media_ng(dict, resp);
 			command = NGC_UNBLOCK_MEDIA;
 			break;
+		case CSH_LOOKUP("silence media"):
+			errstr = call_silence_media_ng(dict, resp);
+			command = NGC_SILENCE_MEDIA;
+			break;
+		case CSH_LOOKUP("unsilence media"):
+			errstr = call_unsilence_media_ng(dict, resp);
+			command = NGC_UNSILENCE_MEDIA;
+			break;
 		case CSH_LOOKUP("play media"):
 			errstr = call_play_media_ng(dict, resp);
 			command = NGC_PLAY_MEDIA;
@@ -297,6 +308,22 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 		case CSH_LOOKUP("statistics"):
 			errstr = statistics_ng(dict, resp);
 			command = NGC_STATISTICS;
+			break;
+		case CSH_LOOKUP("publish"):
+			errstr = call_publish_ng(dict, resp, addr, sin);
+			command = NGC_PUBLISH;
+			break;
+		case CSH_LOOKUP("subscribe request"):
+			errstr = call_subscribe_request_ng(dict, resp);
+			command = NGC_SUBSCRIBE_REQ;
+			break;
+		case CSH_LOOKUP("subscribe answer"):
+			errstr = call_subscribe_answer_ng(dict, resp);
+			command = NGC_SUBSCRIBE_ANS;
+			break;
+		case CSH_LOOKUP("unsubscribe"):
+			errstr = call_unsubscribe_ng(dict, resp);
+			command = NGC_UNSUBSCRIBE;
 			break;
 		default:
 			errstr = "Unrecognized command";

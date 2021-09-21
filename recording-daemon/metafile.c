@@ -73,7 +73,7 @@ static void meta_stream_interface(metafile_t *mf, unsigned long snum, char *cont
 	if (output_enabled && output_mixed) {
 		pthread_mutex_lock(&mf->mix_lock);
 		if (!mf->mix) {
-			mf->mix_out = output_new(output_dir, mf->parent, "mix");
+			mf->mix_out = output_new(output_dir, mf->parent, "mix", "mix");
 			if (mix_method == MM_CHANNELS)
 				mf->mix_out->channel_mult = MIX_NUM_INPUTS;
 			mf->mix = mix_new();
@@ -149,7 +149,6 @@ static void meta_ptime(metafile_t *mf, unsigned long mnum, int ptime)
 	mf->media_ptimes[mnum] = ptime;
 }
 
-
 // mf is locked
 static void meta_metadata(metafile_t *mf, char *content) {
 	mf->metadata = g_string_chunk_insert(mf->gsc, content);
@@ -192,6 +191,8 @@ static void meta_section(metafile_t *mf, char *section, char *content, unsigned 
 		mf->forwarding_on = u ? 1 : 0;
 	else if (sscanf_match(section, "STREAM %lu FORWARDING %u", &lu, &u) == 2)
 		stream_forwarding_on(mf, lu, u);
+	else if (!strcmp(section, "OUTPUT_DESTINATION"))
+		mf->output_dest = g_string_chunk_insert(mf->gsc, content);
 }
 
 

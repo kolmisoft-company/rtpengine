@@ -234,28 +234,14 @@ void statistics_update_oneway(struct call* c) {
 			}
 			if (found) { break; }
 		}
+
 		if (!found)
 			ps = NULL;
-		found = 0;
 
-		if (ml->active_dialogue) {
-			// --- go through partner ml and search the RTP
-			for (k = ml->active_dialogue->medias.head; k; k = k->next) {
-				md = k->data;
-
-				for (o = md->streams.head; o; o = o->next) {
-					ps2 = o->data;
-					if (PS_ISSET(ps2, RTP)) {
-						// --- only RTP is interesting
-						found = 1;
-						break;
-					}
-				}
-				if (found) { break; }
-			}
+		if (ps) {
+			struct sink_handler *sh = g_queue_peek_head(&ps->rtp_sinks);
+			ps2 = sh ? sh->sink : NULL;
 		}
-		if (!found)
-			ps2 = NULL;
 
 		if (ps && ps2 && atomic64_get(&ps2->stats.packets)==0) {
 			if (atomic64_get(&ps->stats.packets)!=0 && IS_OWN_CALL(c)){
@@ -502,7 +488,7 @@ GQueue *statistics_gather_metrics(void) {
 	HEADER("totalstatistics", "Total statistics (does not include current running sessions):");
 	HEADER("{", "");
 
-	METRIC("uptime", "Uptime of rtpengine", "%llu", "%llu seconds", (unsigned long long) time(NULL)-rtpe_totalstats.started);
+	METRIC("uptime", "Uptime of rtpengine", "%llu", "%llu seconds", (long long) rtpe_now.tv_sec-rtpe_totalstats.started);
 	PROM("uptime_seconds", "gauge");
 
 	METRIC("managedsessions", "Total managed sessions", UINT64F, UINT64F, num_sessions);

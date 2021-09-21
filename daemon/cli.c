@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <glib.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "poller.h"
 #include "aux.h"
@@ -571,14 +572,19 @@ static void cli_incoming_list_callid(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw, "--- Tag '" STR_FORMAT "', type: %s, label '" STR_FORMAT "', "
 				"branch '" STR_FORMAT "', "
 				"callduration "
-				"%ld.%06ld, in dialogue with '" STR_FORMAT "'\n",
+				"%ld.%06ld\n",
 			STR_FMT(&ml->tag), get_tag_type_text(ml->tagtype),
 			STR_FMT(ml->label.s ? &ml->label : &STR_EMPTY),
 			STR_FMT(&ml->viabranch),
 			tim_result_duration.tv_sec,
-			tim_result_duration.tv_usec,
-			ml->active_dialogue ? (int) ml->active_dialogue->tag.len : 6,
-			ml->active_dialogue ? ml->active_dialogue->tag.s : "(none)");
+			tim_result_duration.tv_usec);
+
+		for (GList *sub = ml->subscriptions.head; sub; sub = sub->next) {
+			struct call_subscription *cs = sub->data;
+			struct call_monologue *csm = cs->monologue;
+			cw->cw_printf(cw, "---     subscribed to '" STR_FORMAT_M "'\n",
+					STR_FMT_M(&csm->tag));
+		}
 
 		for (k = ml->medias.head; k; k = k->next) {
 			md = k->data;
@@ -1071,7 +1077,7 @@ static void cli_incoming_kslist(str *instr, struct cli_writer *cw) {
 	cw->cw_printf(cw, "\n");
 }
 
-static void cli_incoming_active_standby(struct cli_writer *cw, int foreign) {
+static void cli_incoming_active_standby(struct cli_writer *cw, bool foreign) {
 	GHashTableIter iter;
 	gpointer key, value;
 
@@ -1095,10 +1101,10 @@ static void cli_incoming_active_standby(struct cli_writer *cw, int foreign) {
 	cw->cw_printf(cw, "Ok, all calls set to '%s'\n", foreign ? "foreign (standby)" : "owned (active)");
 }
 static void cli_incoming_active(str *instr, struct cli_writer *cw) {
-	cli_incoming_active_standby(cw, 0);
+	cli_incoming_active_standby(cw, false);
 }
 static void cli_incoming_standby(str *instr, struct cli_writer *cw) {
-	cli_incoming_active_standby(cw, 1);
+	cli_incoming_active_standby(cw, true);
 }
 
 static void cli_incoming_debug(str *instr, struct cli_writer *cw) {
@@ -1263,7 +1269,8 @@ static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw) {
 
 	str subsys = STR_NULL;
 	if (instr->len && (instr->s[0] < '0' || instr->s[0] > '9'))
-		str_token_sep(&subsys, instr, ' ');
+		if (str_token_sep(&subsys, instr, ' '))
+			subsys = STR_NULL;
 
 	if (!instr->len) {
 		cw->cw_printf(cw, "%s\n", "More parameters required.");

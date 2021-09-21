@@ -162,6 +162,7 @@ static codec_def_t __codec_defs[] = {
 		.bits_per_sample = 8,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
+		.silence_pattern = STR_CONST_INIT("\xd5"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
@@ -178,6 +179,7 @@ static codec_def_t __codec_defs[] = {
 		.bits_per_sample = 8,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
+		.silence_pattern = STR_CONST_INIT("\xff"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
@@ -210,6 +212,7 @@ static codec_def_t __codec_defs[] = {
 		.bits_per_sample = 8,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
+		.silence_pattern = STR_CONST_INIT("\xfa"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
@@ -351,6 +354,7 @@ static codec_def_t __codec_defs[] = {
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
 		.init = opus_init,
+		.format_cmp = format_cmp_ignore,
 		.set_enc_options = opus_set_enc_options,
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
@@ -1231,6 +1235,7 @@ encoder_t *encoder_new(void) {
 	encoder_t *ret = g_slice_alloc0(sizeof(*ret));
 	format_init(&ret->requested_format);
 	format_init(&ret->actual_format);
+	ret->avpkt = av_packet_alloc();
 	return ret;
 }
 
@@ -1303,6 +1308,9 @@ int encoder_config_fmtp(encoder_t *enc, const codec_def_t *def, int bitrate, int
 
 	encoder_close(enc);
 
+	if (ptime <= 0)
+		ptime = 20;
+
 	enc->requested_format = *requested_format;
 	enc->def = def;
 	enc->ptime = ptime / def->clockrate_mult;
@@ -1311,8 +1319,6 @@ int encoder_config_fmtp(encoder_t *enc, const codec_def_t *def, int bitrate, int
 	err = def->codec_type->encoder_init ? def->codec_type->encoder_init(enc, fmtp, extra_opts) : 0;
 	if (err)
 		goto err;
-
-	enc->avpkt = av_packet_alloc();
 
 // output frame and fifo
 	enc->frame = av_frame_alloc();
@@ -1455,6 +1461,8 @@ int encoder_input_data(encoder_t *enc, AVFrame *frame,
 	enc->avpkt->size = 0;
 
 	while (1) {
+		if (!enc->def || !enc->def->codec_type)
+			break;
 		if (!enc->def->codec_type->encoder_input)
 			break;
 

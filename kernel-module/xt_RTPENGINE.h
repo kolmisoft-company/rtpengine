@@ -3,7 +3,8 @@
 
 
 
-#define NUM_PAYLOAD_TYPES 16
+#define NUM_PAYLOAD_TYPES 32
+#define MAX_FORWARD_DESTINATIONS 32
 
 
 
@@ -91,27 +92,26 @@ enum rtpengine_src_mismatch {
 	MSM_PROPAGATE,		/* propagate to userspace daemon */
 };
 
+struct rtpengine_payload_type {
+	unsigned char pt_num;
+	unsigned char replace_pattern_len;
+	uint32_t clock_rate;
+	char replace_pattern[16];
+};
+
 struct rtpengine_target_info {
 	struct re_address		local;
 	struct re_address		expected_src; /* for incoming packets */
 	enum rtpengine_src_mismatch	src_mismatch;
-
-	struct re_address		src_addr; /* for outgoing packets */
-	struct re_address		dst_addr;
-
-	struct re_address		mirror_addr;
+	unsigned int			num_destinations;
 	unsigned int			intercept_stream_idx;
 
 	struct rtpengine_srtp		decrypt;
-	struct rtpengine_srtp		encrypt;
 	uint32_t			ssrc; // Expose the SSRC to userspace when we resync.
-	uint32_t			ssrc_out; // Rewrite SSRC
 
-	unsigned char			payload_types[NUM_PAYLOAD_TYPES]; /* must be sorted */
-	uint32_t			clock_rates[NUM_PAYLOAD_TYPES];
+	struct rtpengine_payload_type	payload_types[NUM_PAYLOAD_TYPES]; /* must be sorted */
 	unsigned int			num_payload_types;
 
-	unsigned char			tos;
 	unsigned int			rtcp_mux:1,
 					dtls:1,
 					stun:1,
@@ -122,6 +122,22 @@ struct rtpengine_target_info {
 					non_forwarding:1, // empty src/dst addr
 					blackhole:1,
 					rtp_stats:1; // requires SSRC and clock_rates to be set
+};
+
+struct rtpengine_output_info {
+	struct re_address		src_addr; /* for outgoing packets */
+	struct re_address		dst_addr;
+
+	struct rtpengine_srtp		encrypt;
+	uint32_t			ssrc_out; // Rewrite SSRC
+
+	unsigned char			tos;
+};
+
+struct rtpengine_destination_info {
+	struct re_address		local;
+	unsigned int			num;
+	struct rtpengine_output_info	output;
 };
 
 struct rtpengine_call_info {
@@ -158,9 +174,11 @@ struct rtpengine_message {
 		REMG_NOOP = 1,
 
 		/* target_info: */
-		REMG_ADD,
-		REMG_DEL,
-		REMG_UPDATE, // obsolete - not supported
+		REMG_ADD_TARGET,
+		REMG_DEL_TARGET,
+
+		/* destination_info: */
+		REMG_ADD_DESTINATION,
 
 		/* call_info: */
 		REMG_ADD_CALL,
@@ -183,6 +201,7 @@ struct rtpengine_message {
 	union {
 		struct rtpengine_noop_info	noop;
 		struct rtpengine_target_info	target;
+		struct rtpengine_destination_info destination;
 		struct rtpengine_call_info	call;
 		struct rtpengine_stream_info	stream;
 		struct rtpengine_packet_info	packet;
@@ -196,6 +215,7 @@ struct rtpengine_list_entry {
 	struct rtpengine_target_info	target;
 	struct rtpengine_stats		stats;
 	struct rtpengine_rtp_stats	rtp_stats[NUM_PAYLOAD_TYPES];
+	struct rtpengine_output_info	outputs[MAX_FORWARD_DESTINATIONS];
 };
 
 

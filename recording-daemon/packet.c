@@ -16,6 +16,7 @@
 #include "db.h"
 #include "streambuf.h"
 #include "resample.h"
+#include "tag.h"
 
 
 static ssize_t ssrc_tls_write(void *, const void *, size_t);
@@ -152,7 +153,6 @@ void ssrc_free(void *p) {
 	g_slice_free1(sizeof(*s), s);
 }
 
-
 // mf must be unlocked; returns ssrc locked
 static ssrc_t *ssrc_get(stream_t *stream, unsigned long ssrc) {
 	metafile_t *mf = stream->metafile;
@@ -177,9 +177,29 @@ out:
 	dbg("Init for SSRC %s%lx%s of stream #%lu", FMT_M(ret->ssrc), stream->id);
 
 	if (mf->recording_on && !ret->output && output_single) {
-		char buf[16];
-		snprintf(buf, sizeof(buf), "%08lx", ssrc);
-		ret->output = output_new(output_dir, mf->parent, buf);
+		dbg("Metadata %s, output destination %s", mf->metadata, mf->output_dest);
+		if (mf->output_dest) {
+			char path[PATH_MAX];
+			size_t copied = g_strlcpy(path, mf->output_dest, sizeof(path));
+			if (G_UNLIKELY(copied >= sizeof(path)))
+				ilog(LOG_ERR, "Output file path truncated: %s", mf->output_dest);
+			char *sep = strrchr(path, '/');
+			if (sep) {
+				char *filename = sep + 1;
+				*sep = 0;
+				ret->output = output_new_from_full_path(path, filename);
+				ret->output->skip_filename_extension = TRUE;
+			}
+			else {
+				ret->output = output_new_from_full_path(output_dir, path);
+			}
+		}
+		else {
+			char buf[16];
+			snprintf(buf, sizeof(buf), "%08lx", ssrc);
+			tag_t *tag = tag_get(mf, stream->tag);
+			ret->output = output_new(output_dir, mf->parent, buf, tag->label);
+		}
 		db_do_stream(mf, ret->output, "single", stream, ssrc);
 	}
 	if ((stream->forwarding_on || mf->forwarding_on) && !ret->tls_fwd_stream) {

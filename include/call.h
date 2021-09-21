@@ -14,6 +14,7 @@
 #include <pcre.h>
 #include <openssl/x509.h>
 #include <limits.h>
+#include <stdbool.h>
 #include "compat.h"
 #include "socket.h"
 #include "media_socket.h"
@@ -49,6 +50,9 @@ enum stream_address_format {
 enum call_opmode {
 	OP_OFFER = 0,
 	OP_ANSWER = 1,
+	OP_REQUEST,
+	OP_REQ_ANSWER,
+	OP_PUBLISH,
 	OP_OTHER,
 };
 
@@ -200,7 +204,6 @@ struct call;
 struct redis;
 struct crypto_suite;
 struct rtpengine_srtp;
-struct streamhandler;
 struct sdp_ng_flags;
 struct local_interface;
 struct call_monologue;
@@ -215,6 +218,7 @@ struct jitter_buffer;
 struct codec_tracker;
 struct rtcp_timer;
 struct mqtt_timer;
+struct janus_session;
 
 
 typedef bencode_buffer_t call_buffer_t;
@@ -225,12 +229,26 @@ typedef bencode_buffer_t call_buffer_t;
 
 
 
+struct codec_store {
+	GHashTable		*codecs; // int payload type -> struct rtp_payload_type
+	GHashTable		*codec_names; // codec name -> GQueue of int payload types; storage container
+	GQueue			codec_prefs; // preference by order in SDP; storage container
+	GList			*supp_link; // tracks location for codec_store_add_end
+	struct codec_tracker	*tracker;
+	struct call_media	*media;
+	unsigned int		strip_all:1, // set by codec_store_strip
+				strip_full:1; // set by codec_store_strip
+};
+
 struct stream_params {
 	unsigned int		index; /* starting with 1 */
 	str			type;
+	enum media_type		type_id;
 	struct endpoint		rtp_endpoint;
 	struct endpoint		rtcp_endpoint;
 	unsigned int		consecutive_ports;
+	unsigned int		num_ports;
+	str			protocol_str;
 	const struct transport_protocol *protocol;
 	str			format_str;
 	GQueue			sdes_params; // slice-alloc'd
@@ -238,7 +256,7 @@ struct stream_params {
 	sockfamily_t		*desired_family;
 	struct dtls_fingerprint fingerprint;
 	unsigned int		sp_flags;
-	GQueue			rtp_payload_types; /* slice-alloc'd */
+	struct codec_store	codecs;
 	GQueue			ice_candidates; /* slice-alloc'd */
 	str			ice_ufrag;
 	str			ice_pwd;
@@ -277,18 +295,18 @@ struct packet_stream {
 	struct recording_stream recording;	/* LOCK: call->master_lock */
 
 	GQueue			sfds;		/* LOCK: call->master_lock */
-	struct stream_fd * volatile selected_sfd;
+	struct stream_fd *	selected_sfd;
 	struct dtls_connection	ice_dtls;	/* LOCK: in_lock */
-	struct packet_stream	*rtp_sink;	/* LOCK: call->master_lock */
-	struct packet_stream	*rtcp_sink;	/* LOCK: call->master_lock */
+	GQueue			rtp_sinks;	// LOCK: call->master_lock, in_lock for streamhandler
+	GQueue			rtcp_sinks;	// LOCK: call->master_lock, in_lock for streamhandler
 	struct packet_stream	*rtcp_sibling;	/* LOCK: call->master_lock */
-	const struct streamhandler *handler;	/* LOCK: in_lock */
 	struct endpoint		endpoint;	/* LOCK: out_lock */
 	struct endpoint		detected_endpoints[4];	/* LOCK: out_lock */
 	struct timeval		ep_detect_signal; /* LOCK: out_lock */
 	struct endpoint		advertised_endpoint; /* RO */
+	struct endpoint		learned_endpoint; /* LOCK: out_lock */
 	struct crypto_context	crypto;		/* OUT direction, LOCK: out_lock */
-	struct ssrc_ctx		*ssrc_in,	/* LOCK: in_lock */ // XXX eliminate these
+	struct ssrc_ctx		*ssrc_in,	/* LOCK: in_lock */
 				*ssrc_out;	/* LOCK: out_lock */
 	struct send_timer	*send_timer;	/* RO */
 	struct jitter_buffer	*jb;		/* RO */
@@ -321,6 +339,7 @@ struct call_media {
 	unsigned int		unique_id;	/* RO */
 	str			type;
 	enum media_type		type_id;
+	str			protocol_str;
 	const struct transport_protocol *protocol;
 	str			format_str;
 	sockfamily_t		*desired_family;
@@ -336,27 +355,16 @@ struct call_media {
 	GQueue			streams; /* normally RTP + RTCP */
 	GQueue			endpoint_maps;
 
-	// what we say we can receive (outgoing SDP):
-	GHashTable		*codecs_recv; // int payload type -> struct rtp_payload_type
-	GHashTable		*codec_names_recv; // codec name -> GQueue of int payload types; storage container
-	GQueue			codecs_prefs_recv; // preference by order in SDP; storage container
-
-	// what we can send, taken from received SDP:
-	GHashTable		*codecs_send; // int payload type -> struct rtp_payload_type
-	GHashTable		*codec_names_send; // codec name -> GQueue of int payload types; storage container
-	GQueue			codecs_prefs_send; // storage container
-	struct codec_tracker	*codec_tracker;
-
+	struct codec_store	codecs;
 	GQueue			sdp_attributes; // str_sprintf()
-
 	GHashTable		*codec_handlers; // int payload type -> struct codec_handler
-						// XXX combine this with 'codecs_recv' hash table?
+						// XXX combine this with 'codecs' hash table?
 	GQueue			codec_handlers_store; // storage for struct codec_handler
 	struct codec_handler	*codec_handler_cache;
 	struct rtcp_handler	*rtcp_handler;
 	struct rtcp_timer	*rtcp_timer;	// master lock for scheduling purposes
 	struct mqtt_timer	*mqtt_timer;	// master lock for scheduling purposes
-	struct codec_handler	*dtmf_injector;
+	//struct codec_handler	*dtmf_injector;
 	struct t38_gateway	*t38_gateway;
 	struct codec_handler	*t38_handler;
 #ifdef WITH_TRANSCODING
@@ -372,6 +380,13 @@ struct call_media {
 	volatile unsigned int	media_flags;
 };
 
+// link between subscribers and subscriptions
+struct call_subscription {
+	struct call_monologue	*monologue;
+	GList			*link; // link into the corresponding opposite list
+	unsigned int		offer_answer:1; // bidirectional, exclusive
+};
+
 /* half a dialogue */
 /* protected by call->master_lock, except the RO elements */
 struct call_monologue {
@@ -384,23 +399,33 @@ struct call_monologue {
 	str			label;
 	time_t			created;	/* RO */
 	time_t			deleted;
-	struct timeval         started; /* for CDR */
-	struct timeval         terminated; /* for CDR */
-	enum termination_reason term_reason;
+	struct timeval		started; /* for CDR */
+	struct timeval		terminated; /* for CDR */
+	enum termination_reason	term_reason;
 	GHashTable		*other_tags;
 	GHashTable		*branches;
-	struct call_monologue	*active_dialogue;
+	GQueue			subscriptions; // who am I subscribed to (sources)
+	GHashTable		*subscriptions_ht; // for quick lookup
+	GQueue			subscribers; // who is subscribed to me (sinks)
+	GHashTable		*subscribers_ht; // for quick lookup
 	GQueue			medias;
 	GHashTable		*media_ids;
 	struct media_player	*player;
+	unsigned long long	sdp_session_id;
 	unsigned long long	sdp_version;
-	GString			*last_sdp;
+	str			last_in_sdp;
+	GQueue			last_in_sdp_parsed;
+	GQueue			last_in_sdp_streams;
+	GString			*last_out_sdp;
 	char			*sdp_username;
 	char			*sdp_session_name;
+	struct ssrc_hash	*ssrc_hash;
 
 	unsigned int		block_dtmf:1;
 	unsigned int		block_media:1;
+	unsigned int		silence_media:1;
 	unsigned int		rec_forwarding:1;
+	unsigned int		inject_dtmf:1;
 };
 
 struct call_iterator_list {
@@ -409,7 +434,8 @@ struct call_iterator_list {
 };
 struct call_iterator_entry {
 	GList link; // .data is protected by the list's main lock
-	mutex_t lock; // held while the link is in use, protects link.prev and link.next
+	mutex_t next_lock; // held while the link is in use, protects link.data and link.next
+	mutex_t prev_lock; // held while the link is in use, protects link.prev
 };
 
 #define ITERATE_CALL_LIST_START(which, varname) \
@@ -418,21 +444,36 @@ struct call_iterator_entry {
 		mutex_lock(&rtpe_call_iterators[__which].lock); \
 		\
 		GList *__l = rtpe_call_iterators[__which].first; \
+		bool __has_lock = true; \
+		struct call *next_ ## varname = NULL; \
 		while (__l) { \
-			struct call *varname = __l->data; \
-			obj_hold(varname); \
-			mutex_lock(&varname->iterator[__which].lock); \
-			mutex_unlock(&rtpe_call_iterators[__which].lock)
+			struct call *varname = NULL; \
+			if (next_ ## varname) \
+				varname = next_ ## varname; \
+			else { \
+				varname = __l->data; \
+				obj_hold(varname); \
+				mutex_lock(&varname->iterator[__which].next_lock); \
+			} \
+			if (__has_lock) \
+				mutex_unlock(&rtpe_call_iterators[__which].lock); \
+			__has_lock = false
 
 #define ITERATE_CALL_LIST_NEXT_END(varname) \
 			GList *__next = varname->iterator[__which].link.next; \
-			mutex_unlock(&varname->iterator[__which].lock); \
+			if (__next) { \
+				next_ ## varname = __next->data; \
+				obj_hold(next_ ## varname); \
+				mutex_lock(&next_ ## varname->iterator[__which].next_lock); \
+			} \
+			else \
+				next_ ## varname = NULL; \
+			mutex_unlock(&varname->iterator[__which].next_lock); \
 			__l = __next; \
 			obj_put(varname); \
-			mutex_lock(&rtpe_call_iterators[__which].lock); \
 		} \
-		\
-		mutex_unlock(&rtpe_call_iterators[__which].lock); \
+		if (__has_lock) \
+			mutex_unlock(&rtpe_call_iterators[__which].lock); \
 	} while (0)
 
 struct call {
@@ -452,8 +493,8 @@ struct call {
 	GQueue			stream_fds;
 	GQueue			endpoint_maps;
 	struct dtls_cert	*dtls_cert; /* for outgoing */
-	struct ssrc_hash	*ssrc_hash;
 	struct mqtt_timer	*mqtt_timer;
+	struct janus_session	*janus_session;
 
 	str			callid;
 	struct timeval		created;
@@ -471,6 +512,7 @@ struct call {
 	str			metadata;
 
 	struct call_iterator_entry iterator[NUM_CALL_ITERATORS];
+	int			cpu_affinity;
 
 	// ipv4/ipv6 media flags
 	unsigned int		is_ipv4_media_offer:1;
@@ -481,6 +523,7 @@ struct call {
 
 	unsigned int		block_dtmf:1;
 	unsigned int		block_media:1;
+	unsigned int		silence_media:1;
 	unsigned int		recording_on:1;
 	unsigned int		rec_forwarding:1;
 	unsigned int		drop_traffic:1;
@@ -514,15 +557,29 @@ struct call_monologue *__monologue_create(struct call *call);
 void __monologue_tag(struct call_monologue *ml, const str *tag);
 void __monologue_viabranch(struct call_monologue *ml, const str *viabranch);
 struct packet_stream *__packet_stream_new(struct call *call);
+void __add_subscription(struct call_monologue *ml, struct call_monologue *other, bool offer_answer);
+void free_sink_handler(void *);
+void __add_sink_handler(GQueue *, struct packet_stream *);
 
 
-struct call *call_get_or_create(const str *callid, int foreign);
+struct call *call_get_or_create(const str *callid, bool foreign, bool exclusive);
 struct call *call_get_opmode(const str *callid, enum call_opmode opmode);
-void call_make_own_foreign(struct call *c, int foreign);
-struct call_monologue *call_get_mono_dialogue(struct call *call, const str *fromtag, const str *totag,
+void call_make_own_foreign(struct call *c, bool foreign);
+int call_get_mono_dialogue(struct call_monologue *dialogue[2], struct call *call, const str *fromtag,
+		const str *totag,
 		const str *viabranch);
+struct call_monologue *call_get_monologue(struct call *call, const str *fromtag);
+struct call_monologue *call_get_or_create_monologue(struct call *call, const str *fromtag);
 struct call *call_get(const str *callid);
-int monologue_offer_answer(struct call_monologue *monologue, GQueue *streams, struct sdp_ng_flags *flags);
+int monologue_offer_answer(struct call_monologue *dialogue[2], GQueue *streams, struct sdp_ng_flags *flags);
+void codecs_offer_answer(struct call_media *media, struct call_media *other_media,
+		struct stream_params *sp, struct sdp_ng_flags *flags);
+int monologue_publish(struct call_monologue *ml, GQueue *streams, struct sdp_ng_flags *flags);
+int monologue_subscribe_request(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *);
+int monologue_subscribe_answer(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *,
+		GQueue *);
+int monologue_unsubscribe(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *);
+int monologue_destroy(struct call_monologue *ml);
 int call_delete_branch(const str *callid, const str *branch,
 	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay);
 void call_destroy(struct call *);
@@ -538,8 +595,7 @@ int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address
 
 void add_total_calls_duration_in_interval(struct timeval *interval_tv);
 
-void payload_type_free(struct rtp_payload_type *p);
-void __rtp_stats_update(GHashTable *dst, GHashTable *src);
+void __rtp_stats_update(GHashTable *dst, struct codec_store *);
 int __init_stream(struct packet_stream *ps);
 void call_stream_crypto_reset(struct packet_stream *ps);
 
@@ -596,13 +652,6 @@ INLINE str *call_str_init_dup(struct call *c, char *s) {
 	str t;
 	str_init(&t, s);
 	return call_str_dup(c, &t);
-}
-INLINE struct packet_stream *packet_stream_sink(struct packet_stream *ps) {
-	struct packet_stream *ret;
-	ret = ps->rtp_sink;
-	if (!ret)
-		ret = ps->rtcp_sink;
-	return ret;
 }
 INLINE void __call_unkernelize(struct call *call) {
 	for (GList *l = call->monologues.head; l; l = l->next) {
