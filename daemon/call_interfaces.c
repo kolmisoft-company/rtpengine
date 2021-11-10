@@ -1703,8 +1703,6 @@ static void ng_stats_media(bencode_item_t *list, const struct call_media *m,
 	rtp_pt = __rtp_stats_codec((struct call_media *)m);
 
 	dict = bencode_list_add_dictionary(list);
-	
-	const struct rtp_payload_type *rtp_pt = __rtp_stats_codec((struct call_media *)m);
 
 	bencode_dictionary_add_integer(dict, "index", m->index);
 	bencode_dictionary_add_str(dict, "type", &m->type);
