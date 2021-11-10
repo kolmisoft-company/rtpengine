@@ -111,7 +111,7 @@ struct media_player *media_player_new(struct call_monologue *ml) {
 	uint32_t ssrc = 0;
 	while (ssrc == 0)
 		ssrc = ssl_random();
-	struct ssrc_ctx *ssrc_ctx = get_ssrc_ctx(ssrc, ml->call->ssrc_hash, SSRC_DIR_OUTPUT, ml);
+	struct ssrc_ctx *ssrc_ctx = get_ssrc_ctx(ssrc, ml->ssrc_hash, SSRC_DIR_OUTPUT, ml);
 	ssrc_ctx->next_rtcp = rtpe_now;
 
 	struct media_player *mp = obj_alloc0("media_player", sizeof(*mp), __media_player_free);
@@ -266,7 +266,7 @@ void send_timer_push(struct send_timer *st, struct codec_packet *cp) {
 int media_player_setup(struct media_player *mp, const struct rtp_payload_type *src_pt) {
 	// find suitable output payload type
 	struct rtp_payload_type *dst_pt;
-	for (GList *l = mp->media->codecs_prefs_send.head; l; l = l->next) {
+	for (GList *l = mp->media->codecs.codec_prefs.head; l; l = l->next) {
 		dst_pt = l->data;
 		ensure_codec_def(dst_pt, mp->media);
 		if (dst_pt->codec_def && !dst_pt->codec_def->supplemental)
@@ -326,13 +326,14 @@ static int __ensure_codec_handler(struct media_player *mp, AVStream *avs) {
 	src_pt.encoding = src_pt.codec_def->rtpname_str;
 	src_pt.channels = avs->CODECPAR->channels;
 	src_pt.clock_rate = avs->CODECPAR->sample_rate;
-	codec_init_payload_type(&src_pt, mp->media);
+	codec_init_payload_type(&src_pt, MT_AUDIO);
 
 	if (media_player_setup(mp, &src_pt))
 		return -1;
 
 	mp->duration = avs->duration * 1000 * avs->time_base.num / avs->time_base.den;
 
+	payload_type_clear(&src_pt);
 	return 0;
 }
 

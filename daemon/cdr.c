@@ -69,20 +69,25 @@ void cdr_update_entry(struct call* c) {
 
 		if (_log_facility_cdr) {
 			g_string_append_printf(cdr,
-				"ml%i_start_time=%ld.%06lu, "
-				"ml%i_end_time=%ld.%06ld, "
-				"ml%i_duration=%ld.%06ld, "
+				"ml%i_start_time=%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT ", "
+				"ml%i_end_time=%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT ", "
+				"ml%i_duration=%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT ", "
 				"ml%i_termination=%s, "
 				"ml%i_local_tag=%s, "
-				"ml%i_local_tag_type=%s, "
-				"ml%i_remote_tag=%s, ",
+				"ml%i_local_tag_type=%s, ",
 				cdrlinecnt, ml->started.tv_sec, ml->started.tv_usec,
 				cdrlinecnt, ml->terminated.tv_sec, ml->terminated.tv_usec,
 				cdrlinecnt, tim_result_duration.tv_sec, tim_result_duration.tv_usec,
 				cdrlinecnt, get_term_reason_text(ml->term_reason),
 				cdrlinecnt, ml->tag.s,
-				cdrlinecnt, get_tag_type_text(ml->tagtype),
-				cdrlinecnt, ml->active_dialogue ? ml->active_dialogue->tag.s : "(none)");
+				cdrlinecnt, get_tag_type_text(ml->tagtype));
+
+			for (k = ml->subscriptions.head; k; k = k->next) {
+				struct call_subscription *cs = k->data;
+				g_string_append_printf(cdr,
+					"ml%i_remote_tag=%s, ",
+					cdrlinecnt, cs->monologue->tag.s);
+			}
 		}
 
 		for (k = ml->medias.head; k; k = k->next) {
@@ -134,7 +139,7 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol,
 						atomic64_get(&ps->last_packet),
 						cdrlinecnt, md->index, protocol,
-						ps->stats.in_tos_tclass);
+						ps->in_tos_tclass);
 				    } else {
 #if (RE_HAS_MEASUREDELAY)
 					g_string_append_printf(cdr,
@@ -153,7 +158,7 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol, addr,
 						cdrlinecnt, md->index, protocol, ps->endpoint.port,
 						cdrlinecnt, md->index, protocol, local_addr,
-						cdrlinecnt, md->index, protocol, (unsigned int) (ps->sfd ? ps->sfd->fd.localport : 0),
+						cdrlinecnt, md->index, protocol, (unsigned int) (ps->selected_sfd ? ps->selected_sfd->socket.local.port : 0),
 						cdrlinecnt, md->index, protocol,
 						atomic64_get(&ps->stats.packets),
 						cdrlinecnt, md->index, protocol,
@@ -163,7 +168,7 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol,
 						atomic64_get(&ps->last_packet),
 						cdrlinecnt, md->index, protocol,
-						ps->stats.in_tos_tclass,
+						ps->in_tos_tclass,
 						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_min / 1000000,
 						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_avg / 1000000,
 						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_max / 1000000);
@@ -192,7 +197,7 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol,
 						atomic64_get(&ps->last_packet),
 						cdrlinecnt, md->index, protocol,
-						ps->stats.in_tos_tclass);
+						ps->in_tos_tclass);
 #endif
 				    }
 				}

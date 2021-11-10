@@ -1,13 +1,6 @@
 #ifndef _CONTROL_NG_H_
 #define _CONTROL_NG_H_
 
-#include "obj.h"
-#include "udp_listener.h"
-#include "socket.h"
-#include "str.h"
-#include "tcp_listener.h"
-#include "bencode.h"
-
 struct poller;
 
 enum ng_command {
@@ -29,9 +22,22 @@ enum ng_command {
 	NGC_STOP_MEDIA,
 	NGC_PLAY_DTMF,
 	NGC_STATISTICS,
+	NGC_SILENCE_MEDIA,
+	NGC_UNSILENCE_MEDIA,
+	NGC_PUBLISH,
+	NGC_SUBSCRIBE_REQ,
+	NGC_SUBSCRIBE_ANS,
+	NGC_UNSUBSCRIBE,
 
 	NGC_COUNT // last, number of elements
 };
+
+#include "obj.h"
+#include "udp_listener.h"
+#include "socket.h"
+#include "str.h"
+#include "tcp_listener.h"
+#include "bencode.h"
 
 struct ng_command_stats {
 	mutex_t lock;

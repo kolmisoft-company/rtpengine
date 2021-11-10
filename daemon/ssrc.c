@@ -29,6 +29,7 @@ static struct ssrc_entry *create_ssrc_entry_call(void *uptr) {
 	init_ssrc_ctx(&ent->output_ctx, ent);
 	//ent->seq_out = ssl_random();
 	//ent->ts_out = ssl_random();
+	ent->lost_bits = -1;
 	return &ent->h;
 }
 static void add_ssrc_entry(uint32_t ssrc, struct ssrc_entry *ent, struct ssrc_hash *ht) {
@@ -88,7 +89,7 @@ static void mos_calc(struct ssrc_stats_block *ssb) {
 	ssb->mos = intmos;
 }
 
-static struct ssrc_entry *find_ssrc(uint32_t ssrc, struct ssrc_hash *ht) {
+static void *find_ssrc(uint32_t ssrc, struct ssrc_hash *ht) {
 	rwlock_lock_r(&ht->lock);
 	struct ssrc_entry *ret = g_atomic_pointer_get(&ht->cache);
 	if (!ret || ret->ssrc != ssrc) {
@@ -227,7 +228,6 @@ static void *__do_time_report_item(struct call_media *m, size_t struct_size, siz
 		const struct timeval *tv, uint32_t ssrc, uint32_t ntp_msw, uint32_t ntp_lsw,
 		GDestroyNotify free_func, struct ssrc_entry **e_p)
 {
-	struct call *c = m->call;
 	struct ssrc_entry *e;
 	struct ssrc_time_item *sti;
 
@@ -236,7 +236,7 @@ static void *__do_time_report_item(struct call_media *m, size_t struct_size, siz
 	sti->ntp_middle_bits = ntp_msw << 16 | ntp_lsw >> 16;
 	sti->ntp_ts = ntp_ts_to_double(ntp_msw, ntp_lsw);
 
-	e = get_ssrc(ssrc, c->ssrc_hash);
+	e = get_ssrc(ssrc, m->monologue->ssrc_hash);
 	if (G_UNLIKELY(!e)) {
 		free_func(sti);
 		return NULL;
@@ -254,7 +254,19 @@ static void *__do_time_report_item(struct call_media *m, size_t struct_size, siz
 	return sti;
 }
 
-static long long __calc_rtt(struct call *c, uint32_t ssrc, uint32_t ntp_middle_bits,
+// call must be locked in R
+static struct ssrc_entry_call *hunt_ssrc(struct call_monologue *ml, uint32_t ssrc) {
+	for (GList *l = ml->subscriptions.head; l; l = l->next) {
+		struct call_subscription *cs = l->data;
+		struct call_monologue *other = cs->monologue;
+		struct ssrc_entry_call *e = find_ssrc(ssrc, other->ssrc_hash);
+		if (e)
+			return e;
+	}
+	return NULL;
+}
+
+static long long __calc_rtt(struct call_monologue *ml, uint32_t ssrc, uint32_t ntp_middle_bits,
 		uint32_t delay, size_t reports_queue_offset, const struct timeval *tv, int *pt_p)
 {
 	if (pt_p)
@@ -263,12 +275,21 @@ static long long __calc_rtt(struct call *c, uint32_t ssrc, uint32_t ntp_middle_b
 	if (!ntp_middle_bits || !delay)
 		return 0;
 
-	struct ssrc_entry_call *e = get_ssrc(ssrc, c->ssrc_hash);
+	struct ssrc_entry_call *e = find_ssrc(ssrc, ml->ssrc_hash);
 	if (G_UNLIKELY(!e))
 		return 0;
 
 	if (pt_p)
 		*pt_p = e->output_ctx.tracker.most[0] == 255 ? -1 : e->output_ctx.tracker.most[0];
+
+	// grab the opposite side SSRC for the time reports
+	uint32_t map_ssrc = e->output_ctx.ssrc_map_out;
+	if (!map_ssrc)
+		map_ssrc = e->h.ssrc;
+	obj_put(&e->h);
+	e = hunt_ssrc(ml, map_ssrc);
+	if (G_UNLIKELY(!e))
+		return 0;
 
 	struct ssrc_time_item *sti;
 	GQueue *q = (((void *) e) + reports_queue_offset);
@@ -329,18 +350,16 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 void ssrc_receiver_report(struct call_media *m, const struct ssrc_receiver_report *rr,
 		const struct timeval *tv)
 {
-	struct call *c = m->call;
-
 	ilog(LOG_DEBUG, "RR from %s%x%s about %s%x%s: FL %u TL %u HSR %u J %u LSR %u DLSR %u",
 			FMT_M(rr->from), FMT_M(rr->ssrc), rr->fraction_lost, rr->packets_lost,
 			rr->high_seq_received, rr->jitter, rr->lsr, rr->dlsr);
 
 	int pt;
 
-	long long rtt = __calc_rtt(c, rr->ssrc, rr->lsr, rr->dlsr,
+	long long rtt = __calc_rtt(m->monologue, rr->ssrc, rr->lsr, rr->dlsr,
 			G_STRUCT_OFFSET(struct ssrc_entry_call, sender_reports), tv, &pt);
 
-	struct ssrc_entry_call *other_e = get_ssrc(rr->from, c->ssrc_hash);
+	struct ssrc_entry_call *other_e = get_ssrc(rr->from, m->monologue->ssrc_hash);
 	if (G_UNLIKELY(!other_e))
 		goto out_nl;
 
@@ -350,7 +369,7 @@ void ssrc_receiver_report(struct call_media *m, const struct ssrc_receiver_repor
 		goto out_nl_put;
 	}
 
-	const struct rtp_payload_type *rpt = rtp_payload_type(pt, m->codecs_send);
+	const struct rtp_payload_type *rpt = rtp_payload_type(pt, &m->codecs);
 	if (!rpt) {
 		ilog(LOG_INFO, "Invalid RTP payload type %i, discarding RTCP RR", pt);
 		goto out_nl_put;
@@ -443,7 +462,7 @@ void ssrc_receiver_dlrr(struct call_media *m, const struct ssrc_xr_dlrr *dlrr,
 			FMT_M(dlrr->from), FMT_M(dlrr->ssrc),
 			dlrr->lrr, dlrr->dlrr);
 
-	__calc_rtt(m->call, dlrr->ssrc, dlrr->lrr, dlrr->dlrr,
+	__calc_rtt(m->monologue, dlrr->ssrc, dlrr->lrr, dlrr->dlrr,
 			G_STRUCT_OFFSET(struct ssrc_entry_call, rr_time_reports), tv, NULL);
 }
 
@@ -460,8 +479,7 @@ void ssrc_voip_metrics(struct call_media *m, const struct ssrc_xr_voip_metrics *
 			vm->ext_r_factor, vm->mos_lq, vm->mos_cq, vm->rx_config, vm->jb_nom,
 			vm->jb_max, vm->jb_abs_max);
 
-	struct call *c = m->call;
-	struct ssrc_entry_call *e = get_ssrc(vm->ssrc, c->ssrc_hash);
+	struct ssrc_entry_call *e = get_ssrc(vm->ssrc, m->monologue->ssrc_hash);
 	if (!e)
 		return;
 	e->last_rtt_xr = vm->rnd_trip_delay;

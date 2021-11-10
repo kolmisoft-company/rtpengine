@@ -3,7 +3,9 @@
 
 
 
-#define NUM_PAYLOAD_TYPES 16
+#define RTPE_NUM_PAYLOAD_TYPES 32
+#define RTPE_MAX_FORWARD_DESTINATIONS 32
+#define RTPE_NUM_SSRC_TRACKING 4
 
 
 
@@ -79,7 +81,7 @@ struct rtpengine_srtp {
 	unsigned int			session_key_len;
 	unsigned int			session_salt_len;
 	unsigned char			mki[256]; /* XXX uses too much memory? */
-	uint64_t			last_index;
+	uint64_t			last_index[RTPE_NUM_SSRC_TRACKING];
 	unsigned int			auth_tag_len; /* in bytes */
 	unsigned int			mki_len;
 };
@@ -91,27 +93,26 @@ enum rtpengine_src_mismatch {
 	MSM_PROPAGATE,		/* propagate to userspace daemon */
 };
 
+struct rtpengine_payload_type {
+	unsigned char pt_num;
+	unsigned char replace_pattern_len;
+	uint32_t clock_rate;
+	char replace_pattern[16];
+};
+
 struct rtpengine_target_info {
 	struct re_address		local;
 	struct re_address		expected_src; /* for incoming packets */
 	enum rtpengine_src_mismatch	src_mismatch;
-
-	struct re_address		src_addr; /* for outgoing packets */
-	struct re_address		dst_addr;
-
-	struct re_address		mirror_addr;
+	unsigned int			num_destinations;
 	unsigned int			intercept_stream_idx;
 
 	struct rtpengine_srtp		decrypt;
-	struct rtpengine_srtp		encrypt;
-	uint32_t			ssrc; // Expose the SSRC to userspace when we resync.
-	uint32_t			ssrc_out; // Rewrite SSRC
+	uint32_t			ssrc[RTPE_NUM_SSRC_TRACKING]; // Expose the SSRC to userspace when we resync.
 
-	unsigned char			payload_types[NUM_PAYLOAD_TYPES]; /* must be sorted */
-	uint32_t			clock_rates[NUM_PAYLOAD_TYPES];
+	struct rtpengine_payload_type	payload_types[RTPE_NUM_PAYLOAD_TYPES]; /* must be sorted */
 	unsigned int			num_payload_types;
 
-	unsigned char			tos;
 	unsigned int			rtcp_mux:1,
 					dtls:1,
 					stun:1,
@@ -122,6 +123,22 @@ struct rtpengine_target_info {
 					non_forwarding:1, // empty src/dst addr
 					blackhole:1,
 					rtp_stats:1; // requires SSRC and clock_rates to be set
+};
+
+struct rtpengine_output_info {
+	struct re_address		src_addr; /* for outgoing packets */
+	struct re_address		dst_addr;
+
+	struct rtpengine_srtp		encrypt;
+	uint32_t			ssrc_out[RTPE_NUM_SSRC_TRACKING]; // Rewrite SSRC
+
+	unsigned char			tos;
+};
+
+struct rtpengine_destination_info {
+	struct re_address		local;
+	unsigned int			num;
+	struct rtpengine_output_info	output;
 };
 
 struct rtpengine_call_info {
@@ -143,8 +160,8 @@ struct rtpengine_packet_info {
 
 struct rtpengine_stats_info {
 	struct re_address		local;		// input
-	uint32_t			ssrc;		// output
-	struct rtpengine_ssrc_stats	ssrc_stats;	// output
+	uint32_t			ssrc[RTPE_NUM_SSRC_TRACKING];		// output
+	struct rtpengine_ssrc_stats	ssrc_stats[RTPE_NUM_SSRC_TRACKING];	// output
 };
 
 struct rtpengine_noop_info {
@@ -158,9 +175,11 @@ struct rtpengine_message {
 		REMG_NOOP = 1,
 
 		/* target_info: */
-		REMG_ADD,
-		REMG_DEL,
-		REMG_UPDATE, // obsolete - not supported
+		REMG_ADD_TARGET,
+		REMG_DEL_TARGET,
+
+		/* destination_info: */
+		REMG_ADD_DESTINATION,
 
 		/* call_info: */
 		REMG_ADD_CALL,
@@ -183,6 +202,7 @@ struct rtpengine_message {
 	union {
 		struct rtpengine_noop_info	noop;
 		struct rtpengine_target_info	target;
+		struct rtpengine_destination_info destination;
 		struct rtpengine_call_info	call;
 		struct rtpengine_stream_info	stream;
 		struct rtpengine_packet_info	packet;
@@ -195,7 +215,8 @@ struct rtpengine_message {
 struct rtpengine_list_entry {
 	struct rtpengine_target_info	target;
 	struct rtpengine_stats		stats;
-	struct rtpengine_rtp_stats	rtp_stats[NUM_PAYLOAD_TYPES];
+	struct rtpengine_rtp_stats	rtp_stats[RTPE_NUM_PAYLOAD_TYPES];
+	struct rtpengine_output_info	outputs[RTPE_MAX_FORWARD_DESTINATIONS];
 };
 
 

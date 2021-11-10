@@ -29,6 +29,7 @@
 #include "jitter_buffer.h"
 #include "dtmf.h"
 #include "mqtt.h"
+#include "janus.h"
 
 
 #ifndef PORT_RANDOM_MIN
@@ -38,6 +39,10 @@
 
 #ifndef MAX_RECV_ITERS
 #define MAX_RECV_ITERS 50
+#endif
+
+#ifndef MAX_RECV_LOOP_STRIKES
+#define MAX_RECV_LOOP_STRIKES 5
 #endif
 
 
@@ -52,24 +57,28 @@ struct packet_handler_ctx {
 	// inputs:
 	str s; // raw input packet
 
-	struct packet_stream *sink; // where to send output packets to (forward destination)
+	GQueue *sinks; // where to send output packets to (forward destination)
 	rewrite_func decrypt_func, encrypt_func; // handlers for decrypt/encrypt
 	rtcp_filter_func *rtcp_filter;
 	struct packet_stream *in_srtp, *out_srtp; // SRTP contexts for decrypt/encrypt (relevant for muxed RTCP)
 	int payload_type; // -1 if unknown or not RTP
 	int rtcp; // true if this is an RTCP packet
+	GQueue rtcp_list;
 
 	// verdicts:
 	int update; // true if Redis info needs to be updated
 	int unkernelize; // true if stream ought to be removed from kernel
+	int unconfirm; // forget learned peer address
+	int unkernelize_subscriptions; // if our peer address changed
 	int kernelize; // true if stream can be kernelized
+	int rtcp_discard; // do not forward RTCP
 
 	// output:
 	struct media_packet mp; // passed to handlers
 };
 
 
-static void __determine_handler(struct packet_stream *in, const struct packet_stream *out);
+static const struct streamhandler *__determine_handler(struct packet_stream *in, struct sink_handler *);
 
 static int __k_null(struct rtpengine_srtp *s, struct packet_stream *);
 static int __k_srtp_encrypt(struct rtpengine_srtp *s, struct packet_stream *);
@@ -1061,7 +1070,9 @@ static int __k_null(struct rtpengine_srtp *s, struct packet_stream *stream) {
 	*s = __res_null;
 	return 0;
 }
-static int __k_srtp_crypt(struct rtpengine_srtp *s, struct crypto_context *c, struct ssrc_ctx *ssrc_ctx) {
+static int __k_srtp_crypt(struct rtpengine_srtp *s, struct crypto_context *c,
+		struct ssrc_ctx *ssrc_ctx[RTPE_NUM_SSRC_TRACKING])
+{
 	if (!c->params.crypto_suite)
 		return -1;
 
@@ -1069,9 +1080,10 @@ static int __k_srtp_crypt(struct rtpengine_srtp *s, struct crypto_context *c, st
 		.cipher		= c->params.crypto_suite->kernel_cipher,
 		.hmac		= c->params.crypto_suite->kernel_hmac,
 		.mki_len	= c->params.mki_len,
-		.last_index	= ssrc_ctx ? ssrc_ctx->srtp_index : 0,
 		.auth_tag_len	= c->params.crypto_suite->srtp_auth_tag,
 	};
+	for (unsigned int i = 0; i < RTPE_NUM_SSRC_TRACKING; i++)
+		s->last_index[i] = ssrc_ctx[i] ? ssrc_ctx[i]->srtp_index : 0;
 	if (c->params.mki_len)
 		memcpy(s->mki, c->params.mki, c->params.mki_len);
 	memcpy(s->master_key, c->params.master_key, c->params.crypto_suite->master_key_len);
@@ -1110,17 +1122,207 @@ static int __rtp_stats_pt_sort(const void *ap, const void *bp) {
 }
 
 
+static void reset_ps_kernel_stats(struct packet_stream *ps) {
+	if (bf_clear(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
+		RTPE_GAUGE_DEC(kernel_only_streams);
+	if (bf_clear(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
+		RTPE_GAUGE_DEC(userspace_streams);
+	if (bf_clear(&ps->stats_flags, PS_STATS_MIXED_COUNTED))
+		RTPE_GAUGE_DEC(kernel_user_streams);
+
+	bf_clear(&ps->stats_flags, PS_STATS_KERNEL | PS_STATS_USERSPACE);
+}
+
+
+/* called with in_lock held */
+// sink_handler can be NULL
+static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *outputs,
+		struct packet_stream *stream, struct sink_handler *sink_handler, GQueue *sinks)
+{
+	struct rtpengine_destination_info *redi = NULL;
+	struct call *call = stream->call;
+	struct call_media *media = stream->media;
+	struct packet_stream *sink = sink_handler ? sink_handler->sink : NULL;
+	bool non_forwarding = false;
+	bool blackhole = false;
+
+	if (sink_handler)
+		sink_handler->kernel_output_idx = -1;
+
+	if (!PS_ISSET(stream, RTP)) {
+		if (PS_ISSET(stream, RTCP) && PS_ISSET(stream, STRICT_SOURCE))
+			non_forwarding = true; // use the kernel's source checking capability
+		else
+			return NULL;
+	}
+	if (MEDIA_ISSET(media, BLACKHOLE))
+		blackhole = true;
+	else if (!sink_handler)
+		blackhole = true;
+
+	if (blackhole)
+		non_forwarding = true;
+
+	if (sink && !sink->endpoint.address.family)
+		return NULL;
+
+	if (sink && sink->selected_sfd)
+		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s | %s -> %s%s%s",
+				FMT_M(endpoint_print_buf(&stream->endpoint)),
+				endpoint_print_buf(&stream->selected_sfd->socket.local),
+				endpoint_print_buf(&sink->selected_sfd->socket.local),
+				FMT_M(endpoint_print_buf(&sink->endpoint)));
+	else
+		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s -> void",
+				FMT_M(endpoint_print_buf(&stream->endpoint)),
+				endpoint_print_buf(&stream->selected_sfd->socket.local));
+
+	const struct streamhandler *handler = __determine_handler(stream, sink_handler);
+
+	if (!handler->in->kernel || !handler->out->kernel)
+		return "protocol not supported by kernel module";
+
+	// fill input if needed
+
+	if (reti->local.family)
+		goto output;
+
+	if (PS_ISSET2(stream, STRICT_SOURCE, MEDIA_HANDOVER)) {
+		mutex_lock(&stream->out_lock);
+		__re_address_translate_ep(&reti->expected_src, &stream->endpoint);
+		mutex_unlock(&stream->out_lock);
+		if (PS_ISSET(stream, STRICT_SOURCE))
+			reti->src_mismatch = MSM_DROP;
+		else if (PS_ISSET(stream, MEDIA_HANDOVER))
+			reti->src_mismatch = MSM_PROPAGATE;
+	}
+
+	__re_address_translate_ep(&reti->local, &stream->selected_sfd->socket.local);
+	reti->rtcp_mux = MEDIA_ISSET(media, RTCP_MUX);
+	reti->dtls = MEDIA_ISSET(media, DTLS);
+	reti->stun = media->ice_agent ? 1 : 0;
+	reti->non_forwarding = non_forwarding ? 1 : 0;
+	reti->blackhole = blackhole ? 1 : 0;
+	reti->rtp_stats = (MEDIA_ISSET(media, RTCP_GEN) || (mqtt_publish_scope() != MPS_NONE)) ? 1 : 0;
+
+	handler->in->kernel(&reti->decrypt, stream);
+	if (!reti->decrypt.cipher || !reti->decrypt.hmac)
+		return "decryption cipher or HMAC not supported by kernel module";
+
+	for (unsigned int u = 0; u < G_N_ELEMENTS(stream->ssrc_in); u++) {
+		if (stream->ssrc_in[u])
+			reti->ssrc[u] = htonl(stream->ssrc_in[u]->parent->h.ssrc);
+	}
+	if (MEDIA_ISSET(media, TRANSCODE) || MEDIA_ISSET(media, ECHO))
+		reti->transcoding = 1;
+
+	ZERO(stream->kernel_stats);
+
+	if (proto_is_rtp(media->protocol) && sinks && sinks->length) {
+		GList *values, *l;
+		struct rtp_stats *rs;
+
+		reti->rtp = 1;
+		values = g_hash_table_get_values(stream->rtp_stats);
+		values = g_list_sort(values, __rtp_stats_pt_sort);
+		for (l = values; l; l = l->next) {
+			if (reti->num_payload_types >= G_N_ELEMENTS(reti->payload_types)) {
+				ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Too many RTP payload types for kernel module");
+				break;
+			}
+			rs = l->data;
+			// only add payload types that are passthrough for all sinks
+			bool can_kernelize = true;
+			bool silenced = (call->silence_media || media->monologue->silence_media) ? true : false;
+			unsigned int clockrate = 0;
+			str replace_pattern = STR_NULL;
+			for (GList *k = sinks->head; k; k = k->next) {
+				struct sink_handler *ksh = k->data;
+				struct packet_stream *ksink = ksh->sink;
+				struct codec_handler *ch = codec_handler_get(media, rs->payload_type,
+						ksink->media);
+				clockrate = ch->source_pt.clock_rate;
+				if (silenced && ch->source_pt.codec_def)
+					replace_pattern = ch->source_pt.codec_def->silence_pattern;
+				if (ch->kernelize)
+					continue;
+				can_kernelize = false;
+				break;
+			}
+			if (!can_kernelize)
+				continue;
+
+			struct rtpengine_payload_type *rpt = &reti->payload_types[reti->num_payload_types++];
+			rpt->pt_num = rs->payload_type;
+			rpt->clock_rate = clockrate;
+			if (replace_pattern.len > sizeof(reti->payload_types->replace_pattern))
+				ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Payload replacement pattern too long (%zu)",
+						replace_pattern.len);
+			else {
+				rpt->replace_pattern_len = replace_pattern.len;
+				memcpy(rpt->replace_pattern, replace_pattern.s, replace_pattern.len);
+			}
+		}
+		g_list_free(values);
+	}
+	else {
+		if (MEDIA_ISSET(media, TRANSCODE))
+			return NULL;
+	}
+
+	recording_stream_kernel_info(stream, reti);
+
+output:
+	// output section
+	if (non_forwarding) // also applies to sink == NULL
+		return NULL; // no output
+	if (!PS_ISSET(sink, FILLED))
+		return NULL;
+
+	redi = g_slice_alloc0(sizeof(*redi));
+	redi->local = reti->local;
+	redi->output.tos = call->tos;
+
+	mutex_lock(&sink->out_lock);
+
+	__re_address_translate_ep(&redi->output.dst_addr, &sink->endpoint);
+	__re_address_translate_ep(&redi->output.src_addr, &sink->selected_sfd->socket.local);
+	if (reti->transcoding) {
+		for (unsigned int u = 0; u < G_N_ELEMENTS(stream->ssrc_in); u++) {
+			if (stream->ssrc_in[u])
+				redi->output.ssrc_out[u] = htonl(stream->ssrc_in[u]->ssrc_map_out);
+		}
+	}
+
+	handler->out->kernel(&redi->output.encrypt, sink);
+
+	mutex_unlock(&sink->out_lock);
+
+	if (!redi->output.encrypt.cipher || !redi->output.encrypt.hmac) {
+		g_slice_free1(sizeof(*redi), redi);
+		return "encryption cipher or HMAC not supported by kernel module";
+	}
+
+	// got a new output
+	redi->num = reti->num_destinations;
+	reti->num_destinations++;
+	sink_handler->kernel_output_idx = redi->num;
+	g_queue_push_tail(outputs, redi);
+	assert(outputs->length == reti->num_destinations);
+
+	return NULL;
+}
 /* called with in_lock held */
 void kernelize(struct packet_stream *stream) {
-	struct rtpengine_target_info reti;
 	struct call *call = stream->call;
-	struct packet_stream *sink = NULL;
 	const char *nk_warn_msg;
-	int non_forwarding = 0;
 	struct call_media *media = stream->media;
 
 	if (PS_ISSET(stream, KERNELIZED))
 		return;
+
+	reset_ps_kernel_stats(stream);
+
 	if (call->recording != NULL && !selected_recording_method->kernel_support)
 		goto no_kernel;
 	if (!kernel.is_wanted)
@@ -1128,12 +1330,6 @@ void kernelize(struct packet_stream *stream) {
 	nk_warn_msg = "interface to kernel module not open";
 	if (!kernel.is_open)
 		goto no_kernel_warn;
-	if (!PS_ISSET(stream, RTP)) {
-		if (PS_ISSET(stream, RTCP) && PS_ISSET(stream, STRICT_SOURCE))
-			non_forwarding = 1; // use the kernel's source checking capability
-		else
-			goto no_kernel;
-	}
 	if (MEDIA_ISSET(media, GENERATOR))
 		goto no_kernel;
 	if (!stream->selected_sfd)
@@ -1142,110 +1338,47 @@ void kernelize(struct packet_stream *stream) {
 		goto no_kernel;
 	if (!stream->endpoint.address.family)
 		goto no_kernel;
-	if (MEDIA_ISSET(media, BLACKHOLE))
-		non_forwarding = 1;
 
-        ilog(LOG_INFO, "Kernelizing media stream: %s%s:%d%s",
-			FMT_M(sockaddr_print_buf(&stream->endpoint.address), stream->endpoint.port));
+	GQueue *sinks = stream->rtp_sinks.length ? &stream->rtp_sinks : &stream->rtcp_sinks;
+	struct rtpengine_target_info reti;
+	ZERO(reti); // reti.local.family determines if anything can be done
+	GQueue outputs = G_QUEUE_INIT;
 
-	sink = packet_stream_sink(stream);
-	if (!sink) {
-		ilog(LOG_WARNING, "Attempt to kernelize stream without sink");
-		goto no_kernel;
-	}
-	if (!sink->endpoint.address.family)
-		goto no_kernel;
-
-	__determine_handler(stream, sink);
-
-	if (is_addr_unspecified(&sink->advertised_endpoint.address)
-			|| !sink->advertised_endpoint.port)
-		goto no_kernel;
-	nk_warn_msg = "protocol not supported by kernel module";
-	if (!stream->handler->in->kernel
-			|| !stream->handler->out->kernel)
-		goto no_kernel_warn;
-
-	ZERO(reti);
-
-	if (PS_ISSET2(stream, STRICT_SOURCE, MEDIA_HANDOVER)) {
-		mutex_lock(&stream->out_lock);
-		__re_address_translate_ep(&reti.expected_src, &stream->endpoint);
-		mutex_unlock(&stream->out_lock);
-		if (PS_ISSET(stream, STRICT_SOURCE))
-			reti.src_mismatch = MSM_DROP;
-		else if (PS_ISSET(stream, MEDIA_HANDOVER))
-			reti.src_mismatch = MSM_PROPAGATE;
-	}
-
-	mutex_lock(&sink->out_lock);
-
-	__re_address_translate_ep(&reti.local, &stream->selected_sfd->socket.local);
-	reti.tos = call->tos;
-	reti.rtcp_mux = MEDIA_ISSET(media, RTCP_MUX);
-	reti.dtls = MEDIA_ISSET(media, DTLS);
-	reti.stun = media->ice_agent ? 1 : 0;
-	reti.non_forwarding = non_forwarding;
-	reti.blackhole = MEDIA_ISSET(media, BLACKHOLE) ? 1 : 0;
-	reti.rtp_stats = (MEDIA_ISSET(media, RTCP_GEN) || (mqtt_publish_scope() != MPS_NONE)) ? 1 : 0;
-
-	__re_address_translate_ep(&reti.dst_addr, &sink->endpoint);
-	__re_address_translate_ep(&reti.src_addr, &sink->selected_sfd->socket.local);
-	if (stream->ssrc_in) {
-		reti.ssrc = htonl(stream->ssrc_in->parent->h.ssrc);
-		if (MEDIA_ISSET(media, TRANSCODE) || MEDIA_ISSET(media, ECHO)) {
-			reti.ssrc_out = htonl(stream->ssrc_in->ssrc_map_out);
-			reti.transcoding = 1;
-		}
-	}
-
-	stream->handler->in->kernel(&reti.decrypt, stream);
-	stream->handler->out->kernel(&reti.encrypt, sink);
-
-	mutex_unlock(&sink->out_lock);
-
-	nk_warn_msg = "encryption cipher or HMAC not supported by kernel module";
-	if (!reti.encrypt.cipher || !reti.encrypt.hmac)
-		goto no_kernel_warn;
-	nk_warn_msg = "decryption cipher or HMAC not supported by kernel module";
-	if (!reti.decrypt.cipher || !reti.decrypt.hmac)
-		goto no_kernel_warn;
-
-	ZERO(stream->kernel_stats);
-
-	if (proto_is_rtp(media->protocol)) {
-		GList *values, *l;
-		struct rtp_stats *rs;
-
-		reti.rtp = 1;
-		values = g_hash_table_get_values(stream->rtp_stats);
-		values = g_list_sort(values, __rtp_stats_pt_sort);
-		for (l = values; l; l = l->next) {
-			if (reti.num_payload_types >= G_N_ELEMENTS(reti.payload_types)) {
-				ilog(LOG_WARNING, "Too many RTP payload types for kernel module");
-				break;
-			}
-			rs = l->data;
-			// only add payload types that are passthrough
-			struct codec_handler *ch = codec_handler_get(media, rs->payload_type);
-			if (!ch->kernelize)
-				continue;
-			reti.payload_types[reti.num_payload_types] = rs->payload_type;
-			reti.clock_rates[reti.num_payload_types] = ch->source_pt.clock_rate;
-			reti.num_payload_types++;
-		}
-		g_list_free(values);
+	if (!sinks->length) {
+		// add blackhole kernel rule
+		const char *err = kernelize_one(&reti, &outputs, stream, NULL, NULL);
+		if (err)
+			ilog(LOG_WARNING, "No support for kernel packet forwarding available (%s)", err);
 	}
 	else {
-		if (MEDIA_ISSET(media, TRANSCODE))
-			goto no_kernel;
+		for (GList *l = sinks->head; l; l = l->next) {
+			struct sink_handler *sh = l->data;
+			struct packet_stream *sink = sh->sink;
+			if (PS_ISSET(sink, NAT_WAIT) && !PS_ISSET(sink, RECEIVED))
+				continue;
+			const char *err = kernelize_one(&reti, &outputs, stream, sh, sinks);
+			if (err)
+				ilog(LOG_WARNING, "No support for kernel packet forwarding available (%s)", err);
+		}
 	}
 
-	recording_stream_kernel_info(stream, &reti);
+	if (!reti.local.family)
+		goto no_kernel;
+
+	if (!outputs.length && !reti.non_forwarding) {
+		reti.non_forwarding = 1;
+		ilog(LOG_NOTICE | LOG_FLAG_LIMIT, "Setting 'non-forwarding' flag for kernel stream due to "
+				"lack of sinks");
+	}
 
 	kernel_add_stream(&reti);
-	PS_SET(stream, KERNELIZED);
+	struct rtpengine_destination_info *redi;
+	while ((redi = g_queue_pop_head(&outputs))) {
+		kernel_add_destination(redi);
+		g_slice_free1(sizeof(*redi), redi);
+	}
 
+	PS_SET(stream, KERNELIZED);
 	return;
 
 no_kernel_warn:
@@ -1255,6 +1388,31 @@ no_kernel:
 	PS_SET(stream, NO_KERNEL_SUPPORT);
 }
 
+// must be called with appropriate locks (master lock and/or in/out_lock)
+int __hunt_ssrc_ctx_idx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
+		unsigned int start_idx)
+{
+	for (unsigned int v = 0; v < RTPE_NUM_SSRC_TRACKING; v++) {
+		// starting point is the same offset as `u`
+		unsigned int idx = (start_idx + v) % RTPE_NUM_SSRC_TRACKING;
+		if (!list[idx])
+			continue;
+		if (list[idx]->parent->h.ssrc != ssrc)
+			continue;
+		return idx;
+	}
+	return -1;
+}
+// must be called with appropriate locks (master lock and/or in/out_lock)
+struct ssrc_ctx *__hunt_ssrc_ctx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
+		unsigned int start_idx)
+{
+	int idx = __hunt_ssrc_ctx_idx(ssrc, list, start_idx);
+	if (idx == -1)
+		return NULL;
+	return list[idx];
+}
+
 // must be called with appropriate locks (master lock and/or in_lock)
 static void __stream_update_stats(struct packet_stream *ps, int have_in_lock) {
 	struct re_address local;
@@ -1262,57 +1420,52 @@ static void __stream_update_stats(struct packet_stream *ps, int have_in_lock) {
 	if (!have_in_lock)
 		mutex_lock(&ps->in_lock);
 
-	struct ssrc_ctx *ssrc_ctx = ps->ssrc_in;
-	if (!ssrc_ctx) {
-		if (!have_in_lock)
-			mutex_unlock(&ps->in_lock);
-		return;
-	}
-	struct ssrc_entry_call *parent = ssrc_ctx->parent;
-
 	__re_address_translate_ep(&local, &ps->selected_sfd->socket.local);
-	struct rtpengine_ssrc_stats stats;
-	if (kernel_update_stats(&local, htonl(parent->h.ssrc), &stats)) {
+	struct rtpengine_stats_info stats_info;
+	if (kernel_update_stats(&local, &stats_info)) {
 		if (!have_in_lock)
 			mutex_unlock(&ps->in_lock);
 		return;
 	}
 
-	if (!stats.basic_stats.packets) {
-		// no change
-		if (!have_in_lock)
-			mutex_unlock(&ps->in_lock);
-		return;
+	for (unsigned int u = 0; u < G_N_ELEMENTS(stats_info.ssrc); u++) {
+		// check for the right SSRC association
+		if (!stats_info.ssrc[u]) // end of list
+			break;
+		struct ssrc_ctx *ssrc_ctx = __hunt_ssrc_ctx(ntohl(stats_info.ssrc[u]),
+				ps->ssrc_in, u);
+		if (!ssrc_ctx)
+			continue;
+		struct ssrc_entry_call *parent = ssrc_ctx->parent;
+
+		if (!stats_info.ssrc_stats[u].basic_stats.packets) // no change
+			continue;
+
+		atomic64_add(&ssrc_ctx->packets, stats_info.ssrc_stats[u].basic_stats.packets);
+		atomic64_add(&ssrc_ctx->octets, stats_info.ssrc_stats[u].basic_stats.bytes);
+		parent->packets_lost += stats_info.ssrc_stats[u].total_lost; // XXX should be atomic?
+		atomic64_set(&ssrc_ctx->last_seq, stats_info.ssrc_stats[u].ext_seq);
+		atomic64_set(&ssrc_ctx->last_ts, stats_info.ssrc_stats[u].timestamp);
+		parent->jitter = stats_info.ssrc_stats[u].jitter;
+
+		uint32_t ssrc_map_out = ssrc_ctx->ssrc_map_out;
+
+		// update opposite outgoing SSRC
+		if (mutex_trylock(&ps->out_lock))
+			continue; // will have to skip this
+
+		ssrc_ctx = __hunt_ssrc_ctx(ssrc_map_out, ps->ssrc_out, u);
+
+		if (ssrc_ctx) {
+			parent = ssrc_ctx->parent;
+			atomic64_add(&ssrc_ctx->packets, stats_info.ssrc_stats[u].basic_stats.packets);
+			atomic64_add(&ssrc_ctx->octets, stats_info.ssrc_stats[u].basic_stats.bytes);
+		}
+		mutex_unlock(&ps->out_lock);
 	}
-
-	atomic64_add(&ssrc_ctx->packets, stats.basic_stats.packets);
-	atomic64_add(&ssrc_ctx->octets, stats.basic_stats.bytes);
-	atomic64_add(&ssrc_ctx->packets_lost, stats.total_lost);
-	atomic64_set(&ssrc_ctx->last_seq, stats.ext_seq);
-	atomic64_set(&ssrc_ctx->last_ts, stats.timestamp);
-	parent->jitter = stats.jitter;
-
-	uint32_t ssrc_map_out = ssrc_ctx->ssrc_map_out;
 
 	if (!have_in_lock)
 		mutex_unlock(&ps->in_lock);
-
-	// update opposite outgoing SSRC
-	if (!have_in_lock)
-		mutex_lock(&ps->out_lock);
-	else {
-		if (mutex_trylock(&ps->out_lock))
-			return; // will have to skip this
-	}
-	ssrc_ctx = ps->ssrc_out;
-	if (ssrc_ctx) {
-		parent = ssrc_ctx->parent;
-		if (parent->h.ssrc == ssrc_map_out) {
-			atomic64_add(&ssrc_ctx->packets, stats.basic_stats.packets);
-			atomic64_add(&ssrc_ctx->octets, stats.basic_stats.bytes);
-		}
-	}
-	mutex_unlock(&ps->out_lock);
 }
 
 
@@ -1320,12 +1473,19 @@ static void __stream_update_stats(struct packet_stream *ps, int have_in_lock) {
 void __unkernelize(struct packet_stream *p) {
 	struct re_address rea;
 
+	reset_ps_kernel_stats(p);
+
+	if (!p->selected_sfd)
+		return;
+
 	if (!PS_ISSET(p, KERNELIZED))
 		return;
 	if (PS_ISSET(p, NO_KERNEL_SUPPORT))
 		return;
 
 	if (kernel.is_open) {
+		ilog(LOG_INFO, "Removing media stream from kernel: local %s",
+				endpoint_print_buf(&p->selected_sfd->socket.local));
 		__stream_update_stats(p, 1);
 		__re_address_translate_ep(&rea, &p->selected_sfd->socket.local);
 		kernel_del_stream(&rea);
@@ -1335,11 +1495,25 @@ void __unkernelize(struct packet_stream *p) {
 }
 
 
+void __reset_sink_handlers(struct packet_stream *ps) {
+	for (GList *l = ps->rtp_sinks.head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		sh->handler = NULL;
+	}
+	for (GList *l = ps->rtcp_sinks.head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		sh->handler = NULL;
+	}
+}
 void __stream_unconfirm(struct packet_stream *ps) {
 	__unkernelize(ps);
-	if (!MEDIA_ISSET(ps->media, ASYMMETRIC))
+	if (!MEDIA_ISSET(ps->media, ASYMMETRIC)) {
+		if (ps->selected_sfd)
+			ilog(LOG_DEBUG | LOG_FLAG_LIMIT, "Unconfirming peer address for local %s",
+					endpoint_print_buf(&ps->selected_sfd->socket.local));
 		PS_CLEAR(ps, CONFIRMED);
-	ps->handler = NULL;
+	}
+	__reset_sink_handlers(ps);
 }
 static void stream_unconfirm(struct packet_stream *ps) {
 	if (!ps)
@@ -1347,6 +1521,12 @@ static void stream_unconfirm(struct packet_stream *ps) {
 	mutex_lock(&ps->in_lock);
 	__stream_unconfirm(ps);
 	mutex_unlock(&ps->in_lock);
+}
+static void unconfirm_sinks(GQueue *q) {
+	for (GList *l = q->head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		stream_unconfirm(sh->sink);
+	}
 }
 void unkernelize(struct packet_stream *ps) {
 	if (!ps)
@@ -1369,6 +1549,8 @@ void media_update_stats(struct call_media *m) {
 			continue;
 		if (!PS_ISSET(ps, KERNELIZED))
 			continue;
+		if (PS_ISSET(ps, NO_KERNEL_SUPPORT))
+			continue;
 
 		__stream_update_stats(ps, 0);
 	}
@@ -1376,10 +1558,11 @@ void media_update_stats(struct call_media *m) {
 
 
 
+// `out_media` can be NULL
 const struct streamhandler *determine_handler(const struct transport_protocol *in_proto,
 		struct call_media *out_media, int must_recrypt)
 {
-	const struct transport_protocol *out_proto = out_media->protocol;
+	const struct transport_protocol *out_proto = out_media ? out_media->protocol : NULL;
 	const struct streamhandler * const *sh_pp, *sh;
 	const struct streamhandler * const * const *matrix;
 
@@ -1392,8 +1575,8 @@ const struct streamhandler *determine_handler(const struct transport_protocol *i
 		goto err;
 
 	// special handling for RTP/AVP with advertised a=rtcp-fb
-	int out_proto_idx = out_proto->index;
-	if (out_media && MEDIA_ISSET(out_media, RTCP_FB)) {
+	int out_proto_idx = out_proto ? out_proto->index : in_proto->index;
+	if (out_media && MEDIA_ISSET(out_media, RTCP_FB) && out_proto) {
 		if (!out_proto->avpf && out_proto->avpf_proto)
 			out_proto_idx = out_proto->avpf_proto;
 	}
@@ -1409,103 +1592,125 @@ err:
 }
 
 /* must be called with call->master_lock held in R, and in->in_lock held */
-static void __determine_handler(struct packet_stream *in, const struct packet_stream *out) {
+// `sh` can be null
+static const struct streamhandler *__determine_handler(struct packet_stream *in, struct sink_handler *sh) {
 	const struct transport_protocol *in_proto, *out_proto;
 	int must_recrypt = 0;
+	struct packet_stream *out = sh ? sh->sink : NULL;
+	const struct streamhandler *ret = NULL;
 
-	if (in->handler)
-		return;
+	if (sh && sh->handler)
+		return sh->handler;
 	if (MEDIA_ISSET(in->media, PASSTHRU))
 		goto noop;
 
 	in_proto = in->media->protocol;
-	out_proto = out->media->protocol;
+	out_proto = out ? out->media->protocol : NULL;
 
 	if (!in_proto)
 		goto err;
-	if (!out_proto)
-		goto err;
 
-	if (dtmf_do_logging())
+	if (!sh)
 		must_recrypt = 1;
-	else if (MEDIA_ISSET(in->media, DTLS) || MEDIA_ISSET(out->media, DTLS))
+	else if (dtmf_do_logging())
 		must_recrypt = 1;
-	else if (MEDIA_ISSET(in->media, TRANSCODE) || MEDIA_ISSET(out->media, TRANSCODE))
+	else if (MEDIA_ISSET(in->media, DTLS) || (out && MEDIA_ISSET(out->media, DTLS)))
+		must_recrypt = 1;
+	else if (MEDIA_ISSET(in->media, TRANSCODE) || (out && MEDIA_ISSET(out->media, TRANSCODE)))
 		must_recrypt = 1;
 	else if (in->call->recording)
 		must_recrypt = 1;
-	else if (in_proto->srtp && out_proto->srtp
-			&& in->selected_sfd && out->selected_sfd
+	else if (in->rtp_sinks.length > 1 || in->rtcp_sinks.length > 1) // need a proper decrypter?
+		must_recrypt = 1;
+	else if (in_proto->srtp && out_proto && out_proto->srtp
+			&& in->selected_sfd && out && out->selected_sfd
 			&& (crypto_params_cmp(&in->crypto.params, &out->selected_sfd->crypto.params)
 				|| crypto_params_cmp(&out->crypto.params, &in->selected_sfd->crypto.params)))
 		must_recrypt = 1;
 
-	in->handler = determine_handler(in_proto, out->media, must_recrypt);
-	return;
+	ret = determine_handler(in_proto, out ? out->media : NULL, must_recrypt);
+	if (sh)
+		sh->handler = ret;
+	return ret;
 
 err:
 	ilog(LOG_WARNING, "Unknown transport protocol encountered");
 noop:
-	in->handler = &__sh_noop;
-	return;
+	ret = &__sh_noop;
+	if (sh)
+		sh->handler = ret;
+	return ret;
 }
 
 
-// check and update SSRC pointers
-static void __stream_ssrc(struct packet_stream *in_srtp, struct packet_stream *out_srtp, uint32_t ssrc_bs,
-		struct ssrc_ctx **ssrc_in_p, struct ssrc_ctx **ssrc_out_p, struct ssrc_hash *ssrc_hash, struct packet_handler_ctx *phc)
+static bool __stream_ssrc_inout(struct packet_stream *ps, uint32_t ssrc, mutex_t *lock,
+		struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING], unsigned int *ctx_idx_p,
+		uint32_t output_ssrc,
+		struct ssrc_ctx **output, struct ssrc_hash *ssrc_hash, enum ssrc_dir dir, const char *label)
 {
-	uint32_t in_ssrc = ntohl(ssrc_bs);
-	uint32_t out_ssrc;
+	int changed = false;
 
-	// input direction
-	mutex_lock(&in_srtp->in_lock);
+	mutex_lock(lock);
 
-	(*ssrc_in_p) = in_srtp->ssrc_in;
-	ssrc_ctx_hold(*ssrc_in_p);
-	if (G_UNLIKELY(!(*ssrc_in_p) || (*ssrc_in_p)->parent->h.ssrc != in_ssrc)) {
-		// SSRC mismatch - get the new entry
-		ssrc_ctx_put(ssrc_in_p);
-		ssrc_ctx_put(&in_srtp->ssrc_in);
-		(*ssrc_in_p) = in_srtp->ssrc_in =
-			get_ssrc_ctx(in_ssrc, ssrc_hash, SSRC_DIR_INPUT, in_srtp->media->monologue);
-		ssrc_ctx_hold(in_srtp->ssrc_in);
+	int ctx_idx = __hunt_ssrc_ctx_idx(ssrc, list, 0);
+	if (ctx_idx == -1) {
+		// SSRC mismatch - get the new entry:
+		// move to next slot
+		ctx_idx = (*ctx_idx_p + 1) % RTPE_NUM_SSRC_TRACKING;
+		*ctx_idx_p = ctx_idx;
+		// eject old entry if present
+		if (list[ctx_idx])
+			ssrc_ctx_put(&list[ctx_idx]);
+		// get new entry
+		list[ctx_idx] =
+			get_ssrc_ctx(ssrc, ssrc_hash, dir, ps->media->monologue);
 
-		phc->unkernelize = 1;
-		ilog(LOG_DEBUG, ">>> in_ssrc changed for: %s%s:%d new: %x %s",
-                        FMT_M(sockaddr_print_buf(&in_srtp->endpoint.address), in_srtp->endpoint.port, in_ssrc));
+		changed = true;
+		ilog(LOG_DEBUG, "New %s SSRC for: %s%s:%d SSRC: %x%s", label,
+                        FMT_M(sockaddr_print_buf(&ps->endpoint.address), ps->endpoint.port, ssrc));
+	}
+	if (ctx_idx != 0) {
+		// move most recent entry to front of the list
+		struct ssrc_ctx *tmp = list[0];
+		list[0] = list[ctx_idx];
+		list[ctx_idx] = tmp;
+		ctx_idx = 0;
 	}
 
-	// make sure we reset the output SSRC if we're not transcoding
-	if (!MEDIA_ISSET(in_srtp->media, TRANSCODE) && !MEDIA_ISSET(in_srtp->media, ECHO))
-		(*ssrc_in_p)->ssrc_map_out = in_ssrc;
-
-	out_ssrc = (*ssrc_in_p)->ssrc_map_out;
-	mutex_unlock(&in_srtp->in_lock);
-
-	// out direction
-	mutex_lock(&out_srtp->out_lock);
-
-	(*ssrc_out_p) = out_srtp->ssrc_out;
-	ssrc_ctx_hold(*ssrc_out_p);
-	if (G_UNLIKELY(!(*ssrc_out_p) || (*ssrc_out_p)->parent->h.ssrc != out_ssrc)) {
-		// SSRC mismatch - get the new entry
-		ssrc_ctx_put(ssrc_out_p);
-		ssrc_ctx_put(&out_srtp->ssrc_out);
-		(*ssrc_out_p) = out_srtp->ssrc_out =
-			get_ssrc_ctx(out_ssrc, ssrc_hash, SSRC_DIR_OUTPUT, out_srtp->media->monologue);
-		ssrc_ctx_hold(out_srtp->ssrc_out);
-
-		// coverity[missing_lock : FALSE]
-		phc->unkernelize = 1;
-		ilog(LOG_DEBUG, ">>> out_ssrc changed for %s%s:%d new: %x %s",
-                        FMT_M(sockaddr_print_buf(&out_srtp->endpoint.address), out_srtp->endpoint.port, out_ssrc));
-	}
+	// extract and hold entry (ctx_idx == 0)
+	if (*output)
+		ssrc_ctx_put(output);
+	*output = list[0];
+	ssrc_ctx_hold(*output);
 
 	// reverse SSRC mapping
-	(*ssrc_out_p)->ssrc_map_out = in_ssrc;
+	if (!output_ssrc) {
+		// make sure we reset the output SSRC if we're not transcoding
+		if (!MEDIA_ISSET(ps->media, TRANSCODE) && !MEDIA_ISSET(ps->media, ECHO))
+			(*output)->ssrc_map_out = ssrc;
+	}
+	else {
+		(*output)->ssrc_map_out = output_ssrc;
+	}
 
-	mutex_unlock(&out_srtp->out_lock);
+	mutex_unlock(lock);
+	return changed;
+}
+// check and update input SSRC pointers
+static bool __stream_ssrc_in(struct packet_stream *in_srtp, uint32_t ssrc_bs,
+		struct ssrc_ctx **ssrc_in_p, struct ssrc_hash *ssrc_hash)
+{
+	return __stream_ssrc_inout(in_srtp, ntohl(ssrc_bs), &in_srtp->in_lock, in_srtp->ssrc_in,
+			&in_srtp->ssrc_in_idx, 0, ssrc_in_p, ssrc_hash, SSRC_DIR_INPUT, "ingress");
+}
+// check and update output SSRC pointers
+static bool __stream_ssrc_out(struct packet_stream *out_srtp, uint32_t ssrc_bs,
+		struct ssrc_ctx *ssrc_in, struct ssrc_ctx **ssrc_out_p, struct ssrc_hash *ssrc_hash)
+{
+	return __stream_ssrc_inout(out_srtp, ssrc_in->ssrc_map_out, &out_srtp->out_lock,
+			out_srtp->ssrc_out,
+			&out_srtp->ssrc_out_idx, ntohl(ssrc_bs), ssrc_out_p, ssrc_hash, SSRC_DIR_OUTPUT,
+			"egress");
 }
 
 
@@ -1577,35 +1782,44 @@ loop_ok:
 
 
 
-// in_srtp and out_srtp are set to point to the SRTP contexts to use
-// sink is set to where to forward the packet to
+// in_srtp is set to point to the SRTP context to use
+// sinks is set to where to forward the packet to
 static void media_packet_rtcp_demux(struct packet_handler_ctx *phc)
 {
 	phc->in_srtp = phc->mp.stream;
-	phc->sink = phc->mp.stream->rtp_sink;
-	if (!phc->sink && PS_ISSET(phc->mp.stream, RTCP)) {
-		phc->sink = phc->mp.stream->rtcp_sink;
-		phc->rtcp = 1;
-	}
-	else if (phc->mp.stream->rtcp_sink) {
-		int muxed_rtcp = rtcp_demux(&phc->s, phc->mp.media);
-		if (muxed_rtcp == 2) {
-			phc->sink = phc->mp.stream->rtcp_sink;
+	phc->sinks = &phc->mp.stream->rtp_sinks;
+	// is this RTCP?
+	if (PS_ISSET(phc->mp.stream, RTCP)) {
+		int is_rtcp = 1;
+		// plain RTCP or are we muxing?
+		if (MEDIA_ISSET(phc->mp.media, RTCP_MUX)) {
+			is_rtcp = 0;
+			int muxed_rtcp = rtcp_demux(&phc->s, phc->mp.media);
+			if (muxed_rtcp == 2) {
+				is_rtcp = 1;
+				if (phc->mp.stream->rtcp_sibling)
+					phc->in_srtp = phc->mp.stream->rtcp_sibling; // use RTCP SRTP context
+			}
+		}
+		if (is_rtcp) {
+			phc->sinks = &phc->mp.stream->rtcp_sinks;
 			phc->rtcp = 1;
-			phc->in_srtp = phc->mp.stream->rtcp_sibling; // use RTCP SRTP context
 		}
 	}
-	phc->out_srtp = phc->sink;
-	if (!phc->sink)
-		return;
-	if (phc->rtcp && phc->sink->rtcp_sibling)
-		phc->out_srtp = phc->sink->rtcp_sibling; // use RTCP SRTP context
+}
+// out_srtp is set to point to the SRTP context to use
+static void media_packet_rtcp_mux(struct packet_handler_ctx *phc, struct sink_handler *sh)
+{
+	phc->out_srtp = sh->sink;
+	if (phc->rtcp && sh->sink->rtcp_sibling)
+		phc->out_srtp = sh->sink->rtcp_sibling; // use RTCP SRTP context
 
-	phc->mp.media_out = phc->sink->media;
+	phc->mp.media_out = sh->sink->media;
+	phc->mp.sink = *sh;
 }
 
 
-static void media_packet_rtp(struct packet_handler_ctx *phc)
+static void media_packet_rtp_in(struct packet_handler_ctx *phc)
 {
 	phc->payload_type = -1;
 
@@ -1614,12 +1828,13 @@ static void media_packet_rtp(struct packet_handler_ctx *phc)
 	if (G_UNLIKELY(!proto_is_rtp(phc->mp.media->protocol)))
 		return;
 
+	bool unkern = false;
+
 	if (G_LIKELY(!phc->rtcp && !rtp_payload(&phc->mp.rtp, &phc->mp.payload, &phc->s))) {
 		rtp_padding(phc->mp.rtp, &phc->mp.payload);
 
-		if (G_LIKELY(phc->out_srtp != NULL))
-			__stream_ssrc(phc->in_srtp, phc->out_srtp, phc->mp.rtp->ssrc, &phc->mp.ssrc_in,
-					&phc->mp.ssrc_out, phc->mp.call->ssrc_hash, phc);
+		unkern = __stream_ssrc_in(phc->in_srtp, phc->mp.rtp->ssrc, &phc->mp.ssrc_in,
+				phc->mp.media->monologue->ssrc_hash);
 
 		// check the payload type
 		// XXX redundant between SSRC handling and codec_handler stuff -> combine
@@ -1630,14 +1845,15 @@ static void media_packet_rtp(struct packet_handler_ctx *phc)
 		// XXX yet another hash table per payload type -> combine
 		struct rtp_stats *rtp_s = g_atomic_pointer_get(&phc->mp.stream->rtp_stats_cache);
 		if (G_UNLIKELY(!rtp_s) || G_UNLIKELY(rtp_s->payload_type != phc->payload_type))
-			rtp_s = g_hash_table_lookup(phc->mp.stream->rtp_stats, GINT_TO_POINTER(phc->payload_type));
+			rtp_s = g_hash_table_lookup(phc->mp.stream->rtp_stats,
+					GUINT_TO_POINTER(phc->payload_type));
 		if (!rtp_s) {
 			ilog(LOG_NOTICE | LOG_FLAG_LIMIT,
 					"RTP packet with unknown payload type %u received from %s%s%s",
 					phc->payload_type,
 					FMT_M(endpoint_print_buf(&phc->mp.fsin)));
 			atomic64_inc(&phc->mp.stream->stats.errors);
-			RTPE_STATS_INC(errors, 1);
+			RTPE_STATS_INC(errors_user);
 		}
 		else {
 			atomic64_inc(&rtp_s->packets);
@@ -1646,28 +1862,45 @@ static void media_packet_rtp(struct packet_handler_ctx *phc)
 		}
 	}
 	else if (phc->rtcp && !rtcp_payload(&phc->mp.rtcp, NULL, &phc->s)) {
-		if (G_LIKELY(phc->out_srtp != NULL))
-			__stream_ssrc(phc->in_srtp, phc->out_srtp, phc->mp.rtcp->ssrc, &phc->mp.ssrc_in,
-					&phc->mp.ssrc_out, phc->mp.call->ssrc_hash, phc);
+		unkern = __stream_ssrc_in(phc->in_srtp, phc->mp.rtcp->ssrc, &phc->mp.ssrc_in,
+				phc->mp.media->monologue->ssrc_hash);
 	}
+
+	if (unkern)
+		phc->unkernelize = 1;
+}
+static void media_packet_rtp_out(struct packet_handler_ctx *phc)
+{
+	if (G_UNLIKELY(!proto_is_rtp(phc->mp.media->protocol)))
+		return;
+
+	bool unkern = 0;
+
+	if (G_LIKELY(!phc->rtcp && phc->mp.rtp)) {
+		unkern = __stream_ssrc_out(phc->out_srtp, phc->mp.rtp->ssrc, phc->mp.ssrc_in,
+				&phc->mp.ssrc_out, phc->mp.media_out->monologue->ssrc_hash);
+	}
+	else if (phc->rtcp && phc->mp.rtcp) {
+		unkern = __stream_ssrc_out(phc->out_srtp, phc->mp.rtcp->ssrc, phc->mp.ssrc_in,
+				&phc->mp.ssrc_out, phc->mp.media_out->monologue->ssrc_hash);
+	}
+
+	if (unkern)
+		phc->unkernelize = 1;
 }
 
 
 static int media_packet_decrypt(struct packet_handler_ctx *phc)
 {
 	mutex_lock(&phc->in_srtp->in_lock);
-	__determine_handler(phc->in_srtp, phc->sink);
+	struct sink_handler *first_sh = phc->sinks->length ? phc->sinks->head->data : NULL;
+	const struct streamhandler *sh = __determine_handler(phc->in_srtp, first_sh);
 
 	// XXX use an array with index instead of if/else
-	if (G_LIKELY(!phc->rtcp)) {
-		phc->decrypt_func = phc->in_srtp->handler->in->rtp_crypt;
-		phc->encrypt_func = phc->in_srtp->handler->out->rtp_crypt;
-	}
-	else {
-		phc->decrypt_func = phc->in_srtp->handler->in->rtcp_crypt;
-		phc->encrypt_func = phc->in_srtp->handler->out->rtcp_crypt;
-		phc->rtcp_filter = phc->in_srtp->handler->in->rtcp_filter;
-	}
+	if (G_LIKELY(!phc->rtcp))
+		phc->decrypt_func = sh->in->rtp_crypt;
+	else
+		phc->decrypt_func = sh->in->rtcp_crypt;
 
 	/* return values are: 0 = forward packet, -1 = error/don't forward,
 	 * 1 = forward and push update to redis */
@@ -1687,6 +1920,20 @@ static int media_packet_decrypt(struct packet_handler_ctx *phc)
 		ret = 0;
 	}
 	return ret;
+}
+static void media_packet_set_encrypt(struct packet_handler_ctx *phc, struct sink_handler *sh)
+{
+	mutex_lock(&phc->in_srtp->in_lock);
+	__determine_handler(phc->in_srtp, sh);
+
+	// XXX use an array with index instead of if/else
+	if (G_LIKELY(!phc->rtcp))
+		phc->encrypt_func = sh->handler->out->rtp_crypt;
+	else {
+		phc->encrypt_func = sh->handler->out->rtcp_crypt;
+		phc->rtcp_filter = sh->handler->in->rtcp_filter;
+	}
+	mutex_unlock(&phc->in_srtp->in_lock);
 }
 
 int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, struct media_packet *mp) {
@@ -1750,13 +1997,19 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 		}
 	}
 
+	PS_SET(phc->mp.stream, RECEIVED);
+
 	/* do not pay attention to source addresses of incoming packets for asymmetric streams */
 	if (MEDIA_ISSET(phc->mp.media, ASYMMETRIC) || rtpe_config.endpoint_learning == EL_OFF)
 		PS_SET(phc->mp.stream, CONFIRMED);
 
-	/* confirm sink for unidirectional streams in order to kernelize */
-	if (MEDIA_ISSET(phc->mp.media, UNIDIRECTIONAL))
-		PS_SET(phc->sink, CONFIRMED);
+	/* confirm sinks for unidirectional streams in order to kernelize */
+	if (MEDIA_ISSET(phc->mp.media, UNIDIRECTIONAL)) {
+		for (GList *l = phc->sinks->head; l; l = l->next) {
+			struct sink_handler *sh = l->data;
+			PS_SET(sh->sink, CONFIRMED);
+		}
+	}
 
 	/* if we have already updated the endpoint in the past ... */
 	if (PS_ISSET(phc->mp.stream, CONFIRMED)) {
@@ -1771,6 +2024,7 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 				ilog(LOG_INFO | LOG_FLAG_LIMIT, "Peer address changed to %s%s%s",
 						FMT_M(endpoint_print_buf(&phc->mp.fsin)));
 				phc->unkernelize = 1;
+				phc->unconfirm = 1;
 				phc->update = 1;
 				phc->mp.stream->endpoint = phc->mp.fsin;
 				goto update_addr;
@@ -1792,6 +2046,12 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 		phc->kernelize = 1;
 		goto out;
 	}
+
+	/* wait at least 3 seconds after last signal before committing to a particular
+	 * endpoint address */
+	bool wait_time = false;
+	if (!phc->mp.call->last_signal || rtpe_now.tv_sec <= phc->mp.call->last_signal + 3)
+		wait_time = true;
 
 	const struct endpoint *use_endpoint_confirm = &phc->mp.fsin;
 
@@ -1831,9 +2091,7 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 		}
 	}
 
-	/* wait at least 3 seconds after last signal before committing to a particular
-	 * endpoint address */
-	if (!phc->mp.call->last_signal || rtpe_now.tv_sec <= phc->mp.call->last_signal + 3)
+	if (wait_time)
 		goto update_peerinfo;
 
 confirm_now:
@@ -1846,11 +2104,22 @@ confirm_now:
 
 update_peerinfo:
 	mutex_lock(&phc->mp.stream->out_lock);
-	endpoint = phc->mp.stream->endpoint;
-	phc->mp.stream->endpoint = *use_endpoint_confirm;
-	if (memcmp(&endpoint, &phc->mp.stream->endpoint, sizeof(endpoint))) {
-		phc->unkernelize = 1;
-		phc->update = 1;
+	// if we're during the wait time, check the received address against the previously
+	// learned address. if they're the same, ignore this packet for learning purposes
+	if (!wait_time || !phc->mp.stream->learned_endpoint.address.family ||
+			memcmp(use_endpoint_confirm, &phc->mp.stream->learned_endpoint, sizeof(endpoint)))
+	{
+		endpoint = phc->mp.stream->endpoint;
+		phc->mp.stream->endpoint = *use_endpoint_confirm;
+		phc->mp.stream->learned_endpoint = *use_endpoint_confirm;
+		if (memcmp(&endpoint, &phc->mp.stream->endpoint, sizeof(endpoint))) {
+			ilog(LOG_DEBUG | LOG_FLAG_LIMIT, "Peer address changed from %s%s%s to %s%s%s",
+					FMT_M(endpoint_print_buf(&endpoint)),
+					FMT_M(endpoint_print_buf(use_endpoint_confirm)));
+			phc->unkernelize = 1;
+			phc->update = 1;
+			phc->unkernelize_subscriptions = 1;
+		}
 	}
 update_addr:
 	mutex_unlock(&phc->mp.stream->out_lock);
@@ -1862,6 +2131,7 @@ update_addr:
 		phc->mp.stream->selected_sfd = phc->mp.sfd;
 		phc->unkernelize = 1;
 		phc->update = 1;
+		phc->unkernelize_subscriptions = 1;
 	}
 
 out:
@@ -1873,35 +2143,12 @@ out:
 
 static void media_packet_kernel_check(struct packet_handler_ctx *phc) {
 	if (PS_ISSET(phc->mp.stream, NO_KERNEL_SUPPORT)) {
-		__C_DBG("stream %s:%d NO_KERNEL_SUPPORT", sockaddr_print_buf(&phc->mp.stream->endpoint.address), phc->mp.stream->endpoint.port);
+		__C_DBG("stream %s%s%s NO_KERNEL_SUPPORT", FMT_M(endpoint_print_buf(&phc->mp.stream->endpoint)));
 		return;
 	}
 
 	if (!PS_ISSET(phc->mp.stream, CONFIRMED)) {
-		__C_DBG("stream %s:%d not CONFIRMED", sockaddr_print_buf(&phc->mp.stream->endpoint.address),
-				phc->mp.stream->endpoint.port);
-		return;
-	}
-
-	if (!phc->sink) {
-		__C_DBG("sink is NULL for stream %s:%d", sockaddr_print_buf(&phc->mp.stream->endpoint.address),
-				phc->mp.stream->endpoint.port);
-		return;
-	}
-
-	if (MEDIA_ISSET(phc->sink->media, ASYMMETRIC))
-		PS_SET(phc->sink, CONFIRMED);
-
-	if (!PS_ISSET(phc->sink, CONFIRMED)) {
-		__C_DBG("sink not CONFIRMED for stream %s:%d",
-				sockaddr_print_buf(&phc->mp.stream->endpoint.address),
-				phc->mp.stream->endpoint.port);
-		return;
-	}
-
-	if (!PS_ISSET(phc->sink, FILLED)) {
-		__C_DBG("sink not FILLED for stream %s:%d", sockaddr_print_buf(&phc->mp.stream->endpoint.address),
-				phc->mp.stream->endpoint.port);
+		__C_DBG("stream %s%s%s not CONFIRMED", FMT_M(endpoint_print_buf(&phc->mp.stream->endpoint)));
 		return;
 	}
 
@@ -1911,30 +2158,30 @@ static void media_packet_kernel_check(struct packet_handler_ctx *phc) {
 }
 
 
-static int do_rtcp(struct packet_handler_ctx *phc) {
-	int ret = -1;
-
-	GQueue rtcp_list = G_QUEUE_INIT;
-	int rtcp_ret = rtcp_parse(&rtcp_list, &phc->mp);
+static int do_rtcp_parse(struct packet_handler_ctx *phc) {
+	int rtcp_ret = rtcp_parse(&phc->rtcp_list, &phc->mp);
 	if (rtcp_ret < 0)
-		goto out;
+		return -1;
 	if (rtcp_ret == 1)
-		goto ok;
+		phc->rtcp_discard = 1;
+	return 0;
+}
+static int do_rtcp_output(struct packet_handler_ctx *phc) {
+	if (phc->rtcp_discard)
+		return 0;
+
 	if (phc->rtcp_filter)
-		if (phc->rtcp_filter(&phc->mp, &rtcp_list))
-			goto out;
+		if (phc->rtcp_filter(&phc->mp, &phc->rtcp_list))
+			return -1;
 
 	// queue for output
 	codec_add_raw_packet(&phc->mp, 0);
-ok:
-	ret = 0;
-out:
-	rtcp_list_free(&rtcp_list);
-	return ret;
+	return 0;
 }
 
 
 // appropriate locks must be held
+// only frees the output queue if no `sink` is given
 int media_socket_dequeue(struct media_packet *mp, struct packet_stream *sink) {
 	struct codec_packet *p;
 	while ((p = g_queue_pop_head(&mp->packets_out))) {
@@ -1967,9 +2214,49 @@ void media_packet_release(struct media_packet *mp) {
 		obj_put(&mp->ssrc_in->parent->h);
 	if (mp->ssrc_out)
 		obj_put(&mp->ssrc_out->parent->h);
-	g_queue_clear_full(&mp->packets_out, codec_packet_free);
+	media_socket_dequeue(mp, NULL);
 	g_free(mp->rtp);
 	g_free(mp->rtcp);
+	ZERO(*mp);
+}
+
+
+static int media_packet_queue_dup(GQueue *q) {
+	for (GList *l = q->head; l; l = l->next) {
+		struct codec_packet *p = l->data;
+		if (p->free_func) // nothing to do, already private
+			continue;
+		char *buf = malloc(p->s.len + RTP_BUFFER_TAIL_ROOM);
+		if (!buf)
+			return -1;
+		memcpy(buf, p->s.s, p->s.len);
+		p->s.s = buf;
+		p->free_func = free;
+	}
+	return 0;
+}
+
+// reverse of count_stream_stats_kernel()
+static void count_stream_stats_userspace(struct packet_stream *ps) {
+	if (!PS_ISSET(ps, RTP))
+		return;
+	if (bf_set(&ps->stats_flags, PS_STATS_USERSPACE))
+		return; // flag was already set, nothing to do
+
+	if (bf_isset(&ps->stats_flags, PS_STATS_KERNEL)) {
+		// mixed stream. count as only mixed stream.
+		if (bf_clear(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
+			RTPE_GAUGE_DEC(userspace_streams);
+		if (bf_clear(&ps->stats_flags, PS_STATS_KERNEL_COUNTED))
+			RTPE_GAUGE_DEC(kernel_only_streams);
+		if (!bf_set(&ps->stats_flags, PS_STATS_MIXED_COUNTED))
+			RTPE_GAUGE_INC(kernel_user_streams);
+	}
+	else {
+		// userspace-only (for now). count it.
+		if (!bf_set(&ps->stats_flags, PS_STATS_USERSPACE_COUNTED))
+			RTPE_GAUGE_INC(userspace_streams);
+	}
 }
 
 
@@ -1996,6 +2283,7 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 /* TODO move the above comments to the data structure definitions, if the above
  * always holds true */
 	int ret = 0, handler_ret = 0;
+	GQueue free_list = G_QUEUE_INIT;
 
 	phc->mp.call = phc->mp.sfd->call;
 
@@ -2004,11 +2292,12 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 	phc->mp.stream = phc->mp.sfd->stream;
 	if (G_UNLIKELY(!phc->mp.stream))
 		goto out;
-	__C_DBG("Handling packet on: %s:%d", sockaddr_print_buf(&phc->mp.stream->endpoint.address),
-			phc->mp.stream->endpoint.port);
+	__C_DBG("Handling packet on: %s", endpoint_print_buf(&phc->mp.stream->endpoint));
 
 
 	phc->mp.media = phc->mp.stream->media;
+
+	///////////////// INGRESS HANDLING
 
 	if (!phc->mp.stream->selected_sfd)
 		goto out;
@@ -2036,13 +2325,13 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 #endif
 
 	if (rtpe_config.active_switchover && IS_FOREIGN_CALL(phc->mp.call))
-		call_make_own_foreign(phc->mp.call, 0);
+		call_make_own_foreign(phc->mp.call, false);
 
-	// this sets rtcp, in_srtp, out_srtp, and sink
+	// this sets rtcp, in_srtp, and sinks
 	media_packet_rtcp_demux(phc);
 
-	// this set payload_type, ssrc_in, ssrc_out and mp
-	media_packet_rtp(phc);
+	// this set payload_type, ssrc_in, and mp payloads
+	media_packet_rtp_in(phc);
 
 	// SSRC receive stats
 	if (phc->mp.ssrc_in && phc->mp.rtp) {
@@ -2063,102 +2352,188 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 		}
 	}
 
-
-	/* do we have somewhere to forward it to? */
-
-	if (G_UNLIKELY(!phc->sink || !phc->sink->selected_sfd || !phc->out_srtp
-				|| !phc->out_srtp->selected_sfd || !phc->in_srtp->selected_sfd))
-	{
-		ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Media packet from %s%s%s discarded due to lack of sink",
-				FMT_M(endpoint_print_buf(&phc->mp.fsin)));
-		atomic64_inc(&phc->mp.stream->stats.errors);
-		RTPE_STATS_INC(errors, 1);
-		goto out;
-	}
-
-
+	// decrypt in place
+	// XXX check handler_ret along the paths
 	handler_ret = media_packet_decrypt(phc);
+	if (handler_ret < 0)
+		goto out; // receive error
 
 	// If recording pcap dumper is set, then we record the call.
 	if (phc->mp.call->recording)
 		dump_packet(&phc->mp, &phc->s);
 
-	// ready to process
-
 	phc->mp.raw = phc->s;
 
-	if (phc->rtcp) {
-		if (do_rtcp(phc))
-			goto drop;
+	// XXX separate stats for received/sent
+	if (atomic64_inc(&phc->mp.stream->stats.packets) == 0) {
+		if (phc->mp.stream->component == 1 && phc->mp.media->index == 1)
+			janus_media_up(phc->mp.media->monologue);
 	}
-	else {
-		struct codec_handler *transcoder = codec_handler_get(phc->mp.media, phc->payload_type);
-		// this transfers the packet from 's' to 'packets_out'
-		if (transcoder->func(transcoder, &phc->mp))
-			goto drop;
-	}
+	atomic64_add(&phc->mp.stream->stats.bytes, phc->s.len);
+	atomic64_set(&phc->mp.stream->last_packet, rtpe_now.tv_sec);
+	RTPE_STATS_INC(packets_user);
+	RTPE_STATS_ADD(bytes_user, phc->s.len);
 
-	if (G_LIKELY(handler_ret >= 0))
-		handler_ret = __media_packet_encrypt(phc);
-
-	if (phc->unkernelize) // for RTCP packet index updates
-		unkernelize(phc->mp.stream);
-
+	count_stream_stats_userspace(phc->mp.stream);
 
 	int address_check = media_packet_address_check(phc);
-	if (phc->kernelize)
-		media_packet_kernel_check(phc);
 	if (address_check)
 		goto drop;
 
-	mutex_lock(&phc->sink->out_lock);
+	///////////////// EGRESS HANDLING
 
-	if (!phc->sink->advertised_endpoint.port
-			|| (is_addr_unspecified(&phc->sink->advertised_endpoint.address)
-				&& !is_trickle_ice_address(&phc->sink->advertised_endpoint))
-			|| handler_ret < 0)
-	{
-		mutex_unlock(&phc->sink->out_lock);
-		goto drop;
+	str orig_raw = STR_NULL;
+
+	for (GList *sink = phc->sinks->head; sink; sink = sink->next) {
+		struct sink_handler *sh = sink->data;
+
+		// this sets rtcp, in_srtp, out_srtp, media_out, and sink
+		media_packet_rtcp_mux(phc, sh);
+
+		// this set ssrc_out
+		media_packet_rtp_out(phc);
+
+		rtcp_list_free(&phc->rtcp_list);
+
+		if (phc->rtcp) {
+			phc->rtcp_discard = 0;
+			handler_ret = -1;
+			// these functions may do in-place rewriting, but we may have multiple
+			// outputs - make a copy if this isn't the last sink
+			if (sink->next) {
+				if (!orig_raw.s)
+					orig_raw = phc->mp.raw;
+				char *buf = g_malloc(orig_raw.len + RTP_BUFFER_TAIL_ROOM);
+				memcpy(buf, orig_raw.s, orig_raw.len);
+				phc->mp.raw.s = buf;
+				g_queue_push_tail(&free_list, buf);
+			}
+			if (do_rtcp_parse(phc))
+				goto out;
+			if (phc->rtcp_discard)
+				goto next;
+		}
+
+		if (PS_ISSET(sh->sink, NAT_WAIT) && !PS_ISSET(sh->sink, RECEIVED)) {
+			ilog(LOG_DEBUG | LOG_FLAG_LIMIT,
+					"Media packet from %s%s%s discarded due to `NAT-wait` flag",
+					FMT_M(endpoint_print_buf(&phc->mp.fsin)));
+			goto next;
+		}
+
+		if (G_UNLIKELY(!sh->sink->selected_sfd || !phc->out_srtp
+					|| !phc->out_srtp->selected_sfd || !phc->in_srtp->selected_sfd))
+		{
+			errno = ENOENT;
+			ilog(LOG_WARNING | LOG_FLAG_LIMIT,
+					"Media packet from %s%s%s discarded due to lack of sink",
+					FMT_M(endpoint_print_buf(&phc->mp.fsin)));
+			goto err_next;
+		}
+
+		media_packet_set_encrypt(phc, sh);
+
+		if (phc->rtcp) {
+			if (do_rtcp_output(phc))
+				goto err_next;
+		}
+		else {
+			struct codec_handler *transcoder = codec_handler_get(phc->mp.media, phc->payload_type,
+					phc->mp.media_out);
+			// this transfers the packet from 's' to 'packets_out'
+			if (transcoder->func(transcoder, &phc->mp))
+				goto err_next;
+		}
+
+		// if this is not the last sink, duplicate the output queue packets if necessary
+		if (sink->next) {
+			ret = media_packet_queue_dup(&phc->mp.packets_out);
+			errno = ENOMEM;
+			if (ret)
+				goto err_next;
+		}
+
+		ret = __media_packet_encrypt(phc);
+		errno = ENOTTY;
+		if (ret)
+			goto err_next;
+
+		mutex_lock(&sh->sink->out_lock);
+
+		if (!sh->sink->advertised_endpoint.port
+				|| (is_addr_unspecified(&sh->sink->advertised_endpoint.address)
+					&& !is_trickle_ice_address(&sh->sink->advertised_endpoint)))
+		{
+			mutex_unlock(&sh->sink->out_lock);
+			goto next;
+		}
+
+		if (!MEDIA_ISSET(phc->mp.media, BLACKHOLE))
+			ret = media_socket_dequeue(&phc->mp, sh->sink);
+		else
+			ret = media_socket_dequeue(&phc->mp, NULL);
+
+		mutex_unlock(&sh->sink->out_lock);
+
+		if (ret == 0)
+			goto next;
+
+err_next:
+		ilog(LOG_DEBUG,"Error when sending message. Error: %s", strerror(errno));
+		atomic64_inc(&sh->sink->stats.errors);
+		RTPE_STATS_INC(errors_user);
+		goto next;
+
+next:
+		media_socket_dequeue(&phc->mp, NULL); // just free if anything left
+		ssrc_ctx_put(&phc->mp.ssrc_out);
 	}
 
-	if (!MEDIA_ISSET(phc->mp.media, BLACKHOLE))
-		ret = media_socket_dequeue(&phc->mp, phc->sink);
-	else
-		ret = media_socket_dequeue(&phc->mp, NULL);
+	///////////////// INGRESS POST-PROCESSING HANDLING
 
-	mutex_unlock(&phc->sink->out_lock);
-
-	if (ret == -1) {
-		ret = -errno;
-                ilog(LOG_DEBUG,"Error when sending message. Error: %s",strerror(errno));
-		atomic64_inc(&phc->mp.stream->stats.errors);
-		RTPE_STATS_INC(errors, 1);
-		goto out;
-	}
+	if (phc->unkernelize) // for RTCP packet index updates
+		unkernelize(phc->mp.stream);
+	if (phc->kernelize)
+		media_packet_kernel_check(phc);
 
 drop:
 	ret = 0;
-	// XXX separate stats for received/sent
-	atomic64_inc(&phc->mp.stream->stats.packets);
-	atomic64_add(&phc->mp.stream->stats.bytes, phc->s.len);
-	atomic64_set(&phc->mp.stream->last_packet, rtpe_now.tv_sec);
-	RTPE_STATS_INC(packets, 1);
-	RTPE_STATS_INC(bytes, phc->s.len);
+	handler_ret = 0;
 
 out:
-	if (phc->unkernelize) {
+	if (phc->unconfirm) {
 		stream_unconfirm(phc->mp.stream);
-		stream_unconfirm(phc->mp.stream->rtp_sink);
-		stream_unconfirm(phc->mp.stream->rtcp_sink);
+		unconfirm_sinks(&phc->mp.stream->rtp_sinks);
+		unconfirm_sinks(&phc->mp.stream->rtcp_sinks);
+	}
+	if (phc->unkernelize_subscriptions) {
+		// XXX optimise this triple loop?
+		for (GList *l = phc->mp.media->monologue->subscriptions.head; l; l = l->next) {
+			struct call_subscription *cs = l->data;
+			struct call_monologue *sub = cs->monologue;
+			for (GList *k = sub->medias.head; k; k = k->next) {
+				struct call_media *sub_media = k->data;
+				for (GList *m = sub_media->streams.head; m; m = m->next) {
+					struct packet_stream *sub_ps = m->data;
+					__unkernelize(sub_ps);
+				}
+			}
+		}
+	}
+
+	if (handler_ret < 0) {
+		atomic64_inc(&phc->mp.stream->stats.errors);
+		RTPE_STATS_INC(errors_user);
 	}
 
 	rwlock_unlock_r(&phc->mp.call->master_lock);
 
-	g_queue_clear_full(&phc->mp.packets_out, codec_packet_free);
+	media_socket_dequeue(&phc->mp, NULL); // just free
+	ssrc_ctx_put(&phc->mp.ssrc_out);
 
 	ssrc_ctx_put(&phc->mp.ssrc_in);
-	ssrc_ctx_put(&phc->mp.ssrc_out);
+	rtcp_list_free(&phc->rtcp_list);
+	g_queue_clear_full(&free_list, g_free);
 
 	return ret;
 }
@@ -2172,16 +2547,26 @@ static void stream_fd_readable(int fd, void *p, uintptr_t u) {
 	struct call *ca;
 
 	if (sfd->socket.fd != fd)
-		goto out;
+		return;
 
 	log_info_stream_fd(sfd);
+	int strikes = g_atomic_int_get(&sfd->error_strikes);
+
+	if (strikes >= MAX_RECV_LOOP_STRIKES) {
+		ilog(LOG_ERROR | LOG_FLAG_LIMIT, "UDP receive queue exceeded %i times: "
+				"discarding packet", strikes);
+		// Polling is edge-triggered so we won't immediately get here again.
+		// We could remove ourselves from the poller though. Maybe call stream_fd_closed?
+		return;
+	}
 
 	for (iters = 0; ; iters++) {
 #if MAX_RECV_ITERS
 		if (iters >= MAX_RECV_ITERS) {
-			ilog(LOG_ERROR, "Too many packets in UDP receive queue (more than %d), "
+			ilog(LOG_ERROR | LOG_FLAG_LIMIT, "Too many packets in UDP receive queue (more than %d), "
 					"aborting loop. Dropped packets possible", iters);
-			break;
+			g_atomic_int_inc(&sfd->error_strikes);
+			goto strike;
 		}
 #endif
 
@@ -2201,7 +2586,7 @@ static void stream_fd_readable(int fd, void *p, uintptr_t u) {
 			goto done;
 		}
 		if (ret >= MAX_RTP_PACKET_SIZE)
-			ilog(LOG_WARNING, "UDP packet possibly truncated");
+			ilog(LOG_WARNING | LOG_FLAG_LIMIT, "UDP packet possibly truncated");
 
 		str_init_len(&phc.s, buf + RTP_BUFFER_HEAD_ROOM, ret);
 
@@ -2214,12 +2599,16 @@ static void stream_fd_readable(int fd, void *p, uintptr_t u) {
 			ret = stream_packet(&phc);
 
 		if (G_UNLIKELY(ret < 0))
-			ilog(LOG_WARNING, "Write error on media socket: %s", strerror(-ret));
+			ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Write error on media socket: %s", strerror(-ret));
 		else if (phc.update)
 			update = 1;
 	}
 
-out:
+	// no strike
+	if (strikes > 0)
+		g_atomic_int_compare_and_exchange(&sfd->error_strikes, strikes, strikes - 1);
+
+strike:
 	ca = sfd->call ? : NULL;
 
 	if (ca && update) {

@@ -59,8 +59,6 @@ struct ssrc_ctx {
 	// RTCP stats
 	atomic64 packets,
 		 octets,
-		 packets_lost,
-		 duplicates,
 		 last_seq, // XXX dup with srtp_index?
 		 last_ts;
 
@@ -109,9 +107,14 @@ struct ssrc_entry_call {
 				*highest_mos,
 				average_mos; // contains a running tally of all stats blocks
 	uint16_t no_mos_count; // how many time we where not able to compute MOS due to missing RTT
-	uint32_t packets_lost; // RTCP cumulative number of packets lost
 	unsigned int last_rtt; // last calculated raw rtt without rtt from opposide side
 	unsigned int last_rtt_xr; // last rtt for both legs retreived from RTCP-XR BT-7
+
+	// input only - tracking for passthrough handling
+	uint32_t last_seq_tracked;
+	uint32_t lost_bits; // sliding bitfield, [0] = ext_seq
+	uint32_t packets_lost; // RTCP cumulative number of packets lost
+	uint32_t duplicates;
 
 	// for transcoding
 	// input only

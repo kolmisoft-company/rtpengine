@@ -820,6 +820,10 @@ or backwards (delayed) in case of a DTX buffer overflow or underflow. An
 underflow occurs when RTP packets are received slower than expected, while an
 overflow occurs when packets are received faster than expected.
 
+If this value is set to zero then no adjustments of the DTX timer will be made.
+Instead, in order to keep up with the flow of received RTP packets, packets
+will be dropped or additional DTX audio will be generated as needed.
+
 =item B<--dtx-cn-params=>I<INT>
 
 Specify one comfort noise parameter. This option follows the same format as
@@ -984,6 +988,17 @@ MOS calculation formula. Defaults to B<CQ> (conversational quality) which takes
 RTT into account and therefore requires peers to correctly send RTCP. If set to
 B<LQ> (listening quality) RTT is ignored, allowing a MOS to be calculated in
 the absence of RTCP.
+
+=item B<--socket-cpu-affinity=>I<INT>
+
+Enables setting the socket CPU affinity via the B<SO_INCOMING_CPU> socket
+option if available. The default value is zero which disables this feature. If
+set to a positive number then the CPU affinity for all sockets belonging to the
+same call will be set to the same value. The number specifies the upper limit
+of the affinity to be set, and values will be used in a round-robin fashion
+(e.g. if set to B<8> then the values B<0> through B<7> will be used to set the
+affinity). If this option is set to a negative number, then the number of
+available CPU cores will be used.
 
 =back
 

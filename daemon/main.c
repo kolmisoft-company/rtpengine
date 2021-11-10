@@ -16,6 +16,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <stdbool.h>
 #ifdef HAVE_MQTT
 #include <mosquitto.h>
 #endif
@@ -53,6 +54,7 @@
 #include "websocket.h"
 #include "codec.h"
 #include "mqtt.h"
+#include "janus.h"
 
 
 
@@ -556,6 +558,10 @@ static void options(int *argc, char ***argv) {
 		{ "mqtt-publish-scope",0,0,G_OPTION_ARG_STRING,	&mqtt_publish_scope,	"Scope for published mosquitto messages","global|call|media"},
 #endif
 		{ "mos",0,0,		G_OPTION_ARG_STRING,	&mos,		"Type of MOS calculation","CQ|LQ"},
+#ifdef SO_INCOMING_CPU
+		{ "socket-cpu-affinity",0,0,G_OPTION_ARG_INT,	&rtpe_config.cpu_affinity,"CPU affinity for media sockets","INT"},
+#endif
+		{ "janus-secret", 0,0,	G_OPTION_ARG_STRING,	&rtpe_config.janus_secret,"Admin secret for Janus protocol","STRING"},
 
 		{ NULL, }
 	};
@@ -825,7 +831,7 @@ static void options(int *argc, char ***argv) {
 	if (mos) {
 		if (!strcasecmp(mos, "cq"))
 			rtpe_config.mos = MOS_CQ;
-		else if (!strcmp(mos, "lq"))
+		else if (!strcasecmp(mos, "lq"))
 			rtpe_config.mos = MOS_LQ;
 		else
 			die("Invalid --mos option ('%s')", mos);
@@ -963,15 +969,16 @@ static void options_free(void) {
 	g_free(rtpe_config.https_key);
 	g_free(rtpe_config.software_id);
 	if (rtpe_config.cn_payload.s)
-		free(rtpe_config.cn_payload.s);
+		g_free(rtpe_config.cn_payload.s);
 	if (rtpe_config.dtx_cn_params.s)
-		free(rtpe_config.dtx_cn_params.s);
+		g_free(rtpe_config.dtx_cn_params.s);
 	g_free(rtpe_config.mqtt_user);
 	g_free(rtpe_config.mqtt_pass);
 	g_free(rtpe_config.mqtt_cafile);
 	g_free(rtpe_config.mqtt_certfile);
 	g_free(rtpe_config.mqtt_keyfile);
 	g_free(rtpe_config.mqtt_publish_topic);
+	g_free(rtpe_config.janus_secret);
 
 	// free common config options
 	config_load_free(&rtpe_config.common);
@@ -1020,6 +1027,7 @@ static void init_everything(void) {
 	if (rtpe_config.mqtt_host && mqtt_init())
 		abort();
 	codecs_init();
+	janus_init();
 }
 
 
@@ -1106,20 +1114,20 @@ no_kernel:
 				endpoint_print_buf(&rtpe_config.redis_write_ep));
 	}
 
-		if (!is_addr_unspecified(&rtpe_config.redis_ep.address)) {
-			rtpe_redis = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
-			if (!rtpe_redis)
+	if (!is_addr_unspecified(&rtpe_config.redis_ep.address)) {
+		rtpe_redis = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
+		if (!rtpe_redis)
 			die("Cannot start up without running Redis %s database! "
 					"See also NO_REDIS_REQUIRED parameter.",
 				endpoint_print_buf(&rtpe_config.redis_ep));
 
-			if (rtpe_config.redis_subscribed_keyspaces.length) {
-				rtpe_redis_notify = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
-				if (!rtpe_redis_notify)
-					die("Cannot start up without running notification Redis %s database! "
-							"See also NO_REDIS_REQUIRED parameter.",
-						endpoint_print_buf(&rtpe_config.redis_ep));
-			}
+		if (rtpe_config.redis_subscribed_keyspaces.length) {
+			rtpe_redis_notify = redis_new(&rtpe_config.redis_ep, rtpe_config.redis_db, rtpe_config.redis_auth, rtpe_redis_write ? ANY_REDIS_ROLE : MASTER_REDIS_ROLE, rtpe_config.no_redis_required);
+			if (!rtpe_redis_notify)
+				die("Cannot start up without running notification Redis %s database! "
+						"See also NO_REDIS_REQUIRED parameter.",
+					endpoint_print_buf(&rtpe_config.redis_ep));
+		}
 
 		if (!rtpe_redis_write)
 			rtpe_redis_write = rtpe_redis;
@@ -1127,6 +1135,12 @@ no_kernel:
 
 	if (rtpe_config.num_threads < 1)
 		rtpe_config.num_threads = num_cpu_cores(4);
+
+	if (rtpe_config.cpu_affinity < 0) {
+		rtpe_config.cpu_affinity = num_cpu_cores(0);
+		if (rtpe_config.cpu_affinity <= 0)
+			die("Number of CPU cores is unknown, cannot auto-set socket CPU affinity");
+	}
 
 	if (websocket_init())
 		die("Failed to init websocket listener");
@@ -1149,14 +1163,14 @@ no_kernel:
 			// first as the "owned" DB can do a stray update back to Redis
 			for (GList *l = rtpe_config.redis_subscribed_keyspaces.head; l; l = l->next) {
 				int db = GPOINTER_TO_INT(l->data);
-				if (redis_restore(rtpe_redis_notify, 1, db))
+				if (redis_restore(rtpe_redis_notify, true, db))
 					ilog(LOG_WARN, "Unable to restore calls from the active-active peer");
 			}
-			if (redis_restore(rtpe_redis_write, 0, -1))
+			if (redis_restore(rtpe_redis_write, false, -1))
 				die("Refusing to continue without working Redis database");
 		}
 		else {
-			if (redis_restore(rtpe_redis, 0, -1))
+			if (redis_restore(rtpe_redis, false, -1))
 				die("Refusing to continue without working Redis database");
 		}
 
@@ -1240,7 +1254,7 @@ int main(int argc, char **argv) {
 
 	while (!rtpe_shutdown) {
 		usleep(100000);
-		threads_join_all(0);
+		threads_join_all(false);
 	}
 
         // free libevent
@@ -1256,7 +1270,7 @@ int main(int argc, char **argv) {
 	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && rtpe_redis_notify)
 		redis_async_event_base_action(rtpe_redis_notify, EVENT_BASE_LOOPBREAK);
 
-	threads_join_all(1);
+	threads_join_all(true);
 
 	if (!is_addr_unspecified(&rtpe_config.redis_ep.address) && initial_rtpe_config.redis_delete_async)
 		redis_async_event_base_action(rtpe_redis_write, EVENT_BASE_FREE);
@@ -1288,10 +1302,9 @@ int main(int argc, char **argv) {
 	redis_close(rtpe_redis_notify);
 
 	free_prefix();
-
 	options_free();
-
 	log_free();
+	janus_free();
 
 	obj_release(rtpe_cli);
 	obj_release(rtpe_udp);

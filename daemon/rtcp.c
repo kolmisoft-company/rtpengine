@@ -463,6 +463,7 @@ static const int min_packet_sizes[] = {
 	[RTCP_PT_APP]	= sizeof(struct app_packet),
 	[RTCP_PT_RTPFB]	= sizeof(struct fb_packet),
 	[RTCP_PT_PSFB]	= sizeof(struct fb_packet),
+	[RTCP_PT_XR]	= sizeof(struct xr_packet),
 };
 
 static const xr_handler_func xr_handler_funcs[] = {
@@ -1306,14 +1307,20 @@ static void transcode_rr(struct rtcp_process_ctx *ctx, struct report_block *rr) 
 		return;
 	if (ctx->scratch.rr.from != ctx->mp->ssrc_in->parent->h.ssrc)
 		return;
+	if (!ctx->mp->media)
+		return;
 
 	// reverse SSRC mapping
-	struct ssrc_ctx *map_ctx = get_ssrc_ctx(ctx->scratch.rr.ssrc, ctx->mp->call->ssrc_hash,
+	struct ssrc_ctx *map_ctx = get_ssrc_ctx(ctx->scratch.rr.ssrc, ctx->mp->media->monologue->ssrc_hash,
 			SSRC_DIR_OUTPUT, ctx->mp->media->monologue);
 	rr->ssrc = htonl(map_ctx->ssrc_map_out);
 
+	if (!ctx->mp->media_out)
+		return;
+
 	// for reception stats
-	struct ssrc_ctx *input_ctx = get_ssrc_ctx(map_ctx->ssrc_map_out, ctx->mp->call->ssrc_hash,
+	struct ssrc_ctx *input_ctx = get_ssrc_ctx(map_ctx->ssrc_map_out,
+			ctx->mp->media_out->monologue->ssrc_hash,
 			SSRC_DIR_INPUT, NULL);
 
 	// substitute our own values
@@ -1325,8 +1332,8 @@ static void transcode_rr(struct rtcp_process_ctx *ctx, struct report_block *rr) 
 	if (!packets)
 		goto out;
 
-	unsigned int lost = atomic64_get(&input_ctx->packets_lost);
-	unsigned int dupes = atomic64_get(&input_ctx->duplicates);
+	unsigned int lost = input_ctx->parent->packets_lost;
+	unsigned int dupes = input_ctx->parent->duplicates;
 	unsigned int tot_lost = lost - dupes; // can be negative/rollover
 
 	ilogs(rtcp, LOG_DEBUG, "Substituting RTCP RR SSRC from %s%x%s to %x: %u packets, %u lost, %u duplicates",
@@ -1460,7 +1467,7 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 			uint32_t jitter = se->jitter;
 			mutex_unlock(&se->h.lock);
 
-			uint64_t lost = atomic64_get(&s->packets_lost);
+			uint64_t lost = se->packets_lost;
 			uint64_t tot = atomic64_get(&s->packets);
 
 			*rr = (struct report_block) {
@@ -1552,8 +1559,6 @@ void rtcp_receiver_reports(GQueue *out, struct ssrc_hash *hash, struct call_mono
 
 // call must be locked in R
 void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
-	struct call *call = media->call;
-
 	// figure out where to send it
 	struct packet_stream *ps = media->streams.head->data;
 	if (MEDIA_ISSET(media, RTCP_MUX))
@@ -1566,19 +1571,12 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 			ps = next_ps;
 	}
 
-	struct call_media *other_media = NULL;
-	if (ps->rtp_sink)
-		other_media = ps->rtp_sink->media;
-	else if (ps->rtcp_sink)
-		other_media = ps->rtcp_sink->media;
-
 	media_update_stats(media);
-	media_update_stats(other_media);
 
 	log_info_stream_fd(ps->selected_sfd);
 
 	GQueue rrs = G_QUEUE_INIT;
-	rtcp_receiver_reports(&rrs, call->ssrc_hash, ps->media->monologue);
+	rtcp_receiver_reports(&rrs, media->monologue->ssrc_hash, ps->media->monologue);
 
 	ilogs(rtcp, LOG_DEBUG, "Generating and sending RTCP SR for %x and up to %i source(s)",
 			ssrc_out->parent->h.ssrc, rrs.length);
@@ -1596,12 +1594,22 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 	socket_sendto(&ps->selected_sfd->socket, sr->str, sr->len, &ps->endpoint);
 	g_string_free(sr, TRUE);
 
-	if (other_media)
+	GQueue *sinks = ps->rtp_sinks.length ? &ps->rtp_sinks : &ps->rtcp_sinks;
+	for (GList *l = sinks->head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		struct packet_stream *sink = sh->sink;
+		struct call_media *other_media = sink->media;
+
+		media_update_stats(other_media);
+
 		ssrc_sender_report(other_media, &ssr, &rtpe_now);
-	struct ssrc_receiver_report *srr;
-	while ((srr = g_queue_pop_head(&srrs))) {
-		if (other_media)
+		for (GList *k = srrs.head; k; k = k->next) {
+			struct ssrc_receiver_report *srr = k->data;
 			ssrc_receiver_report(other_media, srr, &rtpe_now);
+		}
+	}
+	while (srrs.length) {
+		struct ssrc_receiver_report *srr = g_queue_pop_head(&srrs);
 		g_slice_free1(sizeof(*srr), srr);
 	}
 }

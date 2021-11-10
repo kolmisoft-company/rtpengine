@@ -5,97 +5,12 @@
 #include "control_ng.h"
 
 
-struct totalstats       rtpe_totalstats;
-struct totalstats       rtpe_totalstats_interval;
-mutex_t		       	rtpe_totalstats_lastinterval_lock;
-struct totalstats       rtpe_totalstats_lastinterval;
+struct timeval rtpe_started;
 
 
 mutex_t rtpe_codec_stats_lock;
 GHashTable *rtpe_codec_stats;
 
-
-static void timeval_totalstats_average_add(struct totalstats *s, const struct timeval *add) {
-	struct timeval dp, oa;
-
-	mutex_lock(&s->total_average_lock);
-
-	// new average = ((old average * old num sessions) + datapoint) / new num sessions
-	// ... but this will overflow when num sessions becomes very large
-
-	// timeval_multiply(&t, &s->total_average_call_dur, s->total_managed_sess);
-	// timeval_add(&t, &t, add);
-	// s->total_managed_sess++;
-	// timeval_divide(&s->total_average_call_dur, &t, s->total_managed_sess);
-
-	// alternative:
-	// new average = old average + (datapoint / new num sessions) - (old average / new num sessions)
-
-	s->total_managed_sess++;
-	timeval_divide(&dp, add, s->total_managed_sess);
-	timeval_divide(&oa, &s->total_average_call_dur, s->total_managed_sess);
-	timeval_add(&s->total_average_call_dur, &s->total_average_call_dur, &dp);
-	timeval_subtract(&s->total_average_call_dur, &s->total_average_call_dur, &oa);
-
-	mutex_unlock(&s->total_average_lock);
-}
-
-static void timeval_totalstats_call_duration_add(struct totalstats *s,
-		struct timeval *call_start, struct timeval *call_stop,
-		struct timeval *interval_start, int interval_dur_s) {
-
-	/* work with graphite interval start val which might be changed elsewhere in the code*/
-	struct timeval real_iv_start = {0,};
-	struct timeval call_duration;
-	struct timeval *call_start_in_iv = call_start;
-
-	if (interval_start) {
-		real_iv_start = *interval_start;
-
-		/* in case graphite interval needs to be the previous one */
-		if (timercmp(&real_iv_start, call_stop, >) && interval_dur_s) {
-			// round up to nearest while interval_dur_s
-			long long d = timeval_diff(&real_iv_start, call_stop);
-			d += (interval_dur_s * 1000000) - 1;
-			d /= 1000000 * interval_dur_s;
-			d *= interval_dur_s;
-			struct timeval graph_dur = { .tv_sec = d, .tv_usec = 0LL };
-			timeval_subtract(&real_iv_start, interval_start, &graph_dur);
-		}
-
-		if (timercmp(&real_iv_start, call_start, >))
-			call_start_in_iv = &real_iv_start;
-
-		/* this should never happen and is here for sanitization of output */
-		if (timercmp(call_start_in_iv, call_stop, >)) {
-			ilog(LOG_ERR, "Call start seems to exceed call stop");
-			return;
-		}
-	}
-
-	timeval_subtract(&call_duration, call_stop, call_start_in_iv);
-
-	mutex_lock(&s->total_calls_duration_lock);
-	timeval_add(&s->total_calls_duration_interval,
-			&s->total_calls_duration_interval, &call_duration);
-	mutex_unlock(&s->total_calls_duration_lock);
-}
-
-
-void statistics_update_totals(struct packet_stream *ps) {
-	atomic64_add(&rtpe_totalstats.total_relayed_packets,
-			atomic64_get(&ps->stats.packets));
-	atomic64_add(&rtpe_totalstats_interval.total_relayed_packets,
-		atomic64_get(&ps->stats.packets));
-	atomic64_add(&rtpe_totalstats.total_relayed_errors,
-		atomic64_get(&ps->stats.errors));
-	atomic64_add(&rtpe_totalstats_interval.total_relayed_errors,
-		atomic64_get(&ps->stats.errors));
-	atomic64_add(&rtpe_totalstats.total_relayed_bytes,
-		atomic64_get(&ps->stats.bytes));
-	atomic64_add(&rtpe_totalstats_interval.total_relayed_bytes,
-		atomic64_get(&ps->stats.bytes));
-}
 
 // op can be CMC_INCREMENT or CMC_DECREMENT
 // check not to multiple decrement or increment
@@ -113,15 +28,15 @@ void statistics_update_ip46_inc_dec(struct call* c, int op) {
 	if (c->is_ipv4_media_offer && !c->is_ipv6_media_offer) {
 		// answer is ipv4 only
 		if (c->is_ipv4_media_answer && !c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv4_sessions) : atomic64_dec(&rtpe_stats.ipv4_sessions);
+			RTPE_GAUGE_ADD(ipv4_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is ipv6 only
 		} else if (!c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.mixed_sessions) : atomic64_dec(&rtpe_stats.mixed_sessions);
+			RTPE_GAUGE_ADD(mixed_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is both ipv4 and ipv6
 		} else if (c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv4_sessions) : atomic64_dec(&rtpe_stats.ipv4_sessions);
+			RTPE_GAUGE_ADD(ipv4_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is neither ipv4 nor ipv6
 		} else {
@@ -132,15 +47,15 @@ void statistics_update_ip46_inc_dec(struct call* c, int op) {
 	} else if (!c->is_ipv4_media_offer && c->is_ipv6_media_offer) {
 		// answer is ipv4 only
 		if (c->is_ipv4_media_answer && !c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.mixed_sessions) : atomic64_dec(&rtpe_stats.mixed_sessions);
+			RTPE_GAUGE_ADD(mixed_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is ipv6 only
 		} else if (!c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv6_sessions) : atomic64_dec(&rtpe_stats.ipv6_sessions);
+			RTPE_GAUGE_ADD(ipv6_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is both ipv4 and ipv6
 		} else if (c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv6_sessions) : atomic64_dec(&rtpe_stats.ipv6_sessions);
+			RTPE_GAUGE_ADD(ipv6_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is neither ipv4 nor ipv6
 		} else {
@@ -151,15 +66,15 @@ void statistics_update_ip46_inc_dec(struct call* c, int op) {
 	} else if (c->is_ipv4_media_offer && c->is_ipv6_media_offer) {
 		// answer is ipv4 only
 		if (c->is_ipv4_media_answer && !c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv4_sessions) : atomic64_dec(&rtpe_stats.ipv4_sessions);
+			RTPE_GAUGE_ADD(ipv4_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is ipv6 only
 		} else if (!c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.ipv6_sessions) : atomic64_dec(&rtpe_stats.ipv6_sessions);
+			RTPE_GAUGE_ADD(ipv6_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is both ipv4 and ipv6
 		} else if (c->is_ipv4_media_answer && c->is_ipv6_media_answer) {
-			(op == CMC_INCREMENT) ? atomic64_inc(&rtpe_stats.mixed_sessions) : atomic64_dec(&rtpe_stats.mixed_sessions);
+			RTPE_GAUGE_ADD(mixed_sessions, op == CMC_INCREMENT ? 1 : -1);
 
 		// answer is neither ipv4 nor ipv6
 		} else {
@@ -177,30 +92,14 @@ void statistics_update_ip46_inc_dec(struct call* c, int op) {
 
 void statistics_update_foreignown_dec(struct call* c) {
 	if (IS_FOREIGN_CALL(c)) {
-		atomic64_dec(&rtpe_stats.foreign_sessions);
+		RTPE_GAUGE_DEC(foreign_sessions);
 	}
-
-	if(IS_OWN_CALL(c)) 	{
-		mutex_lock(&rtpe_totalstats_interval.managed_sess_lock);
-		rtpe_totalstats_interval.managed_sess_min = MIN(rtpe_totalstats_interval.managed_sess_min,
-				g_hash_table_size(rtpe_callhash) - atomic64_get(&rtpe_stats.foreign_sessions));
-		mutex_unlock(&rtpe_totalstats_interval.managed_sess_lock);
-	}
-
 }
 
 void statistics_update_foreignown_inc(struct call* c) {
-	if (IS_OWN_CALL(c)) {
-		mutex_lock(&rtpe_totalstats_interval.managed_sess_lock);
-		rtpe_totalstats_interval.managed_sess_max = MAX(
-				rtpe_totalstats_interval.managed_sess_max,
-				g_hash_table_size(rtpe_callhash)
-						- atomic64_get(&rtpe_stats.foreign_sessions));
-		mutex_unlock(&rtpe_totalstats_interval.managed_sess_lock);
-	}
-	else if (IS_FOREIGN_CALL(c)) { /* foreign call*/
-		atomic64_inc(&rtpe_stats.foreign_sessions);
-		atomic64_inc(&rtpe_totalstats.total_foreign_sessions);
+	if (IS_FOREIGN_CALL(c)) { /* foreign call*/
+		RTPE_GAUGE_INC(foreign_sessions);
+		RTPE_STATS_INC(foreign_sess);
 	}
 
 }
@@ -234,35 +133,19 @@ void statistics_update_oneway(struct call* c) {
 			}
 			if (found) { break; }
 		}
+
 		if (!found)
 			ps = NULL;
-		found = 0;
 
-		if (ml->active_dialogue) {
-			// --- go through partner ml and search the RTP
-			for (k = ml->active_dialogue->medias.head; k; k = k->next) {
-				md = k->data;
-
-				for (o = md->streams.head; o; o = o->next) {
-					ps2 = o->data;
-					if (PS_ISSET(ps2, RTP)) {
-						// --- only RTP is interesting
-						found = 1;
-						break;
-					}
-				}
-				if (found) { break; }
-			}
+		if (ps) {
+			struct sink_handler *sh = g_queue_peek_head(&ps->rtp_sinks);
+			ps2 = sh ? sh->sink : NULL;
 		}
-		if (!found)
-			ps2 = NULL;
 
 		if (ps && ps2 && atomic64_get(&ps2->stats.packets)==0) {
 			if (atomic64_get(&ps->stats.packets)!=0 && IS_OWN_CALL(c)){
-				if (atomic64_get(&ps->stats.packets)!=0) {
-					atomic64_inc(&rtpe_totalstats.total_oneway_stream_sess);
-					atomic64_inc(&rtpe_totalstats_interval.total_oneway_stream_sess);
-				}
+				if (atomic64_get(&ps->stats.packets)!=0)
+					RTPE_STATS_INC(oneway_stream_sess);
 			}
 			else {
 				total_nopacket_relayed_sess++;
@@ -270,10 +153,8 @@ void statistics_update_oneway(struct call* c) {
 		}
 	}
 
-	if (IS_OWN_CALL(c)) {
-		atomic64_add(&rtpe_totalstats.total_nopacket_relayed_sess, total_nopacket_relayed_sess / 2);
-		atomic64_add(&rtpe_totalstats_interval.total_nopacket_relayed_sess, total_nopacket_relayed_sess / 2);
-	}
+	if (IS_OWN_CALL(c))
+		RTPE_STATS_INC(nopacket_relayed_sess);
 
 	if (c->monologues.head) {
 		ml = c->monologues.head->data;
@@ -281,38 +162,23 @@ void statistics_update_oneway(struct call* c) {
 		timeval_subtract(&tim_result_duration, &rtpe_now, &ml->started);
 
 		if (IS_OWN_CALL(c)) {
-			if (ml->term_reason==TIMEOUT) {
-				atomic64_inc(&rtpe_totalstats.total_timeout_sess);
-				atomic64_inc(&rtpe_totalstats_interval.total_timeout_sess);
-			} else if (ml->term_reason==SILENT_TIMEOUT) {
-				atomic64_inc(&rtpe_totalstats.total_silent_timeout_sess);
-				atomic64_inc(&rtpe_totalstats_interval.total_silent_timeout_sess);
-			} else if (ml->term_reason==OFFER_TIMEOUT) {
-				atomic64_inc(&rtpe_totalstats.total_offer_timeout_sess);
-				atomic64_inc(&rtpe_totalstats_interval.total_offer_timeout_sess);
-			} else if (ml->term_reason==REGULAR) {
-				atomic64_inc(&rtpe_totalstats.total_regular_term_sess);
-				atomic64_inc(&rtpe_totalstats_interval.total_regular_term_sess);
-			} else if (ml->term_reason==FORCED) {
-				atomic64_inc(&rtpe_totalstats.total_forced_term_sess);
-				atomic64_inc(&rtpe_totalstats_interval.total_forced_term_sess);
-			}
+			if (ml->term_reason==TIMEOUT)
+				RTPE_STATS_INC(timeout_sess);
+			else if (ml->term_reason==SILENT_TIMEOUT)
+				RTPE_STATS_INC(silent_timeout_sess);
+			else if (ml->term_reason==OFFER_TIMEOUT)
+				RTPE_STATS_INC(offer_timeout_sess);
+			else if (ml->term_reason==REGULAR)
+				RTPE_STATS_INC(regular_term_sess);
+			else if (ml->term_reason==FORCED)
+				RTPE_STATS_INC(forced_term_sess);
 
-			timeval_totalstats_average_add(&rtpe_totalstats, &tim_result_duration);
-			timeval_totalstats_average_add(&rtpe_totalstats_interval, &tim_result_duration);
-			timeval_totalstats_call_duration_add(
-					&rtpe_totalstats_interval, &ml->started, &ml->terminated,
-					&rtpe_latest_graphite_interval_start,
-					rtpe_config.graphite_interval);
-			timeval_totalstats_call_duration_add(
-					&rtpe_totalstats, &ml->started, &ml->terminated,
-					NULL, 0);
+			RTPE_STATS_ADD(call_duration, timeval_us(&tim_result_duration));
+			RTPE_STATS_INC(managed_sess);
 		}
 
-		if (ml->term_reason==FINAL_TIMEOUT) {
-			atomic64_inc(&rtpe_totalstats.total_final_timeout_sess);
-			atomic64_inc(&rtpe_totalstats_interval.total_final_timeout_sess);
-		}
+		if (ml->term_reason==FINAL_TIMEOUT)
+			RTPE_STATS_INC(final_timeout_sess);
 	}
 
 }
@@ -460,15 +326,9 @@ void statistics_update_oneway(struct call* c) {
 GQueue *statistics_gather_metrics(void) {
 	GQueue *ret = g_queue_new();
 
-	struct timeval avg, calls_dur_iv;
+	struct timeval avg;
+	double calls_dur_iv;
 	uint64_t cur_sessions, num_sessions, min_sess_iv, max_sess_iv;
-	struct request_time offer_iv, answer_iv, delete_iv;
-	struct requests_ps offers_ps, answers_ps, deletes_ps;
-
-	mutex_lock(&rtpe_totalstats.total_average_lock);
-	avg = rtpe_totalstats.total_average_call_dur;
-	num_sessions = rtpe_totalstats.total_managed_sess;
-	mutex_unlock(&rtpe_totalstats.total_average_lock);
 
 	HEADER("{", "");
 	HEADER("currentstatistics", "Statistics over currently running sessions:");
@@ -478,136 +338,173 @@ GQueue *statistics_gather_metrics(void) {
 	cur_sessions = g_hash_table_size(rtpe_callhash);
 	rwlock_unlock_r(&rtpe_callhash_lock);
 
-	METRIC("sessionsown", "Owned sessions", UINT64F, UINT64F, cur_sessions - atomic64_get(&rtpe_stats.foreign_sessions));
+	METRIC("sessionsown", "Owned sessions", UINT64F, UINT64F, cur_sessions - atomic64_get(&rtpe_stats_gauge.foreign_sessions));
 	PROM("sessions", "gauge");
 	PROMLAB("type=\"own\"");
-	METRIC("sessionsforeign", "Foreign sessions", UINT64F, UINT64F, atomic64_get(&rtpe_stats.foreign_sessions));
+	METRIC("sessionsforeign", "Foreign sessions", UINT64F, UINT64F, atomic64_get(&rtpe_stats_gauge.foreign_sessions));
 	PROM("sessions", "gauge");
 	PROMLAB("type=\"foreign\"");
 
 	METRIC("sessionstotal", "Total sessions", UINT64F, UINT64F, cur_sessions);
-	METRIC("transcodedmedia", "Transcoded media", UINT64F, UINT64F, atomic64_get(&rtpe_stats.transcoded_media));
+	METRIC("transcodedmedia", "Transcoded media", UINT64F, UINT64F, atomic64_get(&rtpe_stats_gauge.transcoded_media));
 	PROM("transcoded_media", "gauge");
 
-	METRIC("packetrate", "Packets per second", UINT64F, UINT64F, atomic64_get(&rtpe_stats.packets));
-	METRIC("byterate", "Bytes per second", UINT64F, UINT64F, atomic64_get(&rtpe_stats.bytes));
-	METRIC("errorrate", "Errors per second", UINT64F, UINT64F, atomic64_get(&rtpe_stats.errors));
+	METRIC("packetrate_user", "Packets per second (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.packets_user));
+	METRIC("byterate_user", "Bytes per second (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.bytes_user));
+	METRIC("errorrate_user", "Errors per second (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.errors_user));
+	METRIC("packetrate_kernel", "Packets per second (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.packets_kernel));
+	METRIC("byterate_kernel", "Bytes per second (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.bytes_kernel));
+	METRIC("errorrate_kernel", "Errors per second (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.errors_kernel));
+	METRIC("packetrate", "Packets per second (total)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.packets_user) +
+			atomic64_get(&rtpe_stats.intv.packets_kernel));
+	METRIC("byterate", "Bytes per second (total)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.bytes_user) +
+			atomic64_get(&rtpe_stats.intv.bytes_kernel));
+	METRIC("errorrate", "Errors per second (total)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats.intv.errors_user) +
+			atomic64_get(&rtpe_stats.intv.errors_kernel));
 
-	mutex_lock(&rtpe_totalstats.total_average_lock);
-	avg = rtpe_totalstats.total_average_call_dur;
-	num_sessions = rtpe_totalstats.total_managed_sess;
-	mutex_unlock(&rtpe_totalstats.total_average_lock);
+	METRIC("media_userspace", "Userspace-only media streams", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_gauge.userspace_streams));
+	PROM("mediastreams", "gauge");
+	PROMLAB("type=\"userspace\"");
+
+	METRIC("media_kernel", "Kernel-only media streams", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_gauge.kernel_only_streams));
+	PROM("mediastreams", "gauge");
+	PROMLAB("type=\"kernel\"");
+
+	METRIC("media_mixed", "Mixed kernel/userspace media streams", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_gauge.kernel_user_streams));
+	PROM("mediastreams", "gauge");
+	PROMLAB("type=\"mixed\"");
+
+	num_sessions = atomic64_get(&rtpe_stats.ax.managed_sess);
+	long long avg_us = num_sessions ? atomic64_get(&rtpe_stats.ax.call_duration) / num_sessions : 0;
+	timeval_from_us(&avg, avg_us);
 
 	HEADER("}", "");
 	HEADER("totalstatistics", "Total statistics (does not include current running sessions):");
 	HEADER("{", "");
 
-	METRIC("uptime", "Uptime of rtpengine", "%llu", "%llu seconds", (unsigned long long) time(NULL)-rtpe_totalstats.started);
+	METRIC("uptime", "Uptime of rtpengine", "%llu", "%llu seconds", (long long) timeval_diff(&rtpe_now, &rtpe_started) / 1000000);
 	PROM("uptime_seconds", "gauge");
 
 	METRIC("managedsessions", "Total managed sessions", UINT64F, UINT64F, num_sessions);
 	PROM("sessions_total", "counter");
-	METRIC("rejectedsessions", "Total rejected sessions", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_rejected_sess));
+	METRIC("rejectedsessions", "Total rejected sessions", UINT64F, UINT64F, atomic64_get(&rtpe_stats_cumulative.rejected_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"rejected\"");
-	METRIC("timeoutsessions", "Total timed-out sessions via TIMEOUT", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_timeout_sess));
+	METRIC("timeoutsessions", "Total timed-out sessions via TIMEOUT", UINT64F, UINT64F, atomic64_get(&rtpe_stats_cumulative.timeout_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"timeout\"");
-	METRIC("silenttimeoutsessions", "Total timed-out sessions via SILENT_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_totalstats.total_silent_timeout_sess));
+	METRIC("silenttimeoutsessions", "Total timed-out sessions via SILENT_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_stats_cumulative.silent_timeout_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"silent_timeout\"");
-	METRIC("finaltimeoutsessions", "Total timed-out sessions via FINAL_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_totalstats.total_final_timeout_sess));
+	METRIC("finaltimeoutsessions", "Total timed-out sessions via FINAL_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_stats_cumulative.final_timeout_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"final_timeout\"");
-	METRIC("offertimeoutsessions", "Total timed-out sessions via OFFER_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_totalstats.total_offer_timeout_sess));
+	METRIC("offertimeoutsessions", "Total timed-out sessions via OFFER_TIMEOUT", UINT64F, UINT64F,atomic64_get(&rtpe_stats_cumulative.offer_timeout_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"offer_timeout\"");
-	METRIC("regularterminatedsessions", "Total regular terminated sessions", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_regular_term_sess));
+	METRIC("regularterminatedsessions", "Total regular terminated sessions", UINT64F, UINT64F, atomic64_get(&rtpe_stats_cumulative.regular_term_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"terminated\"");
-	METRIC("forcedterminatedsessions", "Total forced terminated sessions", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_forced_term_sess));
+	METRIC("forcedterminatedsessions", "Total forced terminated sessions", UINT64F, UINT64F, atomic64_get(&rtpe_stats_cumulative.forced_term_sess));
 	PROM("closed_sessions_total", "counter");
 	PROMLAB("reason=\"force_terminated\"");
 
-	METRIC("relayedpackets", "Total relayed packets", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_relayed_packets));
+	METRIC("relayedpackets_user", "Total relayed packets (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.packets_user));
 	PROM("packets_total", "counter");
-	METRIC("relayedpacketerrors", "Total relayed packet errors", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_relayed_errors));
+	PROMLAB("type=\"userspace\"");
+	METRIC("relayedpacketerrors_user", "Total relayed packet errors (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.errors_user));
 	PROM("packet_errors_total", "counter");
-	METRIC("relayedbytes", "Total relayed bytes", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_relayed_bytes));
+	PROMLAB("type=\"userspace\"");
+	METRIC("relayedbytes_user", "Total relayed bytes (userspace)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.bytes_user));
 	PROM("bytes_total", "counter");
+	PROMLAB("type=\"userspace\"");
 
-	METRIC("zerowaystreams", "Total number of streams with no relayed packets", UINT64F, UINT64F, atomic64_get(&rtpe_totalstats.total_nopacket_relayed_sess));
+	METRIC("relayedpackets_kernel", "Total relayed packets (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.packets_kernel));
+	PROM("packets_total", "counter");
+	PROMLAB("type=\"kernel\"");
+	METRIC("relayedpacketerrors_kernel", "Total relayed packet errors (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.errors_kernel));
+	PROM("packet_errors_total", "counter");
+	PROMLAB("type=\"kernel\"");
+	METRIC("relayedbytes_kernel", "Total relayed bytes (kernel)", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.bytes_kernel));
+	PROM("bytes_total", "counter");
+	PROMLAB("type=\"kernel\"");
+
+	METRIC("relayedpackets", "Total relayed packets", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.packets_kernel) +
+			atomic64_get(&rtpe_stats_cumulative.packets_user));
+	METRIC("relayedpacketerrors", "Total relayed packet errors", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.errors_kernel) +
+			atomic64_get(&rtpe_stats_cumulative.errors_user));
+	METRIC("relayedbytes", "Total relayed bytes", UINT64F, UINT64F,
+			atomic64_get(&rtpe_stats_cumulative.bytes_kernel) +
+			atomic64_get(&rtpe_stats_cumulative.bytes_user));
+
+	METRIC("zerowaystreams", "Total number of streams with no relayed packets", UINT64F, UINT64F, atomic64_get(&rtpe_stats_cumulative.nopacket_relayed_sess));
 	PROM("zero_packet_streams_total", "counter");
-	METRIC("onewaystreams", "Total number of 1-way streams", UINT64F, UINT64F,atomic64_get(&rtpe_totalstats.total_oneway_stream_sess));
+	METRIC("onewaystreams", "Total number of 1-way streams", UINT64F, UINT64F,atomic64_get(&rtpe_stats_cumulative.oneway_stream_sess));
 	PROM("one_way_sessions_total", "counter");
-	METRICva("avgcallduration", "Average call duration", "%ld.%06ld", "%ld.%06ld", avg.tv_sec, avg.tv_usec);
+	METRICva("avgcallduration", "Average call duration", "%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT, "%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT, avg.tv_sec, avg.tv_usec);
 
-	mutex_lock(&rtpe_totalstats_lastinterval_lock);
-	calls_dur_iv = rtpe_totalstats_lastinterval.total_calls_duration_interval;
-	min_sess_iv = rtpe_totalstats_lastinterval.managed_sess_min;
-	max_sess_iv = rtpe_totalstats_lastinterval.managed_sess_max;
-	offer_iv = rtpe_totalstats_lastinterval.offer;
-	answer_iv = rtpe_totalstats_lastinterval.answer;
-	delete_iv = rtpe_totalstats_lastinterval.delete;
-	offers_ps = rtpe_totalstats_lastinterval.offers_ps;
-	answers_ps = rtpe_totalstats_lastinterval.answers_ps;
-	deletes_ps = rtpe_totalstats_lastinterval.deletes_ps;
-	mutex_unlock(&rtpe_totalstats_lastinterval_lock);
+	calls_dur_iv = (double) atomic64_get_na(&rtpe_stats_graphite_interval.total_calls_duration) / 1000000.0;
+	min_sess_iv = atomic64_get(&rtpe_stats_gauge_graphite_min_max_interval.min.total_sessions);
+	max_sess_iv = atomic64_get(&rtpe_stats_gauge_graphite_min_max_interval.max.total_sessions);
 
 	HEADER(NULL, "");
 	HEADER("}", "");
 	HEADER("intervalstatistics", "Graphite interval statistics (last reported values to graphite):");
 	HEADER("{", NULL);
 
-	METRICva("totalcallsduration", "Total calls duration", "%ld.%06ld", "%ld.%06ld", calls_dur_iv.tv_sec,calls_dur_iv.tv_usec);
+	METRICva("totalcallsduration", "Total calls duration", "%.6f", "%.6f", calls_dur_iv);
 	HEADER(NULL, "");
 
 	METRIC("minmanagedsessions", "Min managed sessions", UINT64F, UINT64F, min_sess_iv);
 	METRIC("maxmanagedsessions", "Max managed sessions", UINT64F, UINT64F, max_sess_iv);
 
-	METRICl("Min/Max/Avg offer processing delay", "%llu.%06llu/%llu.%06llu/%llu.%06llu sec",
-			(unsigned long long)offer_iv.time_min.tv_sec,(unsigned long long)offer_iv.time_min.tv_usec,
-			(unsigned long long)offer_iv.time_max.tv_sec,(unsigned long long)offer_iv.time_max.tv_usec,
-			(unsigned long long)offer_iv.time_avg.tv_sec,(unsigned long long)offer_iv.time_avg.tv_usec);
-	METRICsva("minofferdelay", "%llu.%06llu", (unsigned long long)offer_iv.time_min.tv_sec,(unsigned long long)offer_iv.time_min.tv_usec);
-	METRICsva("maxofferdelay", "%llu.%06llu", (unsigned long long)offer_iv.time_max.tv_sec,(unsigned long long)offer_iv.time_max.tv_usec);
-	METRICsva("avgofferdelay", "%llu.%06llu", (unsigned long long)offer_iv.time_avg.tv_sec,(unsigned long long)offer_iv.time_avg.tv_usec);
-	METRICl("Min/Max/Avg answer processing delay", "%llu.%06llu/%llu.%06llu/%llu.%06llu sec",
-			(unsigned long long)answer_iv.time_min.tv_sec,(unsigned long long)answer_iv.time_min.tv_usec,
-			(unsigned long long)answer_iv.time_max.tv_sec,(unsigned long long)answer_iv.time_max.tv_usec,
-			(unsigned long long)answer_iv.time_avg.tv_sec,(unsigned long long)answer_iv.time_avg.tv_usec);
-	METRICsva("minanswerdelay", "%llu.%06llu", (unsigned long long)answer_iv.time_min.tv_sec,(unsigned long long)answer_iv.time_min.tv_usec);
-	METRICsva("maxanswerdelay", "%llu.%06llu", (unsigned long long)answer_iv.time_max.tv_sec,(unsigned long long)answer_iv.time_max.tv_usec);
-	METRICsva("avganswerdelay", "%llu.%06llu", (unsigned long long)answer_iv.time_avg.tv_sec,(unsigned long long)answer_iv.time_avg.tv_usec);
-	METRICl("Min/Max/Avg delete processing delay", "%llu.%06llu/%llu.%06llu/%llu.%06llu sec",
-			(unsigned long long)delete_iv.time_min.tv_sec,(unsigned long long)delete_iv.time_min.tv_usec,
-			(unsigned long long)delete_iv.time_max.tv_sec,(unsigned long long)delete_iv.time_max.tv_usec,
-			(unsigned long long)delete_iv.time_avg.tv_sec,(unsigned long long)delete_iv.time_avg.tv_usec);
-	METRICsva("mindeletedelay", "%llu.%06llu", (unsigned long long)delete_iv.time_min.tv_sec,(unsigned long long)delete_iv.time_min.tv_usec);
-	METRICsva("maxdeletedelay", "%llu.%06llu", (unsigned long long)delete_iv.time_max.tv_sec,(unsigned long long)delete_iv.time_max.tv_usec);
-	METRICsva("avgdeletedelay", "%llu.%06llu", (unsigned long long)delete_iv.time_avg.tv_sec,(unsigned long long)delete_iv.time_avg.tv_usec);
+	for (int i = 0; i < NGC_COUNT; i++) {
+		double min = (double) atomic64_get(&rtpe_stats_gauge_graphite_min_max_interval.min.ng_command_times[i]) / 1000000.0;
+		double max = (double) atomic64_get(&rtpe_stats_gauge_graphite_min_max_interval.max.ng_command_times[i]) / 1000000.0;
+		double avg = (double) atomic64_get(&rtpe_stats_gauge_graphite_min_max_interval.avg.ng_command_times[i]) / 1000000.0;
+		AUTO_CLEANUP(char *min_label, free_gbuf) = g_strdup_printf("min%sdelay", ng_command_strings[i]);
+		AUTO_CLEANUP(char *max_label, free_gbuf) = g_strdup_printf("max%sdelay", ng_command_strings[i]);
+		AUTO_CLEANUP(char *avg_label, free_gbuf) = g_strdup_printf("avg%sdelay", ng_command_strings[i]);
+		AUTO_CLEANUP(char *long_label, free_gbuf) = g_strdup_printf("Min/Max/Avg %s processing delay", ng_command_strings[i]);
+		METRICl(long_label, "%.6f/%.6f/%.6f sec", min, max, avg);
+		METRICsva(min_label, "%.6f", min);
+		METRICsva(max_label, "%.6f", max);
+		METRICsva(avg_label, "%.6f", avg);
+	}
 
-	METRICl("Min/Max/Avg offer requests per second", "%llu/%llu/%llu per sec",
-			(unsigned long long)offers_ps.ps_min,
-			(unsigned long long)offers_ps.ps_max,
-			(unsigned long long)offers_ps.ps_avg);
-	METRICs("minofferrequestrate", "%llu", (unsigned long long)offers_ps.ps_min);
-	METRICs("maxofferrequestrate", "%llu", (unsigned long long)offers_ps.ps_max);
-	METRICs("avgofferrequestrate", "%llu", (unsigned long long)offers_ps.ps_avg);
-	METRICl("Min/Max/Avg answer requests per second", "%llu/%llu/%llu per sec",
-			(unsigned long long)answers_ps.ps_min,
-			(unsigned long long)answers_ps.ps_max,
-			(unsigned long long)answers_ps.ps_avg);
-	METRICs("minanswerrequestrate", "%llu", (unsigned long long)answers_ps.ps_min);
-	METRICs("maxanswerrequestrate", "%llu", (unsigned long long)answers_ps.ps_max);
-	METRICs("avganswerrequestrate", "%llu", (unsigned long long)answers_ps.ps_avg);
-	METRICl("Min/Max/Avg delete requests per second", "%llu/%llu/%llu per sec",
-			(unsigned long long)deletes_ps.ps_min,
-			(unsigned long long)deletes_ps.ps_max,
-			(unsigned long long)deletes_ps.ps_avg);
-	METRICs("mindeleterequestrate", "%llu", (unsigned long long)deletes_ps.ps_min);
-	METRICs("maxdeleterequestrate", "%llu", (unsigned long long)deletes_ps.ps_max);
-	METRICs("avgdeleterequestrate", "%llu", (unsigned long long)deletes_ps.ps_avg);
+	for (int i = 0; i < NGC_COUNT; i++) {
+		uint64_t min = atomic64_get(&rtpe_stats_graphite_min_max_interval.min.ng_commands[i]);
+		uint64_t max = atomic64_get(&rtpe_stats_graphite_min_max_interval.max.ng_commands[i]);
+		uint64_t avg = atomic64_get(&rtpe_stats_graphite_min_max_interval.avg.ng_commands[i]);
+		AUTO_CLEANUP(char *min_label, free_gbuf) = g_strdup_printf("min%srequestrate", ng_command_strings[i]);
+		AUTO_CLEANUP(char *max_label, free_gbuf) = g_strdup_printf("max%srequestrate", ng_command_strings[i]);
+		AUTO_CLEANUP(char *avg_label, free_gbuf) = g_strdup_printf("avg%srequestrate", ng_command_strings[i]);
+		AUTO_CLEANUP(char *long_label, free_gbuf) = g_strdup_printf("Min/Max/Avg %s requests per second", ng_command_strings[i]);
+		METRICl(long_label, "%" PRIu64 "/%" PRIu64 "/%" PRIu64 " per sec", min, max, avg);
+		METRICsva(min_label, "%" PRIu64 "", min);
+		METRICsva(max_label, "%" PRIu64 "", max);
+		METRICsva(avg_label, "%" PRIu64 "", avg);
+	}
 
 	HEADER(NULL, "");
 	HEADER("}", "");
@@ -791,21 +688,6 @@ void statistics_free_metrics(GQueue **q) {
 }
 
 void statistics_free() {
-	mutex_destroy(&rtpe_totalstats.total_average_lock);
-	mutex_destroy(&rtpe_totalstats_interval.total_average_lock);
-	mutex_destroy(&rtpe_totalstats_interval.managed_sess_lock);
-	mutex_destroy(&rtpe_totalstats_interval.total_calls_duration_lock);
-
-	mutex_destroy(&rtpe_totalstats_lastinterval_lock);
-
-	mutex_destroy(&rtpe_totalstats_interval.offer.lock);
-	mutex_destroy(&rtpe_totalstats_interval.answer.lock);
-	mutex_destroy(&rtpe_totalstats_interval.delete.lock);
-
-	mutex_destroy(&rtpe_totalstats_interval.offers_ps.lock);
-	mutex_destroy(&rtpe_totalstats_interval.answers_ps.lock);
-	mutex_destroy(&rtpe_totalstats_interval.deletes_ps.lock);
-
 	mutex_destroy(&rtpe_codec_stats_lock);
 	g_hash_table_destroy(rtpe_codec_stats);
 }
@@ -818,24 +700,9 @@ static void codec_stats_free(void *p) {
 }
 
 void statistics_init() {
-	mutex_init(&rtpe_totalstats.total_average_lock);
-	mutex_init(&rtpe_totalstats_interval.total_average_lock);
-	mutex_init(&rtpe_totalstats_interval.managed_sess_lock);
-	mutex_init(&rtpe_totalstats_interval.total_calls_duration_lock);
-
-	time(&rtpe_totalstats.started);
+	gettimeofday(&rtpe_started, NULL);
 	//rtpe_totalstats_interval.managed_sess_min = 0; // already zeroed
 	//rtpe_totalstats_interval.managed_sess_max = 0;
-
-	mutex_init(&rtpe_totalstats_lastinterval_lock);
-
-	mutex_init(&rtpe_totalstats_interval.offer.lock);
-	mutex_init(&rtpe_totalstats_interval.answer.lock);
-	mutex_init(&rtpe_totalstats_interval.delete.lock);
-
-	mutex_init(&rtpe_totalstats_interval.offers_ps.lock);
-	mutex_init(&rtpe_totalstats_interval.answers_ps.lock);
-	mutex_init(&rtpe_totalstats_interval.deletes_ps.lock);
 
 	mutex_init(&rtpe_codec_stats_lock);
 	rtpe_codec_stats = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, codec_stats_free);

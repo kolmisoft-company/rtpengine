@@ -1,5 +1,5 @@
 Name:		ngcp-rtpengine
-Version:	10.0.0.0+0~mr10.0.0.0
+Version:	10.2.0.0+0~mr10.2.0.0
 Release:	1%{?dist}
 Summary:	The Sipwise NGCP rtpengine
 
@@ -115,6 +115,8 @@ cd ..
 install -D -p -m755 daemon/%{binname} %{buildroot}%{_sbindir}/%{binname}
 # Install CLI (command line interface)
 install -D -p -m755 utils/%{binname}-ctl %{buildroot}%{_sbindir}/%{binname}-ctl
+# Install helper
+install -D -p -m755 utils/%{binname}-get-table %{buildroot}%{_libexecdir}/%{binname}/%{binname}-get-table
 # Install recording daemon
 %if 0%{?with_transcoding} > 0
 install -D -p -m755 recording-daemon/%{binname}-recording %{buildroot}%{_sbindir}/%{binname}-recording

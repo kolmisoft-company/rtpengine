@@ -38,38 +38,17 @@ const char *ng_command_strings[NGC_COUNT] = {
 	"ping", "offer", "answer", "delete", "query", "list", "start recording",
 	"stop recording", "start forwarding", "stop forwarding", "block DTMF",
 	"unblock DTMF", "block media", "unblock media", "play media", "stop media",
-	"play DTMF", "statistics",
+	"play DTMF", "statistics", "silence media", "unsilence media",
+	"publish", "subscribe request",
+	"subscribe answer", "unsubscribe",
 };
 const char *ng_command_strings_short[NGC_COUNT] = {
 	"Ping", "Offer", "Answer", "Delete", "Query", "List", "StartRec",
 	"StopRec", "StartFwd", "StopFwd", "BlkDTMF",
 	"UnblkDTMF", "BlkMedia", "UnblkMedia", "PlayMedia", "StopMedia",
-	"PlayDTMF", "Stats",
+	"PlayDTMF", "Stats", "SlnMedia", "UnslnMedia",
+	"Pub", "SubReq", "SubAns", "Unsub",
 };
-
-static void timeval_update_request_time(struct request_time *request, const struct timeval *offer_diff) {
-	// lock offers
-	mutex_lock(&request->lock);
-
-	// update min value
-	if (timeval_us(&request->time_min) == 0 ||
-	    timeval_cmp(&request->time_min, offer_diff) > 0) {
-		timeval_from_us(&request->time_min, timeval_us(offer_diff));
-	}
-
-	// update max value
-	if (timeval_us(&request->time_max) == 0 ||
-	    timeval_cmp(&request->time_max, offer_diff) < 0) {
-		timeval_from_us(&request->time_max, timeval_us(offer_diff));
-	}
-
-	// update avg value
-	timeval_add(&request->time_avg, &request->time_avg, offer_diff);
-	request->count++;
-
-	// unlock offers
-	mutex_unlock(&request->lock);
-}
 
 
 static void pretty_print(bencode_item_t *el, GString *s) {
@@ -282,6 +261,14 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 			errstr = call_unblock_media_ng(dict, resp);
 			command = NGC_UNBLOCK_MEDIA;
 			break;
+		case CSH_LOOKUP("silence media"):
+			errstr = call_silence_media_ng(dict, resp);
+			command = NGC_SILENCE_MEDIA;
+			break;
+		case CSH_LOOKUP("unsilence media"):
+			errstr = call_unsilence_media_ng(dict, resp);
+			command = NGC_UNSILENCE_MEDIA;
+			break;
 		case CSH_LOOKUP("play media"):
 			errstr = call_play_media_ng(dict, resp);
 			command = NGC_PLAY_MEDIA;
@@ -297,6 +284,22 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 		case CSH_LOOKUP("statistics"):
 			errstr = statistics_ng(dict, resp);
 			command = NGC_STATISTICS;
+			break;
+		case CSH_LOOKUP("publish"):
+			errstr = call_publish_ng(dict, resp, addr, sin);
+			command = NGC_PUBLISH;
+			break;
+		case CSH_LOOKUP("subscribe request"):
+			errstr = call_subscribe_request_ng(dict, resp);
+			command = NGC_SUBSCRIBE_REQ;
+			break;
+		case CSH_LOOKUP("subscribe answer"):
+			errstr = call_subscribe_answer_ng(dict, resp);
+			command = NGC_SUBSCRIBE_ANS;
+			break;
+		case CSH_LOOKUP("unsubscribe"):
+			errstr = call_unsubscribe_ng(dict, resp);
+			command = NGC_UNSUBSCRIBE;
 			break;
 		default:
 			errstr = "Unrecognized command";
@@ -320,23 +323,8 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 	bencode_dictionary_add_string(resp, "result", resultstr);
 
 	// update interval statistics
-	// XXX could generalise these, same as above
-	switch (command) {
-		case NGC_OFFER:
-			atomic64_inc(&rtpe_statsps.offers);
-			timeval_update_request_time(&rtpe_totalstats_interval.offer, &cmd_process_time);
-			break;
-		case NGC_ANSWER:
-			atomic64_inc(&rtpe_statsps.answers);
-			timeval_update_request_time(&rtpe_totalstats_interval.answer, &cmd_process_time);
-			break;
-		case NGC_DELETE:
-			atomic64_inc(&rtpe_statsps.deletes);
-			timeval_update_request_time(&rtpe_totalstats_interval.delete, &cmd_process_time);
-			break;
-		default:
-			break;
-	}
+	RTPE_STATS_INC(ng_commands[command]);
+	RTPE_GAUGE_SET(ng_command_times[command], timeval_us(&cmd_process_time));
 
 	goto send_resp;
 
@@ -476,7 +464,7 @@ static str *chunk_message(struct streambuf *b) {
 static void control_stream_readable(struct streambuf_stream *s) {
 	str *data;
 
-	ilog(LOG_DEBUG, "Got %ld bytes from %s", s->inbuf->buf->len, s->addr);
+	ilog(LOG_DEBUG, "Got %zu bytes from %s", s->inbuf->buf->len, s->addr);
 	while ((data = chunk_message(s->inbuf))) {
 		ilog(LOG_DEBUG, "Got control ng message from %s", s->addr);
 		control_ng_process(data, &s->sock.remote, s->addr, control_ng_send, &s->sock, s->parent);

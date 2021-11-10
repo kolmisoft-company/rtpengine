@@ -162,7 +162,7 @@ static void mqtt_ssrc_stats(struct ssrc_ctx *ssrc, JsonBuilder *json, struct cal
 
 	unsigned int clockrate = 0;
 	//struct codec_handler *h = codec_handler_get(ps->media, prim_pt);
-	struct rtp_payload_type *pt = g_hash_table_lookup(media->codecs_recv, GUINT_TO_POINTER(prim_pt));
+	struct rtp_payload_type *pt = g_hash_table_lookup(media->codecs.codecs, GUINT_TO_POINTER(prim_pt));
 	if (pt) {
 		json_builder_set_member_name(json, "codec");
 		json_builder_add_string_value(json, pt->encoding.s);
@@ -189,8 +189,8 @@ static void mqtt_ssrc_stats(struct ssrc_ctx *ssrc, JsonBuilder *json, struct cal
 	uint64_t packets, octets, packets_lost, duplicates;
 	packets = atomic64_get(&ssrc->packets);
 	octets = atomic64_get(&ssrc->octets);
-	packets_lost = atomic64_get(&ssrc->packets_lost);
-	duplicates = atomic64_get(&ssrc->duplicates);
+	packets_lost = sc->packets_lost;
+	duplicates = sc->duplicates;
 
 	// process per-second stats
 	uint64_t cur_ts = ssrc_timeval_to_ts(&rtpe_now);
@@ -284,10 +284,10 @@ static void mqtt_stream_stats(struct packet_stream *ps, JsonBuilder *json) {
 		json_builder_add_int_value(json, sfd->socket.local.port);
 	}
 
-	if (ps->ssrc_in) {
+	if (ps->ssrc_in[0]) {
 		json_builder_set_member_name(json, "ingress");
 		json_builder_begin_object(json);
-		mqtt_ssrc_stats(ps->ssrc_in, json, ps->media);
+		mqtt_ssrc_stats(ps->ssrc_in[0], json, ps->media);
 		json_builder_end_object(json);
 	}
 
@@ -295,10 +295,10 @@ static void mqtt_stream_stats(struct packet_stream *ps, JsonBuilder *json) {
 
 	mutex_lock(&ps->out_lock);
 
-	if (ps->ssrc_out) {
+	if (ps->ssrc_out[0]) {
 		json_builder_set_member_name(json, "egress");
 		json_builder_begin_object(json);
-		mqtt_ssrc_stats(ps->ssrc_out, json, ps->media);
+		mqtt_ssrc_stats(ps->ssrc_out[0], json, ps->media);
 		json_builder_end_object(json);
 	}
 

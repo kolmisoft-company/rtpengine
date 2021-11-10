@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdbool.h>
 #include "compat.h"
 #include "auxlib.h"
 
@@ -182,7 +183,7 @@ INLINE void g_tree_find_all(GQueue *out, GTree *t, GEqualFunc f, void *data) {
 INLINE void g_tree_get_values(GQueue *out, GTree *t) {
 	g_tree_find_all(out, t, NULL, NULL);
 }
-INLINE void g_tree_remove_all(GQueue *out, GTree *t) {
+INLINE void g_tree_find_remove_all(GQueue *out, GTree *t) {
 	GList *l;
 	g_queue_init(out);
 	g_tree_find_all(out, t, NULL, NULL);
@@ -342,7 +343,7 @@ struct thread_waker {
 
 void thread_waker_add(struct thread_waker *);
 void thread_waker_del(struct thread_waker *);
-void threads_join_all(int);
+void threads_join_all(bool);
 void thread_create_detach_prio(void (*)(void *), void *, const char *, int, const char *);
 INLINE void thread_create_detach(void (*f)(void *), void *a, const char *name) {
 	thread_create_detach_prio(f, a, NULL, 0, name);
@@ -354,26 +355,26 @@ INLINE void thread_create_detach(void (*f)(void *), void *a, const char *name) {
 /*** ATOMIC BITFIELD OPERATIONS ***/
 
 /* checks if at least one of the flags is set */
-INLINE int bf_isset(const volatile unsigned int *u, unsigned int f) {
+INLINE bool bf_isset(const volatile unsigned int *u, unsigned int f) {
 	if ((g_atomic_int_get(u) & f))
-		return -1;
-	return 0;
+		return true;
+	return false;
 }
 /* checks if all of the flags are set */
-INLINE int bf_areset(const volatile unsigned int *u, unsigned int f) {
+INLINE bool bf_areset(const volatile unsigned int *u, unsigned int f) {
 	if ((g_atomic_int_get(u) & f) == f)
-		return -1;
-	return 0;
+		return true;
+	return false;
 }
 /* returns true if at least one of the flags was set already */
-INLINE int bf_set(volatile unsigned int *u, unsigned int f) {
-	return (g_atomic_int_or(u, f) & f) ? -1 : 0;
+INLINE bool bf_set(volatile unsigned int *u, unsigned int f) {
+	return (g_atomic_int_or(u, f) & f) ? true : false;
 }
 /* returns true if at least one of the flags was set */
-INLINE int bf_clear(volatile unsigned int *u, unsigned int f) {
-	return (g_atomic_int_and(u, ~f) & f) ? -1 : 0;
+INLINE bool bf_clear(volatile unsigned int *u, unsigned int f) {
+	return (g_atomic_int_and(u, ~f) & f) ? true : false;
 }
-INLINE void bf_set_clear(volatile unsigned int *u, unsigned int f, int cond) {
+INLINE void bf_set_clear(volatile unsigned int *u, unsigned int f, bool cond) {
 	if (cond)
 		bf_set(u, f);
 	else
@@ -402,13 +403,13 @@ INLINE void bf_copy_same(volatile unsigned int *u, const volatile unsigned int *
 #define BIT_ARRAY_DECLARE(name, size)	\
 	volatile unsigned int name[((size) + sizeof(int) * 8 - 1) / (sizeof(int) * 8)]
 
-INLINE int bit_array_isset(const volatile unsigned int *name, unsigned int bit) {
+INLINE bool bit_array_isset(const volatile unsigned int *name, unsigned int bit) {
 	return bf_isset(&name[bit / (sizeof(int) * 8)], 1U << (bit % (sizeof(int) * 8)));
 }
-INLINE int bit_array_set(volatile unsigned int *name, unsigned int bit) {
+INLINE bool bit_array_set(volatile unsigned int *name, unsigned int bit) {
 	return bf_set(&name[bit / (sizeof(int) * 8)], 1U << (bit % (sizeof(int) * 8)));
 }
-INLINE int bit_array_clear(volatile unsigned int *name, unsigned int bit) {
+INLINE bool bit_array_clear(volatile unsigned int *name, unsigned int bit) {
 	return bf_clear(&name[bit / (sizeof(int) * 8)], 1U << (bit % (sizeof(int) * 8)));
 }
 
@@ -434,14 +435,19 @@ INLINE uint64_t atomic64_get_na(const atomic64 *u) {
 INLINE void atomic64_set(atomic64 *u, uint64_t a) {
 	g_atomic_pointer_set(&u->p, (void *) a);
 }
+INLINE gboolean atomic64_set_if(atomic64 *u, uint64_t a, uint64_t i) {
+	return g_atomic_pointer_compare_and_exchange(&u->p, (void *) i, (void *) a);
+}
 INLINE void atomic64_set_na(atomic64 *u, uint64_t a) {
 	u->p = (void *) a;
 }
-INLINE void atomic64_add(atomic64 *u, uint64_t a) {
-	g_atomic_pointer_add(&u->p, a);
+INLINE uint64_t atomic64_add(atomic64 *u, uint64_t a) {
+	return g_atomic_pointer_add(&u->p, a);
 }
-INLINE void atomic64_add_na(atomic64 *u, uint64_t a) {
+INLINE uint64_t atomic64_add_na(atomic64 *u, uint64_t a) {
+	uint64_t old = (uint64_t) u->p;
 	u->p = (void *) (((uint64_t) u->p) + a);
+	return old;
 }
 INLINE uint64_t atomic64_get_set(atomic64 *u, uint64_t a) {
 	uint64_t old;
@@ -479,16 +485,30 @@ INLINE void atomic64_set(atomic64 *u, uint64_t a) {
 	u->u = a;
 	mutex_unlock(&__atomic64_mutex);
 }
+INLINE gboolean atomic64_set_if(atomic64 *u, uint64_t a, uint64_t i) {
+	gboolean done = TRUE;
+	mutex_lock(&__atomic64_mutex);
+	if (u->u == i)
+		u->u = a;
+	else
+		done = FALSE;
+	mutex_unlock(&__atomic64_mutex);
+	return done;
+}
 INLINE void atomic64_set_na(atomic64 *u, uint64_t a) {
 	u->u = a;
 }
-INLINE void atomic64_add(atomic64 *u, uint64_t a) {
+INLINE uint64_t atomic64_add(atomic64 *u, uint64_t a) {
 	mutex_lock(&__atomic64_mutex);
+	uint64_t old = u->u;
 	u->u += a;
 	mutex_unlock(&__atomic64_mutex);
+	return old;
 }
-INLINE void atomic64_add_na(atomic64 *u, uint64_t a) {
+INLINE uint64_t atomic64_add_na(atomic64 *u, uint64_t a) {
+	uint64_t old = u->u;
 	u->u += a;
+	return old;
 }
 INLINE uint64_t atomic64_get_set(atomic64 *u, uint64_t a) {
 	uint64_t old;
@@ -501,17 +521,41 @@ INLINE uint64_t atomic64_get_set(atomic64 *u, uint64_t a) {
 
 #endif
 
-INLINE void atomic64_inc(atomic64 *u) {
-	atomic64_add(u, 1);
+INLINE uint64_t atomic64_inc(atomic64 *u) {
+	return atomic64_add(u, 1);
 }
-INLINE void atomic64_dec(atomic64 *u) {
-	atomic64_add(u, -1);
+INLINE uint64_t atomic64_dec(atomic64 *u) {
+	return atomic64_add(u, -1);
 }
 INLINE void atomic64_local_copy_zero(atomic64 *dst, atomic64 *src) {
 	atomic64_set_na(dst, atomic64_get_set(src, 0));
 }
 #define atomic64_local_copy_zero_struct(d, s, member) \
 	atomic64_local_copy_zero(&((d)->member), &((s)->member))
+
+#define atomic64_min(min, val_expression) \
+	do { \
+		uint64_t __cur = val_expression; \
+		do { \
+			uint64_t __old = atomic64_get(min); \
+			if (__old && __old <= __cur) \
+				break; \
+			if (atomic64_set_if(min, __cur, __old)) \
+				break; \
+		} while (1); \
+	} while (0)
+
+#define atomic64_max(max, val_expression) \
+	do { \
+		uint64_t __cur = val_expression; \
+		do { \
+			uint64_t __old = atomic64_get(max); \
+			if (__old && __old >= __cur) \
+				break; \
+			if (atomic64_set_if(max, __cur, __old)) \
+				break; \
+		} while (1); \
+	} while (0)
 
 
 

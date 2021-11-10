@@ -129,7 +129,7 @@ int kernel_add_stream(struct rtpengine_target_info *mti) {
 	if (!kernel.is_open)
 		return -1;
 
-	msg.cmd = REMG_ADD;
+	msg.cmd = REMG_ADD_TARGET;
 	msg.u.target = *mti;
 
 	// coverity[uninit_use_in_call : FALSE]
@@ -138,6 +138,25 @@ int kernel_add_stream(struct rtpengine_target_info *mti) {
 		return 0;
 
 	ilog(LOG_ERROR, "Failed to push relay stream to kernel: %s", strerror(errno));
+	return -1;
+}
+
+int kernel_add_destination(struct rtpengine_destination_info *mdi) {
+	struct rtpengine_message msg;
+	int ret;
+
+	if (!kernel.is_open)
+		return -1;
+
+	msg.cmd = REMG_ADD_DESTINATION;
+	msg.u.destination = *mdi;
+
+	// coverity[uninit_use_in_call : FALSE]
+	ret = write(kernel.fd, &msg, sizeof(msg));
+	if (ret > 0)
+		return 0;
+
+	ilog(LOG_ERROR, "Failed to push relay stream destination to kernel: %s", strerror(errno));
 	return -1;
 }
 
@@ -150,7 +169,7 @@ int kernel_del_stream(const struct re_address *a) {
 		return -1;
 
 	ZERO(msg);
-	msg.cmd = REMG_DEL;
+	msg.cmd = REMG_DEL_TARGET;
 	msg.u.target.local = *a;
 
 	ret = write(kernel.fd, &msg, sizeof(msg));
@@ -243,7 +262,7 @@ unsigned int kernel_add_intercept_stream(unsigned int call_idx, const char *id) 
 	return msg.u.stream.stream_idx;
 }
 
-int kernel_update_stats(const struct re_address *a, uint32_t ssrc, struct rtpengine_ssrc_stats *out) {
+int kernel_update_stats(const struct re_address *a, struct rtpengine_stats_info *out) {
 	struct rtpengine_message msg;
 	int ret;
 
@@ -259,10 +278,8 @@ int kernel_update_stats(const struct re_address *a, uint32_t ssrc, struct rtpeng
 		ilog(LOG_ERROR, "Failed to get stream stats from kernel: %s", strerror(errno));
 		return -1;
 	}
-	if (msg.u.stats.ssrc != ssrc)
-		return -1;
 
-	*out = msg.u.stats.ssrc_stats;
+	*out = msg.u.stats;
 
 	return 0;
 }

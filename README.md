@@ -12,6 +12,13 @@ proxies.
 
 Currently the only supported platform is GNU/Linux.
 
+Mailing List
+============
+
+For general questions, discussion, requests for support, and community chat,
+join our [mailing list](https://rtpengine.com/mailing-list). Please do not use
+the Github issue tracker for this purpose.
+
 Features
 =========
 
@@ -57,6 +64,8 @@ the following additional features are available:
 - Playback of pre-recorded streams/announcements
 - Transcoding between T.38 and PCM (G.711 or other audio codecs)
 - Silence detection and comfort noise (RFC 3389) payloads
+* Media forking
+* Publish/subscribe mechanism for N-to-N media forwarding
 
 *Rtpengine* does not (yet) support:
 
@@ -65,8 +74,13 @@ the following additional features are available:
 Compiling and Installing
 =========================
 
-On a Debian System
-------------------
+Package Repositories
+--------------------
+
+Prebuilt packages for some newer releases of Debian are available on [this repository](https://dfx.at/rtpengine)
+
+Compiling on a Debian System
+----------------------------
 
 On a Debian system, everything can be built and packaged into Debian packages
 by executing `dpkg-buildpackage` (which can be found in the `dpkg-dev` package) in the main directory.
@@ -122,9 +136,10 @@ see the section on *G.729 support* below for details.
 Manual Compilation
 ------------------
 
-There's 3 parts to *rtpengine*, which can be found in the respective
-subdirectories. Running `make check` on the top source directory will
-build all parts and run the test suite.
+There are 3 main parts to *rtpengine* plus one optional component, which can be
+found in the respective subdirectories. Running `make` on the top source
+directory will build all parts. Running `make check` additionally will run the
+test suite.
 
 * `daemon`
 
@@ -149,6 +164,8 @@ build all parts and run the test suite.
 	- *libiptc* library for iptables management (optional)
 	- *ffmpeg* codec libraries for transcoding (optional) such as *libavcodec*, *libavfilter*, *libswresample*
 	- *bcg729* for full G.729 transcoding support (optional)
+	- *libmosquitto*
+	- *libwebsockets*
 
 	The `Makefile` contains a few Debian-specific flags, which may have to removed for compilation to
 	be successful. This will not affect operation in any way.
@@ -189,6 +206,12 @@ build all parts and run the test suite.
 	depending modules aren't loaded, for example the `x_tables` module), but it's recommended to copy the
 	module into `/lib/modules/$VERSION/updates/`, followed by running `depmod -a`. After this, the module can
 	be loaded by issuing `modprobe xt_RTPENGINE`.
+
+* `recording-daemon`
+
+	Optional component for the call recording feature. Prerequisites are
+	usage of the kernel module and availability of transcoding (via
+	*ffmpeg*)
 
 Usage
 =====
@@ -432,12 +455,16 @@ via the [bcg729](https://www.linphone.org/technical-corner/bcg729/) library
 the *bcg729* headers in a few locations and uses the library if found. If the library is located
 elsewhere, see `daemon/Makefile` to control where the build system is looking for it.
 
-In a Debian build environment, `debian/control` lists a build-time dependency on *bcg729*. Since
-Debian proper does not currently include a *bcg729* package, one can be built locally using these
-instructions on [GitHub](https://github.com/ossobv/bcg729-deb). *Sipwise* provides a pre-packaged
-version of this as part of our
-[C5 CE](https://www.sipwise.com/products/class-5-softswitch-carrier-grade-for-voice-over-ip/)
-product which is [available here](https://deb.sipwise.com/spce/mr6.2.1/pool/main/b/bcg729/).
+In a Debian build environment, `debian/control` lists a build-time dependency
+on *bcg729*. Newer Debian releases (currently *bullseye*, *bookworm*, *sid*)
+include *bcg729* as a package so nothing needs to be done there. Older Debian
+releases do not currently include a *bcg729* package, but one can be built
+locally using these instructions on
+[GitHub](https://github.com/ossobv/bcg729-deb). *Sipwise* provides a
+pre-packaged version of this as part of our [C5
+CE](https://www.sipwise.com/products/class-5-softswitch-carrier-grade-for-voice-over-ip/)
+product which is [available
+here](https://deb.sipwise.com/spce/mr6.2.1/pool/main/b/bcg729/).
 
 Alternatively the build dependency
 can be removed from `debian/control` or by switching to a different Debian build profile.
@@ -571,12 +598,18 @@ a string and determines the type of message. Currently the following commands ar
 * unblock DTMF
 * block media
 * unblock media
+* silence media
+* unsilence media
 * start forwarding
 * stop forwarding
 * play media
 * stop media
 * play DTMF
 * statistics
+* publish
+* subscribe request
+* subscribe answer
+* unsubscribe
 
 The response dictionary must contain at least one key called `result`. The value can be either `ok` or `error`.
 For the `ping` command, the additional value `pong` is allowed. If the result is `error`, then another key
@@ -630,10 +663,19 @@ Optionally included keys are:
 	The SIP `Via` branch as string. Used to additionally refine the matching logic between media streams
 	and calls and call branches.
 
-* `label`
+* `label` or `from-label`
 
 	A custom free-form string which *rtpengine* remembers for this participating endpoint and reports
-	back in logs and statistics output.
+	back in logs and statistics output. For some commands (e.g. `block media`) the given label is not
+	used to set the label of the call participant, but rather to select an existing call participant.
+
+* `set-label` or `to-label`
+
+	Some commands (e.g. `block media`) use the given `label` to select
+	an existing call participant. For these commands, `set-label` instead
+	of `label` can be used to set the label at the same time, either for
+	the selected call participant (if selected via `from-tag`) or for the
+	newly created participant (e.g. for `subscribe request`).
 
 * `flags`
 
@@ -734,69 +776,7 @@ Optionally included keys are:
 
 	- `always transcode`
 
-		When transcoding is in use, *rtpengine* will normally match up the codecs offered with
-		one side with the codecs offered by the other side, and engage the transcoding engine
-		only for codec pairs that are not supported by both sides. With this flag present,
-		*rtpengine* will skip the codec match-up routine and always trancode any received media
-		to the first (highest priority) codec offered by the other side that is supported for
-		transcoding. Using this flag engages the transcoding engine even if no other
-		`transcoding` flags are present. Unlike other transcoding options, this one is directional,
-		which means that it's applied only to the one side doing the signalling that is being
-		handled (i.e. the side doing the `offer` or the `answer`).
-
-	- `asymmetric codecs`
-
-		This flag is relevant to transcoding scenarios. By default, if an RTP client rejects a
-		codec that was offered to it (by not including it in the answer SDP), *rtpengine* will
-		assume that this client will also not send this codec (in addition to not wishing to
-		receive it). With this flag given, *rtpengine* will not make this assumption, meaning
-		that *rtpengine* will expect to potentially receive a codec from an RTP client even if
-		that RTP client rejected this codec in its answer SDP.
-
-		The effective difference is that when *rtpengine* is instructed to offer a new codec for
-		transcoding to an RTP client, and then this RTP client rejects this codec, by default
-		*rtpengine* is then able to shut down its transcoding engine and revert to non-transcoding
-		operation for this call. With this flag given however, *rtpengine* would not be able
-		to shut down its transcoding engine in this case, resulting in potentially different media
-		flow, and potentially transcoding media when it otherwise would not have to.
-
-		This flag should be given as part of the `answer` message.
-
-	- `symmetric codecs`
-
-		This flag instructs *rtpengine* to honour the list of codecs accepted by answer, including
-		their order, and match them up with the list of codecs that *rtpengine* itself produces
-		when transcoding. It must be using in an `answer` message and is ignored in an `offer`.
-
-		By default, any supported codec that was originally offered will be accepted by
-		*rtpengine* when transcoding, and the first codec listed will be used as output codec,
-		even if neither this codec nor its transcoded counterpart was accepted by the answer.
-		With this flag given, *rtpengine* will prefer the codecs listed in the answer over
-		the codecs listed in the offer and re-order the answer accordingly. This can lead to
-		a high-priority codec given in the offer to be listed as low-priority codec in the
-		answer, and vice versa. On the other hand, it can lead to the transcoding engine to be
-		disabled when it isn't needed.
-
-		For example: The original offer lists codecs `PCMA` and `opus`. *Rtpengine* is instructed
-		to add `G722` as a transcoded codec in the offer, and so the offer produced by
-		*rtpengine* lists `PCMA`, `opus`, and `G722`. If *rtpengine* were to receive any
-		G.722 media, it would transcode it to PCMA as this is the codec preferred by the
-		offer. The answer now accepts `opus` and rejects the other two codecs. Without this
-		flag, the answer produced by *rtpengine* would contain both `PCMA` and `opus`, because
-		receiving G.722 would still be a possibility and so would have to be transcoded to
-		PCMA. With this flag however, *rtpengine* honours the single accepted codec from the
-		answer and so is able to eliminate PCMA from its own answer as it's not needed.
-
-	- `reorder codecs`
-
-		This flag adds an additional stage in the processing of the `answer` codecs. Instead of
-		accepting codecs in the same order that they were offered, reorder the list of codecs
-		to match the codecs on the opposite (answer) side. This can avoid asymmetric codec flow
-		in certain cases, at the cost of the answer message possibly listing codecs in a different
-		order from the offer message (which then could be suppressed using `single codec`).
-
-		The config option `reorder-codecs` can be set to make this the default behaviour for
-		all answer messages.
+		Legacy flag, synonymous to `codec-accept=all`.
 
 	- `single codec`
 
@@ -804,11 +784,27 @@ Optionally included keys are:
 		and will remove all others from the list. Useful for RTP clients which get confused if
 		more than one codec is listed in an answer.
 
+	- `reuse codecs` or `no codec renegotiation`
+
+		Instructs *rtpengine* to prevent endpoints from switching codecs during call run-time
+		if possible. Codecs that were listed as preferred in the past will be kept as preferred
+		even if the re-offer lists other codecs as preferred, or in a different order. Recommended
+		to be combined with `single codec`.
+
+	- `allow transcoding`
+
+		This flag is only useful in commands that provide an explicit answer SDP to *rtpengine*
+		(e.g. `subscribe answer`). For these commands, if the answer SDP does not accept all
+		codecs that were offered, the default behaviour is to reject the answer. With this flag
+		given, the answer will be accepted even if some codecs were rejected, and codecs will be
+		transcoded as required.
+
 	- `all`
 
-		Only relevant to the `unblock media` message. Instructs *rtpengine* to remove not only a
-		full-call media block, but also remove directional media blocks that were imposed on
-		individual participants.
+		Only relevant to the `unblock media` and `unsilence media`
+		messages. Instructs *rtpengine* to remove not only a full-call
+		media block, but also remove directional media blocks that were
+		imposed on individual participants.
 
 	- `pad crypto`
 
@@ -818,6 +814,10 @@ Optionally included keys are:
 	- `generate mid`
 
 		Add `a=mid` attributes to the outgoing SDP if they were not already present.
+
+	- `strip extmap`
+
+		Remove `a=rtpmap` attributes from the outgoing SDP.
 
 	- `original sendrecv`
 
@@ -848,6 +848,19 @@ Optionally included keys are:
 		endpoint address is available from a received SDP, for as long
 		as no incoming packets have been received. Useful to create an
 		initial NAT mapping. Not needed when ICE is in use.
+
+	- `NAT-wait`
+
+		Prevents forwarding media packets to the respective endpoint
+		until at least one media packet has been received from that
+		endpoint. This is to allow a NAT binding to open in the ingress
+		direction before sending packets out, which could result in an
+		automated firewall block.
+
+	- `trickle ICE`
+
+		Useful for `offer` messages when ICE as advertised to also advertise
+		support for trickle ICE.
 
 * `generate RTCP`
 
@@ -922,6 +935,12 @@ Optionally included keys are:
 	interfaces, whether or not they are configured using the `BASE:SUFFIX` interface name notation.
 	This special keyword is provided only for legacy support and should be considered obsolete.
 	It will be removed in future versions.
+
+* `interface`
+
+	Contains a single string naming one of the configured interfaces, just like `direction` does. The
+	`interface` option is used instead of `direction` where only one interface is required (e.g. outside
+	of an offer/answer scenario), for example in the `publish` or `subscribe request` commands.
 
 * `received from`
 
@@ -1815,6 +1834,9 @@ call legs, therefore all keys other than `call-id` are currently ignored.
 If the chosen recording method doesn't support in-kernel packet forwarding, enabling call recording
 via this messages will force packet forwarding to happen in userspace only.
 
+If the optional 'output-destination' key is set, then its value will be used
+as an output file. Note that a filename extension will not be added.
+
 `stop recording` Message
 -------------------------
 
@@ -1851,6 +1873,13 @@ of DTMF events can be enabled and disabled at any time during call runtime.
 Analogous to `block DTMF` and `unblock DTMF` but blocks media packets instead of DTMF packets. DTMF packets
 can still pass through when media blocking is enabled. Media packets can be blocked for an entire call, or
 directionally for individual participants. See `block DTMF` above for details.
+
+`silence media` and `unsilence media` Messages
+----------------------------------------------
+
+Identical to `block media` and `unblock media` except that media packets are
+not simply blocked, but rather have their payload replaced with silence audio.
+This is only supported for certain trivial audio codecs (i.e. G.711, G.722).
 
 `start forwarding` and `stop forwarding` Messages
 -------------------------------------------------
@@ -2039,6 +2068,75 @@ command. Sample return dictionary:
 	  },
 	  "result": "ok"
 	}
+
+`publish` Message
+-----------------
+
+Similar to an `offer` message except that it is used outside of an offer/answer
+scenario. The media described by the SDP is published to *rtpengine* directly,
+and other peer can then subscribe to the published media to receive a copy.
+
+The message must include the key `sdp` which should describe `sendonly` media;
+and the key `call-id` and `from-tag` to identify the publisher. Most other keys
+and options supported by `offer` are also supported for `publish`.
+
+The reply message will contain an answer SDP in `sdp`, but unlike with `offer`
+this is not a rewritten version of the received SDP, but rather a `recvonly`
+answer SDP generated by *rtpengine* locally. Only one codec for each media
+section will be listed, and by default this will be the first supported codec
+from the published media. This can be influenced with the `codec` options
+described above.
+
+`subscribe request` Message
+---------------------------
+
+This message is used to request subscription (i.e. receiving a copy of the
+media) to an existing call participant, which must have been created either
+through the offer/answer mechanism, or through the publish mechanism.
+
+The call participant is selected in the same way as described under `block
+DTMF` except that one call participant must be selected (i.e. the `all` keyword
+cannot be used). This message then creates a new call participant, which
+corresponds to the subscription. This new call participant will be identified
+by a newly generated unique tag, or by the tag given in the `to-tag` key. If a
+label is to be set for the newly created subscription, it can be set through
+`set-label`.
+
+The reply message will contain a sendonly offer SDP in `sdp` which by default
+will mirror the SDP of the call participant being subscribed to. This offer SDP
+can be manipulated with the same flags as used in an `offer` message, including
+the option to manipulate the codecs. The reply message will also contain the
+`from-tag` (corresponding to the call participant being subscribed to) and the
+`to-tag` (corresponding to the subscription, either generated or taken from the
+received message).
+
+`subscribe answer` Message
+--------------------------
+
+This message is expected to be received after responding to a `subscribe
+request` message. The message should contain the same `from-tag` and `to-tag`
+is the reply to the `subscribe request` (although `label` etc can also be used
+instead of the `from-tag`), as well as the answer SDP in `sdp`.
+
+By default, the answer SDP must accept all codecs that were presented in the
+offer SDP (given in the reply to `subscribe request`). If not all codecs were
+accepted, then the `subscribe answer` will be rejected. This behavious can be
+changed by including the `allow transcoding` flag in the message. If this flag
+is present, then the answer SDP will be accepted as long as at least one valid
+codec is present, and the media will be transcoded as required. This also holds
+true if some codecs were added for transcoding in the `subscribe request`
+message, which means that `allow transcoding` must always be included in
+`subscribe answer` if any transcoding is to be allowed.
+
+The reply message will simply indicate success or failure. If successful, media
+forwarding will start to the endpoint given in the answer SDP.
+
+`unsubscribe` Message
+---------------------
+
+This message is a counterpart to `subsscribe answer` to stop an established
+subscription. The subscription to be stopped is identified by `from-tag` and
+`to`tag`.
 
 The *tcp-ng* Control Protocol
 =========================

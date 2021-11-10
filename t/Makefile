@@ -22,6 +22,7 @@ CFLAGS+=	$(shell pkg-config --cflags spandsp)
 CFLAGS+=	-DWITH_TRANSCODING
 CFLAGS+=	$(shell pkg-config --cflags zlib)
 CFLAGS+=	$(shell pkg-config --cflags json-glib-1.0)
+CFLAGS+=	$(shell pkg-config --cflags libwebsockets)
 CFLAGS+=	$(shell pkg-config --cflags libevent_pthreads)
 CFLAGS+=	$(shell pkg-config xmlrpc_client --cflags 2> /dev/null || xmlrpc-c-config client --cflags)
 CFLAGS+=	$(shell pkg-config xmlrpc --cflags 2> /dev/null)
@@ -49,6 +50,7 @@ LDLIBS+=	$(shell pkg-config --libs libavfilter)
 LDLIBS+=	$(shell pkg-config --libs spandsp)
 LDLIBS+=	$(shell pkg-config --libs zlib)
 LDLIBS+=	$(shell pkg-config --libs json-glib-1.0)
+LDLIBS+=	$(shell pkg-config --libs libwebsockets)
 LDLIBS+=	-lpcap
 LDLIBS+=	$(shell pkg-config --libs libevent_pthreads)
 LDLIBS+=	$(shell pkg-config xmlrpc_client --libs 2> /dev/null || xmlrpc-c-config client --libs)
@@ -59,12 +61,12 @@ LDLIBS+=	$(shell mysql_config --libs)
 endif
 
 SRCS=		test-bitstr.c aes-crypt.c aead-aes-crypt.c test-const_str_hash.strhash.c
-LIBSRCS=	loglib.c auxlib.c str.c rtplib.c
+LIBSRCS=	loglib.c auxlib.c str.c rtplib.c ssllib.c
 DAEMONSRCS=	crypto.c ssrc.c aux.c rtp.c
 HASHSRCS=
 
 ifeq ($(with_transcoding),yes)
-SRCS+=		test-transcode.c test-dtmf-detect.c test-payload-tracker.c test-resample.c
+SRCS+=		test-transcode.c test-dtmf-detect.c test-payload-tracker.c test-resample.c test-stats.c
 SRCS+=		spandsp_recv_fax_pcm.c spandsp_recv_fax_t38.c spandsp_send_fax_pcm.c \
 		spandsp_send_fax_t38.c
 ifeq ($(with_amr_tests),yes)
@@ -74,22 +76,23 @@ LIBSRCS+=	codeclib.c resample.c socket.c streambuf.c dtmflib.c
 DAEMONSRCS+=	codec.c call.c ice.c kernel.c media_socket.c stun.c bencode.c poller.c \
 		dtls.c recording.c statistics.c rtcp.c redis.c iptables.c graphite.c \
 		cookie_cache.c udp_listener.c homer.c load.c cdr.c dtmf.c timerthread.c \
-		media_player.c jitter_buffer.c t38.c tcp_listener.c mqtt.c
-HASHSRCS+=	call_interfaces.c control_ng.c sdp.c
+		media_player.c jitter_buffer.c t38.c tcp_listener.c mqtt.c websocket.c cli.c
+HASHSRCS+=	call_interfaces.c control_ng.c sdp.c janus.c
 endif
 
 OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o) $(DAEMONSRCS:.c=.o) $(HASHSRCS:.c=.strhash.o)
 
-COMMONOBJS=	str.o auxlib.o rtplib.o loglib.o
+COMMONOBJS=	str.o auxlib.o rtplib.o loglib.o ssllib.o
 
 include ../lib/common.Makefile
 
-.PHONY:		all-tests unit-tests daemon-tests all-daemon-tests \
-	daemon-tests-main daemon-tests-jb daemon-tests-reorder daemon-tests-dtx daemon-tests-dtx-cn
+.PHONY:		all-tests unit-tests daemon-tests daemon-tests \
+	daemon-tests-main daemon-tests-jb daemon-tests-dtx daemon-tests-dtx-cn daemon-tests-pubsub \
+	daemon-tests-intfs daemon-tests-stats
 
 TESTS=		test-bitstr aes-crypt aead-aes-crypt test-const_str_hash.strhash
 ifeq ($(with_transcoding),yes)
-TESTS+=		test-transcode test-dtmf-detect test-payload-tracker test-resample
+TESTS+=		test-transcode test-dtmf-detect test-payload-tracker test-resample test-stats
 ifeq ($(with_amr_tests),yes)
 TESTS+=		test-amr-decode test-amr-encode
 endif
@@ -107,13 +110,13 @@ endif
 unit-tests:	$(TESTS)
 	for x in $(TESTS); do echo testing: $$x; G_DEBUG=fatal-warnings ./$$x || exit 1; done
 
-daemon-tests:	tests-preload.so
+daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-pubsub daemon-tests-websocket \
+	daemon-tests-intfs daemon-tests-stats
+
+daemon-test-deps:	tests-preload.so
 	$(MAKE) -C ../daemon
-	$(MAKE) all-daemon-tests
 
-all-daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-reorder daemon-tests-dtx daemon-tests-dtx-cn
-
-daemon-tests-main:
+daemon-tests-main:	daemon-test-deps
 	rm -rf fake-$@-sockets
 	mkdir fake-$@-sockets
 	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
@@ -121,7 +124,7 @@ daemon-tests-main:
 	test "$$(ls fake-$@-sockets)" = ""
 	rmdir fake-$@-sockets
 
-daemon-tests-jb:
+daemon-tests-jb:	daemon-test-deps
 	rm -rf fake-$@-sockets
 	mkdir fake-$@-sockets
 	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
@@ -129,15 +132,7 @@ daemon-tests-jb:
 	test "$$(ls fake-$@-sockets)" = ""
 	rmdir fake-$@-sockets
 
-daemon-tests-reorder:
-	rm -rf fake-$@-sockets
-	mkdir fake-$@-sockets
-	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
-		   perl -I../perl auto-daemon-tests-reorder.pl
-	test "$$(ls fake-$@-sockets)" = ""
-	rmdir fake-$@-sockets
-
-daemon-tests-dtx:
+daemon-tests-dtx:	daemon-test-deps
 	rm -rf fake-$@-sockets
 	mkdir fake-$@-sockets
 	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
@@ -145,11 +140,43 @@ daemon-tests-dtx:
 	test "$$(ls fake-$@-sockets)" = ""
 	rmdir fake-$@-sockets
 
-daemon-tests-dtx-cn:
+daemon-tests-dtx-cn:	daemon-test-deps
 	rm -rf fake-$@-sockets
 	mkdir fake-$@-sockets
 	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
 		   perl -I../perl auto-daemon-tests-dtx-cn.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-pubsub:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-pubsub.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-stats:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-stats.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-websocket:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   python3 auto-daemon-tests-websocket.py
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-intfs:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-intfs.pl
 	test "$$(ls fake-$@-sockets)" = ""
 	rmdir fake-$@-sockets
 
@@ -175,12 +202,21 @@ aes-crypt:	aes-crypt.o $(COMMONOBJS) crypto.o
 
 aead-aes-crypt:	aead-aes-crypt.o $(COMMONOBJS) crypto.o
 
+test-stats:	test-stats.o $(COMMONOBJS) codeclib.o resample.o codec.o ssrc.o call.o ice.o aux.o \
+	kernel.o media_socket.o stun.o bencode.o socket.o poller.o dtls.o recording.o statistics.o \
+	rtcp.o redis.o iptables.o graphite.o call_interfaces.strhash.o sdp.strhash.o rtp.o crypto.o \
+	control_ng.strhash.o graphite.o \
+	streambuf.o cookie_cache.o udp_listener.o homer.o load.o cdr.o dtmf.o timerthread.o \
+	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o \
+	websocket.o cli.o
+
 test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.o resample.o codec.o ssrc.o call.o ice.o aux.o \
 	kernel.o media_socket.o stun.o bencode.o socket.o poller.o dtls.o recording.o statistics.o \
 	rtcp.o redis.o iptables.o graphite.o call_interfaces.strhash.o sdp.strhash.o rtp.o crypto.o \
 	control_ng.strhash.o \
 	streambuf.o cookie_cache.o udp_listener.o homer.o load.o cdr.o dtmf.o timerthread.o \
-	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o
+	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o websocket.o \
+	cli.o
 
 test-resample:	test-resample.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
 

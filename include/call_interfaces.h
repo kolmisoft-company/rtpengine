@@ -23,6 +23,7 @@ struct sdp_ng_flags {
 	str from_tag;
 	str to_tag;
 	str via_branch;
+	str sdp;
 	str received_from_family;
 	str received_from_address;
 	str media_address;
@@ -31,20 +32,22 @@ struct sdp_ng_flags {
 	sockaddr_t parsed_received_from;
 	sockaddr_t parsed_media_address;
 	str direction[2];
+	str interface;
 	sockfamily_t *address_family;
 	int tos;
 	str record_call_str;
 	str metadata;
 	str label;
+	str set_label;
 	str address;
 	sockaddr_t xmlrpc_callback;
-	GHashTable *codec_strip;
+	GQueue codec_strip;
 	GHashTable *codec_except;
 	GQueue codec_offer;
 	GQueue codec_transcode;
-	GHashTable *codec_mask;
-	GHashTable *codec_accept;
-	GHashTable *codec_consume;
+	GQueue codec_mask;
+	GQueue codec_accept;
+	GQueue codec_consume;
 	GHashTable *codec_set;
 	int ptime,
 	    rev_ptime;
@@ -89,11 +92,13 @@ struct sdp_ng_flags {
 	             rtcp_mux_demux:1,
 	             rtcp_mux_accept:1,
 	             rtcp_mux_reject:1,
+		     trickle_ice:1,
 	             no_rtcp_attr:1,
 	             full_rtcp_attr:1,
 	             generate_rtcp:1,
 	             generate_rtcp_off:1,
 	             generate_mid:1,
+		     strip_extmap:1,
 	             strict_source:1,
 	             media_handover:1,
 	             dtls_passive:1,
@@ -107,10 +112,10 @@ struct sdp_ng_flags {
 		     debug:1,
 	             loop_protect:1,
 	             original_sendrecv:1,
-	             asymmetric_codecs:1,
-	             symmetric_codecs:1,
-	             reorder_codecs:1,
 	             single_codec:1,
+		     reuse_codec:1,
+		     allow_transcoding:1,
+		     accept_any:1,
 	             inject_dtmf:1,
 	             t38_decode:1,
 	             t38_force:1,
@@ -139,6 +144,7 @@ struct sdp_ng_flags {
 	             passthrough_on:1,
 	             passthrough_off:1,
 	             disable_jb:1,
+		     nat_wait:1,
 		     pierce_nat:1;
 };
 
@@ -170,11 +176,22 @@ const char *call_block_dtmf_ng(bencode_item_t *, bencode_item_t *);
 const char *call_unblock_dtmf_ng(bencode_item_t *, bencode_item_t *);
 const char *call_block_media_ng(bencode_item_t *, bencode_item_t *);
 const char *call_unblock_media_ng(bencode_item_t *, bencode_item_t *);
+const char *call_silence_media_ng(bencode_item_t *, bencode_item_t *);
+const char *call_unsilence_media_ng(bencode_item_t *, bencode_item_t *);
 const char *call_play_media_ng(bencode_item_t *, bencode_item_t *);
 const char *call_stop_media_ng(bencode_item_t *, bencode_item_t *);
 const char *call_play_dtmf_ng(bencode_item_t *, bencode_item_t *);
 void ng_call_stats(struct call *call, const str *fromtag, const str *totag, bencode_item_t *output,
 		struct call_stats *totals);
+const char *call_publish_ng(bencode_item_t *, bencode_item_t *, const char *, const endpoint_t *);
+const char *call_subscribe_request_ng(bencode_item_t *, bencode_item_t *);
+const char *call_subscribe_answer_ng(bencode_item_t *, bencode_item_t *);
+const char *call_unsubscribe_ng(bencode_item_t *, bencode_item_t *);
+
+void save_last_sdp(struct call_monologue *ml, str *sdp, GQueue *parsed, GQueue *streams);
+void call_ng_flags_init(struct sdp_ng_flags *out, enum call_opmode opmode);
+void call_ng_free_flags(struct sdp_ng_flags *flags);
+void call_unlock_release(struct call **c);
 
 int call_interfaces_init(void);
 void call_interfaces_free(void);

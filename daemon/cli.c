@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <glib.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "poller.h"
 #include "aux.h"
@@ -187,43 +188,30 @@ static void cli_handler_do(const cli_handler_t *handlers, str *instr,
 	cw->cw_printf(cw, "%s:" STR_FORMAT "\n", "Unknown or incomplete command:", STR_FMT(instr));
 }
 
-static void destroy_own_foreign_calls(int foreign_call, unsigned int uint_keyspace_db) {
+static void destroy_own_foreign_calls(bool foreign_call, unsigned int uint_keyspace_db) {
 	struct call *c = NULL;
 	struct call_monologue *ml = NULL;
 	GQueue call_list = G_QUEUE_INIT;
-	GHashTableIter iter;
-	gpointer key, value;
 	GList *i;
 
-	// lock read
-	rwlock_lock_r(&rtpe_callhash_lock);
-
-	g_hash_table_iter_init(&iter, rtpe_callhash);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		c = (struct call*)value;
-		if (!c) {
-			continue;
-		}
-
+	ITERATE_CALL_LIST_START(CALL_ITERATOR_MAIN, c);
 		// match foreign_call flag
-		if ((foreign_call != UNDEFINED) && !(foreign_call == IS_FOREIGN_CALL(c))) {
-			continue;
-		}
+		if (foreign_call && !IS_FOREIGN_CALL(c))
+			goto next;
+		if (!foreign_call && IS_FOREIGN_CALL(c))
+			goto next;
 
 		// match uint_keyspace_db, if some given
-		if ((uint_keyspace_db != UNDEFINED) && !(uint_keyspace_db == c->redis_hosted_db)) {
-			continue;
-		}
+		if ((uint_keyspace_db != UNDEFINED) && !(uint_keyspace_db == c->redis_hosted_db))
+			goto next;
 		
 		// increase ref counter
 		obj_get(c);
 
 		// save call reference
 		g_queue_push_tail(&call_list, c);
-	}
-
-	// unlock read
-	rwlock_unlock_r(&rtpe_callhash_lock);
+next:;
+	ITERATE_CALL_LIST_NEXT_END(c);
 
 	// destroy calls
 	while ((c = g_queue_pop_head(&call_list))) {
@@ -242,15 +230,15 @@ static void destroy_own_foreign_calls(int foreign_call, unsigned int uint_keyspa
 }
 
 static void destroy_all_foreign_calls(void) {
-	destroy_own_foreign_calls(1, UNDEFINED);
+	destroy_own_foreign_calls(true, UNDEFINED);
 }
 
 static void destroy_all_own_calls(void) {
-	destroy_own_foreign_calls(0, UNDEFINED);
+	destroy_own_foreign_calls(false, UNDEFINED);
 }
 
 static void destroy_keyspace_foreign_calls(unsigned int uint_keyspace_db) {
-	destroy_own_foreign_calls(1, uint_keyspace_db);
+	destroy_own_foreign_calls(true, uint_keyspace_db);
 }
 
 static void cli_incoming_params_start(str *instr, struct cli_writer *cw) {
@@ -405,12 +393,27 @@ static void cli_incoming_params_revert(str *instr, struct cli_writer *cw) {
 
 static void cli_incoming_list_counters(str *instr, struct cli_writer *cw) {
 	cw->cw_printf(cw, "\nCurrent per-second counters:\n\n");
-	cw->cw_printf(cw, " Packets per second                              :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats.packets));
-	cw->cw_printf(cw, " Bytes per second                                :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats.bytes));
-	cw->cw_printf(cw, " Errors per second                               :%" PRIu64 "\n",
-			atomic64_get(&rtpe_stats.errors));
+	cw->cw_printf(cw, " Packets per second (userspace)                  :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.packets_user));
+	cw->cw_printf(cw, " Bytes per second (userspace)                    :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.bytes_user));
+	cw->cw_printf(cw, " Errors per second (userspace)                   :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.errors_user));
+	cw->cw_printf(cw, " Packets per second (kernel)                     :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.packets_kernel));
+	cw->cw_printf(cw, " Bytes per second (kernel)                       :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.bytes_kernel));
+	cw->cw_printf(cw, " Errors per second (kernel)                      :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.errors_kernel));
+	cw->cw_printf(cw, " Packets per second (total)                      :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.packets_user) +
+			atomic64_get(&rtpe_stats.intv.packets_kernel));
+	cw->cw_printf(cw, " Bytes per second (total)                        :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.bytes_user) +
+			atomic64_get(&rtpe_stats.intv.bytes_kernel));
+	cw->cw_printf(cw, " Errors per second (total)                       :%" PRIu64 "\n",
+			atomic64_get(&rtpe_stats.intv.errors_user) +
+			atomic64_get(&rtpe_stats.intv.errors_kernel));
 }
 
 static void cli_incoming_list_totals(str *instr, struct cli_writer *cw) {
@@ -433,14 +436,17 @@ static void cli_incoming_list_totals(str *instr, struct cli_writer *cw) {
 
 static void cli_incoming_list_numsessions(str *instr, struct cli_writer *cw) {
        rwlock_lock_r(&rtpe_callhash_lock);
-       cw->cw_printf(cw, "Current sessions own: "UINT64F"\n", g_hash_table_size(rtpe_callhash) - atomic64_get(&rtpe_stats.foreign_sessions));
-       cw->cw_printf(cw, "Current sessions foreign: "UINT64F"\n", atomic64_get(&rtpe_stats.foreign_sessions));
+       cw->cw_printf(cw, "Current sessions own: "UINT64F"\n", g_hash_table_size(rtpe_callhash) - atomic64_get(&rtpe_stats_gauge.foreign_sessions));
+       cw->cw_printf(cw, "Current sessions foreign: "UINT64F"\n", atomic64_get(&rtpe_stats_gauge.foreign_sessions));
        cw->cw_printf(cw, "Current sessions total: %i\n", g_hash_table_size(rtpe_callhash));
        rwlock_unlock_r(&rtpe_callhash_lock);
-       cw->cw_printf(cw, "Current transcoded media: "UINT64F"\n", atomic64_get(&rtpe_stats.transcoded_media));
-       cw->cw_printf(cw, "Current sessions ipv4 only media: %li\n", atomic64_get(&rtpe_stats.ipv4_sessions));
-       cw->cw_printf(cw, "Current sessions ipv6 only media: %li\n", atomic64_get(&rtpe_stats.ipv6_sessions));
-       cw->cw_printf(cw, "Current sessions ip mixed  media: %li\n", atomic64_get(&rtpe_stats.mixed_sessions));
+       cw->cw_printf(cw, "Current transcoded media: "UINT64F"\n", atomic64_get(&rtpe_stats_gauge.transcoded_media));
+       cw->cw_printf(cw, "Current sessions ipv4 only media: " UINT64F "\n",
+		       atomic64_get(&rtpe_stats_gauge.ipv4_sessions));
+       cw->cw_printf(cw, "Current sessions ipv6 only media: " UINT64F "\n",
+		       atomic64_get(&rtpe_stats_gauge.ipv6_sessions));
+       cw->cw_printf(cw, "Current sessions ip mixed  media: " UINT64F "\n",
+		       atomic64_get(&rtpe_stats_gauge.mixed_sessions));
 }
 
 static void cli_incoming_list_maxsessions(str *instr, struct cli_writer *cw) {
@@ -571,14 +577,19 @@ static void cli_incoming_list_callid(str *instr, struct cli_writer *cw) {
 		cw->cw_printf(cw, "--- Tag '" STR_FORMAT "', type: %s, label '" STR_FORMAT "', "
 				"branch '" STR_FORMAT "', "
 				"callduration "
-				"%ld.%06ld, in dialogue with '" STR_FORMAT "'\n",
+				"%" TIME_T_INT_FMT ".%06" TIME_T_INT_FMT "\n",
 			STR_FMT(&ml->tag), get_tag_type_text(ml->tagtype),
 			STR_FMT(ml->label.s ? &ml->label : &STR_EMPTY),
 			STR_FMT(&ml->viabranch),
 			tim_result_duration.tv_sec,
-			tim_result_duration.tv_usec,
-			ml->active_dialogue ? (int) ml->active_dialogue->tag.len : 6,
-			ml->active_dialogue ? ml->active_dialogue->tag.s : "(none)");
+			tim_result_duration.tv_usec);
+
+		for (GList *sub = ml->subscriptions.head; sub; sub = sub->next) {
+			struct call_subscription *cs = sub->data;
+			struct call_monologue *csm = cs->monologue;
+			cw->cw_printf(cw, "---     subscribed to '" STR_FORMAT_M "'\n",
+					STR_FMT_M(&csm->tag));
+		}
 
 		for (k = ml->medias.head; k; k = k->next) {
 			md = k->data;
@@ -610,7 +621,7 @@ static void cli_incoming_list_callid(str *instr, struct cli_writer *cw) {
 						 sockaddr_print_buf(&ps->endpoint.address),
 						 ps->endpoint.port,
 						 (!PS_ISSET(ps, RTP) && PS_ISSET(ps, RTCP)) ? " (RTCP)" : "",
-						 ps->ssrc_in ? ps->ssrc_in->parent->h.ssrc : 0,
+						 ps->ssrc_in[0] ? ps->ssrc_in[0]->parent->h.ssrc : 0,
 						 atomic64_get(&ps->stats.packets),
 						 atomic64_get(&ps->stats.bytes), atomic64_get(&ps->stats.errors),
 						 atomic64_get(&ps->last_packet));
@@ -632,11 +643,8 @@ static void cli_incoming_list_callid(str *instr, struct cli_writer *cw) {
 }
 
 static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw) {
-	GHashTableIter iter;
-	gpointer key, value;
-	str *ptrkey;
-	struct call *call;
-	int found_own = 0, found_foreign = 0;
+	size_t found = 0;
+	bool all = false, own = false;
 
 	static const char* LIST_ALL = "all";
 	static const char* LIST_OWN = "own";
@@ -647,57 +655,39 @@ static void cli_incoming_list_sessions(str *instr, struct cli_writer *cw) {
 		return;
 	}
 
-	rwlock_lock_r(&rtpe_callhash_lock);
-
-	if (g_hash_table_size(rtpe_callhash)==0) {
-		cw->cw_printf(cw, "No sessions on this media relay.\n");
-		rwlock_unlock_r(&rtpe_callhash_lock);
+	if (str_cmp(instr, LIST_ALL) == 0)
+		all = true;
+	else if (str_cmp(instr, LIST_OWN) == 0)
+		own = true;
+	else if (str_cmp(instr, LIST_FOREIGN) == 0)
+	{ } // default
+	else {
+		// list session for callid
+		cli_incoming_list_callid(instr, cw);
 		return;
 	}
 
-	g_hash_table_iter_init (&iter, rtpe_callhash);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		ptrkey = (str*)key;
-		call = (struct call*)value;
-
-		if (str_cmp(instr, LIST_ALL) == 0) {
-			if (!call) {
-				continue;
-			}
-		} else if (str_cmp(instr, LIST_OWN) == 0) {
-			if (!call || IS_FOREIGN_CALL(call)) {
-				continue;
-			} else {
-				found_own = 1;
-			}
-		} else if (str_cmp(instr, LIST_FOREIGN) == 0) {
-			if (!call || !IS_FOREIGN_CALL(call)) {
-				continue;
-			} else {
-				found_foreign = 1;
-			}
-		} else {
-			// expect callid parameter
-			break;
+	ITERATE_CALL_LIST_START(CALL_ITERATOR_MAIN, call);
+		if (!all) {
+			if (IS_FOREIGN_CALL(call) && own)
+				goto next;
+			if (!IS_FOREIGN_CALL(call) && !own)
+				goto next;
 		}
+		found++;
 
-		cw->cw_printf(cw, "callid: %60s | deletionmark:%4s | created:%12i | proxy:%s | redis_keyspace:%i | foreign:%s\n", ptrkey->s, call->ml_deleted?"yes":"no", (int)call->created.tv_sec, call->created_from, call->redis_hosted_db, IS_FOREIGN_CALL(call)?"yes":"no");
-	}
-	rwlock_unlock_r(&rtpe_callhash_lock);
+		cw->cw_printf(cw, "callid: %60s | deletionmark:%4s | created:%12i | proxy:%s | redis_keyspace:%i | foreign:%s\n", call->callid.s, call->ml_deleted?"yes":"no", (int)call->created.tv_sec, call->created_from, call->redis_hosted_db, IS_FOREIGN_CALL(call)?"yes":"no");
 
-	if (str_cmp(instr, LIST_ALL) == 0) {
-		;
-	} else if (str_cmp(instr, LIST_OWN) == 0) {
-		if (!found_own) {
+next:;
+	ITERATE_CALL_LIST_NEXT_END(call);
+
+	if (!found) {
+		if (all)
+			cw->cw_printf(cw, "No sessions on this media relay.\n");
+		else if (own)
 			cw->cw_printf(cw, "No own sessions on this media relay.\n");
-		}
-	} else if (str_cmp(instr, LIST_FOREIGN) == 0) {
-		if (!found_foreign) {
+		else
 			cw->cw_printf(cw, "No foreign sessions on this media relay.\n");
-		}
-	} else {
-		// list session for callid
-		cli_incoming_list_callid(instr, cw);
 	}
 
 	return;
@@ -1071,15 +1061,8 @@ static void cli_incoming_kslist(str *instr, struct cli_writer *cw) {
 	cw->cw_printf(cw, "\n");
 }
 
-static void cli_incoming_active_standby(struct cli_writer *cw, int foreign) {
-	GHashTableIter iter;
-	gpointer key, value;
-
-	rwlock_lock_r(&rtpe_callhash_lock);
-
-	g_hash_table_iter_init(&iter, rtpe_callhash);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		struct call *c = value;
+static void cli_incoming_active_standby(struct cli_writer *cw, bool foreign) {
+	ITERATE_CALL_LIST_START(CALL_ITERATOR_MAIN, c);
 		rwlock_lock_w(&c->master_lock);
 		call_make_own_foreign(c, foreign);
 		c->last_signal = MAX(c->last_signal, rtpe_now.tv_sec);
@@ -1089,16 +1072,15 @@ static void cli_incoming_active_standby(struct cli_writer *cw, int foreign) {
 		}
 		rwlock_unlock_w(&c->master_lock);
 		redis_update_onekey(c, rtpe_redis_write);
-	}
-	rwlock_unlock_r(&rtpe_callhash_lock);
+	ITERATE_CALL_LIST_NEXT_END(c);
 
 	cw->cw_printf(cw, "Ok, all calls set to '%s'\n", foreign ? "foreign (standby)" : "owned (active)");
 }
 static void cli_incoming_active(str *instr, struct cli_writer *cw) {
-	cli_incoming_active_standby(cw, 0);
+	cli_incoming_active_standby(cw, false);
 }
 static void cli_incoming_standby(str *instr, struct cli_writer *cw) {
-	cli_incoming_active_standby(cw, 1);
+	cli_incoming_active_standby(cw, true);
 }
 
 static void cli_incoming_debug(str *instr, struct cli_writer *cw) {
@@ -1263,7 +1245,8 @@ static void cli_incoming_set_loglevel(str *instr, struct cli_writer *cw) {
 
 	str subsys = STR_NULL;
 	if (instr->len && (instr->s[0] < '0' || instr->s[0] > '9'))
-		str_token_sep(&subsys, instr, ' ');
+		if (str_token_sep(&subsys, instr, ' '))
+			subsys = STR_NULL;
 
 	if (!instr->len) {
 		cw->cw_printf(cw, "%s\n", "More parameters required.");

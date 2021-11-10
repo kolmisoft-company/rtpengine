@@ -40,6 +40,8 @@ Build-Depends:
  libxmlrpc-core-c3-dev (>= 1.16.07),
  libxtables-dev (>= 1.4) | iptables-dev (>= 1.4),
  markdown,
+ python3,
+ python3-websockets,
  zlib1g-dev,
 
 Package: ngcp-rtpengine-daemon
@@ -50,6 +52,7 @@ Recommends:
 Suggests:
  ngcp-system-tools,
 Depends:
+ iptables,
  lsb-base (>= 3.0-6),
  ${misc:Depends},
  ${shlibs:Depends},
