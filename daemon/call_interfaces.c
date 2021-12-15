@@ -601,69 +601,39 @@ INLINE void ng_t38_option(struct sdp_ng_flags *out, str *s, void *dummy) {
 		case CSH_LOOKUP("stop"):
 			out->t38_stop = 1;
 			break;
+		case CSH_LOOKUP("no-ecm"):
 		case CSH_LOOKUP("no-ECM"):
 			out->t38_no_ecm = 1;
 			break;
 		case CSH_LOOKUP("no-V17"):
-			out->t38_no_v17 = 1;
-			break;
 		case CSH_LOOKUP("no-V.17"):
-			out->t38_no_v17 = 1;
-			break;
-		case CSH_LOOKUP("no-V.27ter"):
-			out->t38_no_v27ter = 1;
-			break;
-		case CSH_LOOKUP("no-V27ter"):
-			out->t38_no_v27ter = 1;
-			break;
-		case CSH_LOOKUP("no-V29"):
-			out->t38_no_v29 = 1;
-			break;
-		case CSH_LOOKUP("no-V.29"):
-			out->t38_no_v29 = 1;
-			break;
-		case CSH_LOOKUP("no-V34"):
-			out->t38_no_v34 = 1;
-			break;
-		case CSH_LOOKUP("no-V.34"):
-			out->t38_no_v34 = 1;
-			break;
-		case CSH_LOOKUP("no-IAF"):
-			out->t38_no_iaf = 1;
-			break;
-		case CSH_LOOKUP("no-ecm"):
-			out->t38_no_ecm = 1;
-			break;
 		case CSH_LOOKUP("no-v17"):
-			out->t38_no_v17 = 1;
-			break;
 		case CSH_LOOKUP("no-v.17"):
 			out->t38_no_v17 = 1;
 			break;
+		case CSH_LOOKUP("no-V.27ter"):
+		case CSH_LOOKUP("no-V27ter"):
 		case CSH_LOOKUP("no-v.27ter"):
-			out->t38_no_v27ter = 1;
-			break;
 		case CSH_LOOKUP("no-v27ter"):
 			out->t38_no_v27ter = 1;
 			break;
+		case CSH_LOOKUP("no-V29"):
+		case CSH_LOOKUP("no-V.29"):
 		case CSH_LOOKUP("no-v29"):
-			out->t38_no_v29 = 1;
-			break;
 		case CSH_LOOKUP("no-v.29"):
 			out->t38_no_v29 = 1;
 			break;
+		case CSH_LOOKUP("no-V34"):
+		case CSH_LOOKUP("no-V.34"):
 		case CSH_LOOKUP("no-v34"):
-			out->t38_no_v34 = 1;
-			break;
 		case CSH_LOOKUP("no-v.34"):
 			out->t38_no_v34 = 1;
 			break;
+		case CSH_LOOKUP("no-IAF"):
 		case CSH_LOOKUP("no-iaf"):
 			out->t38_no_iaf = 1;
 			break;
 		case CSH_LOOKUP("FEC"):
-			out->t38_fec = 1;
-			break;
 		case CSH_LOOKUP("fec"):
 			out->t38_fec = 1;
 			break;
@@ -675,17 +645,16 @@ INLINE void ng_t38_option(struct sdp_ng_flags *out, str *s, void *dummy) {
 #endif
 
 
-static void call_ng_flags_list(struct sdp_ng_flags *out, bencode_item_t *input, const char *key,
+static void call_ng_flags_list(struct sdp_ng_flags *out, bencode_item_t *list,
 		void (*callback)(struct sdp_ng_flags *, str *, void *), void *parm)
 {
-	bencode_item_t *list, *it;
-	str s;
-	if ((list = bencode_dictionary_get_expect(input, key, BENCODE_LIST))) {
-		for (it = list->child; it; it = it->sibling) {
-			if (!bencode_get_str(it, &s))
-				continue;
-			callback(out, &s, parm);
-		}
+	if (list->type != BENCODE_LIST)
+		return;
+	for (bencode_item_t *it = list->child; it; it = it->sibling) {
+		str s;
+		if (!bencode_get_str(it, &s))
+			continue;
+		callback(out, &s, parm);
 	}
 }
 static void call_ng_flags_rtcp_mux(struct sdp_ng_flags *out, str *s, void *dummy) {
@@ -723,8 +692,6 @@ static void call_ng_flags_replace(struct sdp_ng_flags *out, str *s, void *dummy)
 			out->replace_sess_name = 1;
 			break;
 		case CSH_LOOKUP("sdp-version"):
-			out->replace_sdp_version = 1;
-			break;
 		case CSH_LOOKUP("SDP-version"):
 			out->replace_sdp_version = 1;
 			break;
@@ -753,7 +720,7 @@ static str *str_dup_escape(const str *s) {
 	}
 	return ret;
 }
-static void call_ng_flags_codec_list(struct sdp_ng_flags *out, str *s, void *qp) {
+static void call_ng_flags_esc_str_list(struct sdp_ng_flags *out, str *s, void *qp) {
 	str *s_copy = str_dup_escape(s);
 	g_queue_push_tail((GQueue *) qp, s_copy);
 }
@@ -799,6 +766,7 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			out->trust_address = 1;
 			break;
 		case CSH_LOOKUP("SIP-source-address"):
+		case CSH_LOOKUP("sip-source-address"):
 			out->trust_address = 0;
 			break;
 		case CSH_LOOKUP("asymmetric"):
@@ -821,6 +789,10 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			break;
 		case CSH_LOOKUP("all"):
 			out->all = 1;
+			break;
+		case CSH_LOOKUP("SIPREC"):
+		case CSH_LOOKUP("siprec"):
+			out->siprec = 1;
 			break;
 		case CSH_LOOKUP("fragment"):
 			out->fragment = 1;
@@ -847,26 +819,18 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			out->debug = 1;
 			break;
 		case CSH_LOOKUP("no-rtcp-attribute"):
-			out->no_rtcp_attr = 1;
-			break;
-		case CSH_LOOKUP("full-rtcp-attribute"):
-			out->full_rtcp_attr = 1;
-			break;
 		case CSH_LOOKUP("no-RTCP-attribute"):
 			out->no_rtcp_attr = 1;
 			break;
+		case CSH_LOOKUP("full-rtcp-attribute"):
 		case CSH_LOOKUP("full-RTCP-attribute"):
 			out->full_rtcp_attr = 1;
 			break;
 		case CSH_LOOKUP("generate-RTCP"):
-			out->generate_rtcp = 1;
-			break;
 		case CSH_LOOKUP("generate-rtcp"):
 			out->generate_rtcp = 1;
 			break;
 		case CSH_LOOKUP("trickle-ICE"):
-			out->trickle_ice = 1;
-			break;
 		case CSH_LOOKUP("trickle-ice"):
 			out->trickle_ice = 1;
 			break;
@@ -878,7 +842,7 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			break;
 		case CSH_LOOKUP("always-transcode"):;
 			static const str str_all = STR_CONST_INIT("all");
-			call_ng_flags_codec_list(out, (str *) &str_all, &out->codec_accept);
+			call_ng_flags_esc_str_list(out, (str *) &str_all, &out->codec_accept);
 			break;
 		case CSH_LOOKUP("asymmetric-codecs"):
 			ilog(LOG_INFO, "Ignoring obsolete flag `asymmetric-codecs`");
@@ -917,23 +881,28 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			out->disable_jb = 1;
 			break;
 		case CSH_LOOKUP("pierce-NAT"):
+		case CSH_LOOKUP("pierce-nat"):
 			out->pierce_nat = 1;
 			break;
 		case CSH_LOOKUP("NAT-wait"):
+		case CSH_LOOKUP("nat-wait"):
 			out->nat_wait = 1;
 			break;
 		default:
 			// handle values aliases from other dictionaries
+			if (call_ng_flags_prefix(out, s, "from-tags-", call_ng_flags_esc_str_list,
+						&out->from_tags))
+				return;
 			if (call_ng_flags_prefix(out, s, "SDES-no-", call_ng_flags_str_ht, &out->sdes_no))
 				return;
 			if (call_ng_flags_prefix(out, s, "SDES-", ng_sdes_option, NULL))
 				return;
 			if (call_ng_flags_prefix(out, s, "OSRTP-", ng_osrtp_option, NULL))
 				return;
-			if (call_ng_flags_prefix(out, s, "codec-strip-", call_ng_flags_codec_list,
+			if (call_ng_flags_prefix(out, s, "codec-strip-", call_ng_flags_esc_str_list,
 						&out->codec_strip))
 				return;
-			if (call_ng_flags_prefix(out, s, "codec-offer-", call_ng_flags_codec_list,
+			if (call_ng_flags_prefix(out, s, "codec-offer-", call_ng_flags_esc_str_list,
 						&out->codec_offer))
 				return;
 			if (call_ng_flags_prefix(out, s, "codec-except-", call_ng_flags_str_ht,
@@ -943,13 +912,13 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 				return;
 #ifdef WITH_TRANSCODING
 			if (out->opmode == OP_OFFER || out->opmode == OP_REQUEST || out->opmode == OP_PUBLISH) {
-				if (call_ng_flags_prefix(out, s, "transcode-", call_ng_flags_codec_list,
+				if (call_ng_flags_prefix(out, s, "transcode-", call_ng_flags_esc_str_list,
 							&out->codec_transcode))
 					return;
-				if (call_ng_flags_prefix(out, s, "codec-transcode-", call_ng_flags_codec_list,
+				if (call_ng_flags_prefix(out, s, "codec-transcode-", call_ng_flags_esc_str_list,
 							&out->codec_transcode))
 					return;
-				if (call_ng_flags_prefix(out, s, "codec-mask-", call_ng_flags_codec_list,
+				if (call_ng_flags_prefix(out, s, "codec-mask-", call_ng_flags_esc_str_list,
 							&out->codec_mask))
 					return;
 				if (call_ng_flags_prefix(out, s, "T38-", ng_t38_option, NULL))
@@ -960,10 +929,10 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 			if (call_ng_flags_prefix(out, s, "codec-set-", call_ng_flags_str_ht_split,
 						&out->codec_set))
 				return;
-			if (call_ng_flags_prefix(out, s, "codec-accept-", call_ng_flags_codec_list,
+			if (call_ng_flags_prefix(out, s, "codec-accept-", call_ng_flags_esc_str_list,
 						&out->codec_accept))
 				return;
-			if (call_ng_flags_prefix(out, s, "codec-consume-", call_ng_flags_codec_list,
+			if (call_ng_flags_prefix(out, s, "codec-consume-", call_ng_flags_esc_str_list,
 						&out->codec_consume))
 				return;
 #endif
@@ -981,257 +950,376 @@ void call_ng_flags_init(struct sdp_ng_flags *out, enum call_opmode opmode) {
 	out->dtls_passive = dtls_passive_def;
 	out->dtls_reverse_passive = dtls_passive_def;
 	out->el_option = rtpe_config.endpoint_learning;
+	out->tos = 256;
 }
 
+static void call_ng_dict_iter(struct sdp_ng_flags *out, bencode_item_t *input,
+		void (*callback)(struct sdp_ng_flags *, str *key, bencode_item_t *value))
+{
+	if (input->type != BENCODE_DICTIONARY)
+		return;
+
+	bencode_item_t *value = NULL;
+	for (bencode_item_t *key = input->child; key; key = value->sibling) {
+		value = key->sibling;
+		if (!value)
+			break;
+
+		str k;
+		if (!bencode_get_str(key, &k))
+			continue;
+
+		callback(out, &k, value);
+
+	}
+}
+static void call_ng_codec_flags(struct sdp_ng_flags *out, str *key, bencode_item_t *value) {
+	switch (__csh_lookup(key)) {
+		case CSH_LOOKUP("strip"):
+			call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->codec_strip);
+			break;
+		case CSH_LOOKUP("offer"):
+			call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->codec_offer);
+			break;
+		case CSH_LOOKUP("except"):
+			call_ng_flags_list(out, value,  call_ng_flags_str_ht, &out->codec_except);
+			break;
+	}
+#ifdef WITH_TRANSCODING
+	if (out->opmode == OP_OFFER || out->opmode == OP_REQUEST || out->opmode == OP_PUBLISH) {
+		switch (__csh_lookup(key)) {
+			case CSH_LOOKUP("transcode"):
+				call_ng_flags_list(out, value, call_ng_flags_esc_str_list,
+						&out->codec_transcode);
+				break;
+			case CSH_LOOKUP("mask"):
+				call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->codec_mask);
+				break;
+			case CSH_LOOKUP("set"):
+				call_ng_flags_list(out, value, call_ng_flags_str_ht_split, &out->codec_set);
+				break;
+			case CSH_LOOKUP("accept"):
+				call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->codec_accept);
+				break;
+			case CSH_LOOKUP("consume"):
+				call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->codec_consume);
+				break;
+		}
+	}
+#endif
+}
+static void call_ng_main_flags(struct sdp_ng_flags *out, str *key, bencode_item_t *value) {
+	str s = STR_NULL;
+	bencode_item_t *it;
+
+	bencode_get_str(value, &s);
+
+	switch (__csh_lookup(key)) {
+		case CSH_LOOKUP("call-id"):
+		case CSH_LOOKUP("call-ID"):
+		case CSH_LOOKUP("call id"):
+		case CSH_LOOKUP("call ID"):
+			out->call_id = s;
+			break;
+		case CSH_LOOKUP("from-tag"):
+			out->from_tag = s;
+			break;
+		case CSH_LOOKUP("to-tag"):
+			out->to_tag = s;
+			break;
+		case CSH_LOOKUP("via-branch"):
+			out->via_branch = s;
+			break;
+		case CSH_LOOKUP("from-label"):
+		case CSH_LOOKUP("label"):
+			out->label = s;
+			break;
+		case CSH_LOOKUP("to-label"):
+		case CSH_LOOKUP("set-label"):
+			out->set_label = s;
+			break;
+		case CSH_LOOKUP("address"):
+			out->address = s;
+			break;
+		case CSH_LOOKUP("SDP"):
+		case CSH_LOOKUP("sdp"):
+			out->sdp = s;
+			break;
+		case CSH_LOOKUP("interface"):
+			out->interface = s;
+			break;
+		case CSH_LOOKUP("flags"):
+			call_ng_flags_list(out, value, call_ng_flags_flags, NULL);
+			break;
+		case CSH_LOOKUP("replace"):
+			call_ng_flags_list(out, value, call_ng_flags_replace, NULL);
+			break;
+		case CSH_LOOKUP("supports"):
+			call_ng_flags_list(out, value, call_ng_flags_supports, NULL);
+			break;
+		case CSH_LOOKUP("from-tags"):
+			call_ng_flags_list(out, value, call_ng_flags_esc_str_list, &out->from_tags);
+			break;
+		case CSH_LOOKUP("rtcp-mux"):
+		case CSH_LOOKUP("RTCP-mux"):
+			call_ng_flags_list(out, value, call_ng_flags_rtcp_mux, NULL);
+			break;
+		case CSH_LOOKUP("SDES"):
+		case CSH_LOOKUP("sdes"):
+			call_ng_flags_list(out, value, ng_sdes_option, NULL);
+			break;
+		case CSH_LOOKUP("OSRTP"):
+		case CSH_LOOKUP("osrtp"):
+			call_ng_flags_list(out, value, ng_osrtp_option, NULL);
+			break;
+		case CSH_LOOKUP("endpoint-learning"):
+		case CSH_LOOKUP("endpoint learning"):
+			call_ng_flags_list(out, value, ng_el_option, NULL);
+			break;
+		case CSH_LOOKUP("direction"):
+			if (value->type != BENCODE_LIST)
+				break;
+			int diridx = 0;
+			for (bencode_item_t *it = value->child; it && diridx < 2; it = it->sibling)
+				bencode_get_str(it, &out->direction[diridx++]);
+			break;
+		case CSH_LOOKUP("received from"):
+		case CSH_LOOKUP("received-from"):
+			if (value->type != BENCODE_LIST)
+				break;
+			if (value && (it = value->child)) {
+				bencode_get_str(it, &out->received_from_family);
+				bencode_get_str(it->sibling, &out->received_from_address);
+			}
+			break;
+		case CSH_LOOKUP("drop-traffic"):
+		case CSH_LOOKUP("drop traffic"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("start"):
+					out->drop_traffic_start = 1;
+					break;
+				case CSH_LOOKUP("stop"):
+					out->drop_traffic_stop = 1;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'drop-traffic' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("ICE"):
+		case CSH_LOOKUP("ice"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("remove"):
+					out->ice_option = ICE_REMOVE;
+					break;
+				case CSH_LOOKUP("force"):
+					out->ice_option = ICE_FORCE;
+					break;
+				case CSH_LOOKUP("default"):
+					out->ice_option = ICE_DEFAULT;
+					break;
+				case CSH_LOOKUP("optional"):
+					out->ice_option = ICE_OPTIONAL;
+					break;
+				case CSH_LOOKUP("force_relay"):
+				case CSH_LOOKUP("force-relay"):
+				case CSH_LOOKUP("force relay"):
+					out->ice_option = ICE_FORCE_RELAY;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'ICE' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("ICE-lite"):
+		case CSH_LOOKUP("ice-lite"):
+		case CSH_LOOKUP("ICE lite"):
+		case CSH_LOOKUP("ice lite"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("off"):
+				case CSH_LOOKUP("none"):
+				case CSH_LOOKUP("no"):
+					out->ice_lite_option = ICE_LITE_OFF;
+					break;
+				case CSH_LOOKUP("forward"):
+				case CSH_LOOKUP("offer"):
+				case CSH_LOOKUP("fwd"):
+				case CSH_LOOKUP("fw"):
+					out->ice_lite_option = ICE_LITE_FWD;
+					break;
+				case CSH_LOOKUP("backward"):
+				case CSH_LOOKUP("backwards"):
+				case CSH_LOOKUP("reverse"):
+				case CSH_LOOKUP("answer"):
+				case CSH_LOOKUP("back"):
+				case CSH_LOOKUP("bkw"):
+				case CSH_LOOKUP("bk"):
+					out->ice_lite_option = ICE_LITE_BKW;
+					break;
+				case CSH_LOOKUP("both"):
+					out->ice_lite_option = ICE_LITE_BOTH;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'ICE-lite' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("DTLS"):
+		case CSH_LOOKUP("dtls"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("passive"):
+					out->dtls_passive = 1;
+					break;
+				case CSH_LOOKUP("active"):
+					out->dtls_passive = 0;
+					break;
+				case CSH_LOOKUP("no"):
+				case CSH_LOOKUP("off"):
+				case CSH_LOOKUP("disabled"):
+				case CSH_LOOKUP("disable"):
+					out->dtls_off = 1;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'DTLS' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("DTLS-reverse"):
+		case CSH_LOOKUP("dtls-reverse"):
+		case CSH_LOOKUP("DTLS reverse"):
+		case CSH_LOOKUP("dtls reverse"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("passive"):
+					out->dtls_reverse_passive = 1;
+					break;
+				case CSH_LOOKUP("active"):
+					out->dtls_reverse_passive = 0;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'DTLS-reverse' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("passthrough"):
+		case CSH_LOOKUP("passthru"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("on"):
+				case CSH_LOOKUP("yes"):
+				case CSH_LOOKUP("enable"):
+				case CSH_LOOKUP("enabled"):
+					out->passthrough_on = 1;
+					break;
+				case CSH_LOOKUP("no"):
+				case CSH_LOOKUP("off"):
+				case CSH_LOOKUP("disable"):
+				case CSH_LOOKUP("disabled"):
+					out->passthrough_off = 1;
+					break;
+				default:
+					ilog(LOG_WARN, "Unknown 'passthrough' flag encountered: '" STR_FORMAT "'",
+							STR_FMT(&s));
+			}
+			break;
+		case CSH_LOOKUP("transport protocol"):
+		case CSH_LOOKUP("transport-protocol"):
+			if (!str_cmp(&s, "accept"))
+				out->protocol_accept = 1;
+			else
+				out->transport_protocol = transport_protocol(&s);
+			break;
+		case CSH_LOOKUP("media address"):
+		case CSH_LOOKUP("media-address"):
+			out->media_address = s;
+			break;
+		case CSH_LOOKUP("record call"):
+		case CSH_LOOKUP("record-call"):
+			out->record_call_str = s;
+			break;
+		case CSH_LOOKUP("address family"):
+		case CSH_LOOKUP("address-family"):
+			if (bencode_get_str(value, &out->address_family_str))
+				out->address_family = get_socket_family_rfc(&out->address_family_str);
+			break;
+		case CSH_LOOKUP("metadata"):
+			out->metadata = s;
+			break;
+		case CSH_LOOKUP("DTLS fingerprint"):
+		case CSH_LOOKUP("DTLS-fingerprint"):
+		case CSH_LOOKUP("dtls fingerprint"):
+		case CSH_LOOKUP("dtls-fingerprint"):
+			out->dtls_fingerprint = s;
+			break;
+		case CSH_LOOKUP("TOS"):
+		case CSH_LOOKUP("tos"):
+			out->tos = bencode_get_integer_str(value, out->tos);
+			break;
+		case CSH_LOOKUP("ptime"):
+			if (out->opmode == OP_OFFER)
+				out->ptime = bencode_get_integer_str(value, 0);
+			break;
+		case CSH_LOOKUP("ptime-reverse"):
+		case CSH_LOOKUP("ptime reverse"):
+		case CSH_LOOKUP("reverse ptime"):
+		case CSH_LOOKUP("reverse-ptime"):
+			if (out->opmode == OP_OFFER)
+				out->rev_ptime = bencode_get_integer_str(value, 0);
+			break;
+		case CSH_LOOKUP("xmlrpc-callback"):
+		case CSH_LOOKUP("XMLRPC-callback"):
+			if (sockaddr_parse_any_str(&out->xmlrpc_callback, &s))
+				ilog(LOG_WARN, "Failed to parse 'xmlrpc-callback' address '" STR_FORMAT "'",
+						STR_FMT(&s));
+			break;
+		case CSH_LOOKUP("codec"):
+			call_ng_dict_iter(out, value, call_ng_codec_flags);
+			break;
+		case CSH_LOOKUP("generate RTCP"):
+		case CSH_LOOKUP("generate-RTCP"):
+		case CSH_LOOKUP("generate rtcp"):
+		case CSH_LOOKUP("generate-rtcp"):
+			if (!str_cmp(&s, "on"))
+				out->generate_rtcp = 1;
+			else if (!str_cmp(&s, "off"))
+				out->generate_rtcp_off = 1;
+			break;
+		case CSH_LOOKUP("media echo"):
+		case CSH_LOOKUP("media-echo"):
+			switch (__csh_lookup(&s)) {
+				case CSH_LOOKUP("blackhole"):
+				case CSH_LOOKUP("sinkhole"):
+					out->media_echo = MEO_BLACKHOLE;
+					break;
+				case CSH_LOOKUP("forward"):
+				case CSH_LOOKUP("fwd"):
+				case CSH_LOOKUP("fw"):
+					out->media_echo = MEO_FWD;
+					break;
+				case CSH_LOOKUP("backward"):
+				case CSH_LOOKUP("backwards"):
+				case CSH_LOOKUP("reverse"):
+				case CSH_LOOKUP("back"):
+				case CSH_LOOKUP("bkw"):
+				case CSH_LOOKUP("bk"):
+					out->media_echo = MEO_BKW;
+					break;
+				case CSH_LOOKUP("both"):
+					out->media_echo = MEO_BOTH;
+					break;
+			}
+			break;
+#ifdef WITH_TRANSCODING
+		case CSH_LOOKUP("T38"):
+		case CSH_LOOKUP("T.38"):
+		case CSH_LOOKUP("t38"):
+		case CSH_LOOKUP("t.38"):
+			call_ng_flags_list(out, value, ng_t38_option, NULL);
+			break;
+#endif
+	}
+}
 static void call_ng_process_flags(struct sdp_ng_flags *out, bencode_item_t *input, enum call_opmode opmode) {
-	bencode_item_t *list, *it, *dict;
-	int diridx;
-	str s;
-
 	call_ng_flags_init(out, opmode);
-
-	call_ng_flags_list(out, input, "flags", call_ng_flags_flags, NULL);
-	call_ng_flags_list(out, input, "replace", call_ng_flags_replace, NULL);
-	call_ng_flags_list(out, input, "supports", call_ng_flags_supports, NULL);
-
-	bencode_get_alt(input, "call-id", "call-ID", &out->call_id);
-	bencode_dictionary_get_str(input, "from-tag", &out->from_tag);
-	bencode_dictionary_get_str(input, "to-tag", &out->to_tag);
-	bencode_dictionary_get_str(input, "via-branch", &out->via_branch);
-	bencode_get_alt(input, "label", "from-label", &out->label);
-	bencode_get_alt(input, "to-label", "set-label", &out->set_label);
-	bencode_dictionary_get_str(input, "address", &out->address);
-	bencode_get_alt(input, "sdp", "SDP", &out->sdp);
-	bencode_dictionary_get_str(input, "interface", &out->interface);
-
-	diridx = 0;
-	if ((list = bencode_dictionary_get_expect(input, "direction", BENCODE_LIST))) {
-		for (it = list->child; it && diridx < 2; it = it->sibling)
-			bencode_get_str(it, &out->direction[diridx++]);
-	}
-
-	list = bencode_dictionary_get_expect(input, "received from", BENCODE_LIST);
-	if (!list)
-		list = bencode_dictionary_get_expect(input, "received-from", BENCODE_LIST);
-	if (list && (it = list->child)) {
-		bencode_get_str(it, &out->received_from_family);
-		bencode_get_str(it->sibling, &out->received_from_address);
-	}
-
-	if (bencode_dictionary_get_str(input, "drop-traffic", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("start"):
-				out->drop_traffic_start = 1;
-				break;
-			case CSH_LOOKUP("stop"):
-				out->drop_traffic_stop = 1;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'drop-traffic' flag encountered: '"STR_FORMAT"'",
-						STR_FMT(&s));
-		}
-	}
-
-	if (bencode_get_alt(input, "ICE", "ice", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("remove"):
-				out->ice_option = ICE_REMOVE;
-				break;
-			case CSH_LOOKUP("force"):
-				out->ice_option = ICE_FORCE;
-				break;
-			case CSH_LOOKUP("default"):
-				out->ice_option = ICE_DEFAULT;
-				break;
-			case CSH_LOOKUP("optional"):
-				out->ice_option = ICE_OPTIONAL;
-				break;
-			case CSH_LOOKUP("force_relay"):
-			case CSH_LOOKUP("force-relay"):
-			case CSH_LOOKUP("force relay"):
-				out->ice_option = ICE_FORCE_RELAY;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'ICE' flag encountered: '"STR_FORMAT"'",
-						STR_FMT(&s));
-		}
-	}
-
-	if (bencode_get_alt(input, "ICE-lite", "ice-lite", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("off"):
-			case CSH_LOOKUP("none"):
-			case CSH_LOOKUP("no"):
-				out->ice_lite_option = ICE_LITE_OFF;
-				break;
-			case CSH_LOOKUP("forward"):
-			case CSH_LOOKUP("offer"):
-			case CSH_LOOKUP("fwd"):
-			case CSH_LOOKUP("fw"):
-				out->ice_lite_option = ICE_LITE_FWD;
-				break;
-			case CSH_LOOKUP("backward"):
-			case CSH_LOOKUP("backwards"):
-			case CSH_LOOKUP("reverse"):
-			case CSH_LOOKUP("answer"):
-			case CSH_LOOKUP("back"):
-			case CSH_LOOKUP("bkw"):
-			case CSH_LOOKUP("bk"):
-				out->ice_lite_option = ICE_LITE_BKW;
-				break;
-			case CSH_LOOKUP("both"):
-				out->ice_lite_option = ICE_LITE_BOTH;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'ICE-lite' flag encountered: '" STR_FORMAT "'",
-						STR_FMT(&s));
-		}
-	}
-
-	if (bencode_get_alt(input, "DTLS", "dtls", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("passive"):
-				out->dtls_passive = 1;
-				break;
-			case CSH_LOOKUP("active"):
-				out->dtls_passive = 0;
-				break;
-			case CSH_LOOKUP("no"):
-			case CSH_LOOKUP("off"):
-			case CSH_LOOKUP("disabled"):
-			case CSH_LOOKUP("disable"):
-				out->dtls_off = 1;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'DTLS' flag encountered: '"STR_FORMAT"'",
-						STR_FMT(&s));
-		}
-	}
-
-	if (bencode_get_alt(input, "DTLS-reverse", "dtls-reverse", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("passive"):
-				out->dtls_reverse_passive = 1;
-				break;
-			case CSH_LOOKUP("active"):
-				out->dtls_reverse_passive = 0;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'DTLS-reverse' flag encountered: '"STR_FORMAT"'",
-						STR_FMT(&s));
-		}
-	}
-
-	if (bencode_dictionary_get_str(input, "passthrough", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("on"):
-			case CSH_LOOKUP("yes"):
-			case CSH_LOOKUP("enable"):
-			case CSH_LOOKUP("enabled"):
-				out->passthrough_on = 1;
-				break;
-			case CSH_LOOKUP("no"):
-			case CSH_LOOKUP("off"):
-			case CSH_LOOKUP("disable"):
-			case CSH_LOOKUP("disabled"):
-				out->passthrough_off = 1;
-				break;
-			default:
-				ilog(LOG_WARN, "Unknown 'passthrough' flag encountered: '"STR_FORMAT"'",
-						STR_FMT(&s));
-		}
-	}
-
-	call_ng_flags_list(out, input, "rtcp-mux", call_ng_flags_rtcp_mux, NULL);
-	call_ng_flags_list(out, input, "RTCP-mux", call_ng_flags_rtcp_mux, NULL);
-	call_ng_flags_list(out, input, "SDES", ng_sdes_option, NULL);
-	call_ng_flags_list(out, input, "sdes", ng_sdes_option, NULL);
-	call_ng_flags_list(out, input, "OSRTP", ng_osrtp_option, NULL);
-	call_ng_flags_list(out, input, "osrtp", ng_osrtp_option, NULL);
-	call_ng_flags_list(out, input, "endpoint-learning", ng_el_option, NULL);
-#ifdef WITH_TRANSCODING
-	call_ng_flags_list(out, input, "T38", ng_t38_option, NULL);
-	call_ng_flags_list(out, input, "t38", ng_t38_option, NULL);
-	call_ng_flags_list(out, input, "T.38", ng_t38_option, NULL);
-	call_ng_flags_list(out, input, "t.38", ng_t38_option, NULL);
-#endif
-
-	str transport_protocol_str;
-	bencode_get_alt(input, "transport-protocol", "transport protocol", &transport_protocol_str);
-	if (!str_cmp(&transport_protocol_str, "accept"))
-		out->protocol_accept = 1;
-	else
-		out->transport_protocol = transport_protocol(&transport_protocol_str);
-
-	bencode_get_alt(input, "media-address", "media address", &out->media_address);
-	if (bencode_get_alt(input, "address-family", "address family", &out->address_family_str))
-		out->address_family = get_socket_family_rfc(&out->address_family_str);
-	out->tos = bencode_dictionary_get_int_str(input, "TOS", 256);
-	bencode_get_alt(input, "record-call", "record call", &out->record_call_str);
-	bencode_dictionary_get_str(input, "metadata", &out->metadata);
-	bencode_get_alt(input, "DTLS-fingerprint", "dtls-fingerprint", &out->dtls_fingerprint);
-
-	if (opmode == OP_OFFER) {
-		out->ptime = bencode_dictionary_get_int_str(input, "ptime", 0);
-		out->rev_ptime = bencode_dictionary_get_int_str(input, "ptime-reverse", 0);
-		if (out->rev_ptime == 0)
-			out->rev_ptime = bencode_dictionary_get_int_str(input, "ptime reverse", 0);
-	}
-
-	if (bencode_get_alt(input, "xmlrpc-callback", "XMLRPC-callback", &s)) {
-		if (sockaddr_parse_any_str(&out->xmlrpc_callback, &s))
-			ilog(LOG_WARN, "Failed to parse 'xmlrpc-callback' address '" STR_FORMAT "'",
-					STR_FMT(&s));
-	}
-
-	if ((dict = bencode_dictionary_get_expect(input, "codec", BENCODE_DICTIONARY))) {
-		call_ng_flags_list(out, dict, "strip", call_ng_flags_codec_list, &out->codec_strip);
-		call_ng_flags_list(out, dict, "offer", call_ng_flags_codec_list, &out->codec_offer);
-		call_ng_flags_list(out, dict, "except", call_ng_flags_str_ht, &out->codec_except);
-#ifdef WITH_TRANSCODING
-		if (opmode == OP_OFFER || opmode == OP_REQUEST || opmode == OP_PUBLISH) {
-			call_ng_flags_list(out, dict, "transcode", call_ng_flags_codec_list, &out->codec_transcode);
-			call_ng_flags_list(out, dict, "mask", call_ng_flags_codec_list, &out->codec_mask);
-			call_ng_flags_list(out, dict, "set", call_ng_flags_str_ht_split, &out->codec_set);
-			call_ng_flags_list(out, dict, "accept", call_ng_flags_codec_list, &out->codec_accept);
-			call_ng_flags_list(out, dict, "consume", call_ng_flags_codec_list, &out->codec_consume);
-		}
-#endif
-	}
-
-	if (bencode_get_alt(input, "generate-RTCP", "generate RTCP", &s)
-			|| bencode_get_alt(input, "generate-rtcp", "generate rtcp", &s))
-	{
-		if (!str_cmp(&s, "on"))
-			out->generate_rtcp = 1;
-		else if (!str_cmp(&s, "off"))
-			out->generate_rtcp_off = 1;
-	}
-
-	if (bencode_get_alt(input, "media-echo", "media echo", &s)) {
-		switch (__csh_lookup(&s)) {
-			case CSH_LOOKUP("blackhole"):
-			case CSH_LOOKUP("sinkhole"):
-				out->media_echo = MEO_BLACKHOLE;
-				break;
-			case CSH_LOOKUP("forward"):
-			case CSH_LOOKUP("fwd"):
-			case CSH_LOOKUP("fw"):
-				out->media_echo = MEO_FWD;
-				break;
-			case CSH_LOOKUP("backward"):
-			case CSH_LOOKUP("backwards"):
-			case CSH_LOOKUP("reverse"):
-			case CSH_LOOKUP("back"):
-			case CSH_LOOKUP("bkw"):
-			case CSH_LOOKUP("bk"):
-				out->media_echo = MEO_BKW;
-				break;
-			case CSH_LOOKUP("both"):
-				out->media_echo = MEO_BOTH;
-				break;
-		}
-	}
+	call_ng_dict_iter(out, input, call_ng_main_flags);
 }
 void call_ng_free_flags(struct sdp_ng_flags *flags) {
 	if (flags->codec_except)
@@ -1240,6 +1328,7 @@ void call_ng_free_flags(struct sdp_ng_flags *flags) {
 		g_hash_table_destroy(flags->codec_set);
 	if (flags->sdes_no)
 		g_hash_table_destroy(flags->sdes_no);
+	g_queue_clear_full(&flags->from_tags, free);
 	g_queue_clear_full(&flags->codec_offer, free);
 	g_queue_clear_full(&flags->codec_transcode, free);
 	g_queue_clear_full(&flags->codec_strip, free);
@@ -2040,6 +2129,46 @@ const char *call_stop_recording_ng(bencode_item_t *input, bencode_item_t *output
 	return NULL;
 }
 
+static const char *media_block_match1(struct call *call, struct call_monologue **monologue,
+		struct sdp_ng_flags *flags)
+{
+	if (flags->label.s) {
+		*monologue = g_hash_table_lookup(call->labels, &flags->label);
+		if (!*monologue)
+			return "No monologue matching the given label";
+	}
+	else if (flags->address.s) {
+		sockaddr_t addr;
+		if (sockaddr_parse_any_str(&addr, &flags->address))
+			return "Failed to parse network address";
+		// walk our structures to find a matching stream
+		for (GList *l = call->monologues.head; l; l = l->next) {
+			*monologue = l->data;
+			for (GList *k = (*monologue)->medias.head; k; k = k->next) {
+				struct call_media *media = k->data;
+				if (!media->streams.head)
+					continue;
+				struct packet_stream *ps = media->streams.head->data;
+				if (!sockaddr_eq(&addr, &ps->advertised_endpoint.address))
+					continue;
+				ilog(LOG_DEBUG, "Matched address %s%s%s to tag '" STR_FORMAT_M "'",
+						FMT_M(sockaddr_print_buf(&addr)), STR_FMT_M(&(*monologue)->tag));
+				goto found;
+			}
+		}
+		return "Failed to match address to any tag";
+found:
+		;
+	}
+	else if (flags->from_tag.s) {
+		*monologue = call_get_monologue(call, &flags->from_tag);
+		if (!*monologue)
+			return "From-tag given, but no such tag exists";
+	}
+	if (*monologue)
+		__monologue_unkernelize(*monologue);
+	return NULL;
+}
 static const char *media_block_match(struct call **call, struct call_monologue **monologue,
 		struct sdp_ng_flags *flags, bencode_item_t *input, enum call_opmode opmode)
 {
@@ -2063,46 +2192,67 @@ static const char *media_block_match(struct call **call, struct call_monologue *
 	if (flags->all) // explicitly non-directional, so skip the rest
 		return NULL;
 
-	if (flags->label.s) {
-		*monologue = g_hash_table_lookup((*call)->labels, &flags->label);
-		if (!*monologue)
-			return "No monologue matching the given label";
-	}
-	else if (flags->address.s) {
-		sockaddr_t addr;
-		if (sockaddr_parse_any_str(&addr, &flags->address))
-			return "Failed to parse network address";
-		// walk our structures to find a matching stream
-		for (GList *l = (*call)->monologues.head; l; l = l->next) {
-			*monologue = l->data;
-			for (GList *k = (*monologue)->medias.head; k; k = k->next) {
-				struct call_media *media = k->data;
-				if (!media->streams.head)
-					continue;
-				struct packet_stream *ps = media->streams.head->data;
-				if (!sockaddr_eq(&addr, &ps->advertised_endpoint.address))
-					continue;
-				ilog(LOG_DEBUG, "Matched address %s%s%s to tag '" STR_FORMAT_M "'",
-						FMT_M(sockaddr_print_buf(&addr)), STR_FMT_M(&(*monologue)->tag));
-				goto found;
-			}
-		}
-		return "Failed to match address to any tag";
-found:
-		;
-	}
-	else if (flags->from_tag.s) {
-		*monologue = call_get_monologue(*call, &flags->from_tag);
-		if (!*monologue)
-			return "From-tag given, but no such tag exists";
-		__monologue_unkernelize(*monologue);
-	}
+	const char *err = media_block_match1(*call, monologue, flags);
+	if (err)
+		return err;
 
 	// for generic ops, handle set-label here if given
 	if (opmode == OP_OTHER && flags->set_label.len && *monologue) {
 		call_str_cpy(*call, &(*monologue)->label, &flags->set_label);
 		g_hash_table_replace((*call)->labels, &(*monologue)->label, *monologue);
 	}
+
+	return NULL;
+}
+static void add_ml_to_sub_list(GQueue *q, struct call_monologue *ml) {
+	struct call_subscription *cs = g_slice_alloc0(sizeof(*cs));
+	cs->monologue = ml;
+	g_queue_push_tail(q, cs);
+}
+static const char *media_block_match_mult(struct call **call, GQueue *mls,
+		struct sdp_ng_flags *flags, bencode_item_t *input, enum call_opmode opmode)
+{
+	call_ng_process_flags(flags, input, opmode);
+
+	if (!flags->call_id.s)
+		return "No call-id in message";
+	*call = call_get_opmode(&flags->call_id, opmode);
+	if (!*call)
+		return "Unknown call-ID";
+
+	if (flags->all) {
+		// get and add all offer/answer mls
+		for (GList *l = (*call)->monologues.head; l; l = l->next) {
+			struct call_monologue *ml = l->data;
+			if (ml->tagtype != FROM_TAG && ml->tagtype != TO_TAG)
+				continue;
+			add_ml_to_sub_list(mls, ml);
+		}
+		return NULL;
+	}
+
+	// is a single ml given?
+	struct call_monologue *ml = NULL;
+	const char *err = media_block_match1(*call, &ml, flags);
+	if (err)
+		return err;
+	if (ml) {
+		add_ml_to_sub_list(mls, ml);
+		return NULL;
+	}
+
+	// handle from-tag list
+	for (GList *l = flags->from_tags.head; l; l = l->next) {
+		str *s = l->data;
+		struct call_monologue *ml = call_get_monologue(*call, s);
+		if (!ml)
+			ilog(LOG_WARN, "Given from-tag " STR_FORMAT_M " not found", STR_FMT_M(s));
+		else
+			add_ml_to_sub_list(mls, ml);
+	}
+
+	if (!mls->length)
+		return "No monologues matched";
 
 	return NULL;
 }
@@ -2576,20 +2726,28 @@ const char *call_subscribe_request_ng(bencode_item_t *input, bencode_item_t *out
 	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
 	char rand_buf[65];
 	AUTO_CLEANUP_NULL(struct call *call, call_unlock_release);
-	struct call_monologue *source_ml;
+	AUTO_CLEANUP(GQueue srcs, call_subscriptions_clear) = G_QUEUE_INIT;
+	AUTO_CLEANUP(str sdp_out, str_free_dup) = STR_NULL;
 
 	// get source monologue
-	err = media_block_match(&call, &source_ml, &flags, input, OP_REQUEST);
+	err = media_block_match_mult(&call, &srcs, &flags, input, OP_REQUEST);
 	if (err)
 		return err;
 
 	if (flags.sdp.len)
 		ilog(LOG_INFO, "Subscribe-request with SDP received - ignoring SDP");
 
-	if (!source_ml)
+	if (!srcs.length)
 		return "No call participant specified";
-	if (!source_ml->last_in_sdp.len || !source_ml->last_in_sdp_parsed.length)
-		return "No SDP known for this from-tag";
+
+	// special case with just one source: we can use the original SDP
+	struct call_monologue *sdp_ml = NULL;
+	if (srcs.length == 1) {
+		struct call_subscription *cs = srcs.head->data;
+		sdp_ml = cs->monologue;
+		if (!sdp_ml->last_in_sdp.len || !sdp_ml->last_in_sdp_parsed.length)
+			sdp_ml = NULL;
+	}
 
 	// the `label=` option was possibly used above to select the from-tag --
 	// switch it out with `to-label=` or `set-label=` for monologue_subscribe_request
@@ -2604,20 +2762,81 @@ const char *call_subscribe_request_ng(bencode_item_t *input, bencode_item_t *out
 	}
 	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
 
-	struct sdp_chopper *chopper = sdp_chopper_new(&source_ml->last_in_sdp);
-	bencode_buffer_destroy_add(output->buffer, (free_func_t) sdp_chopper_destroy, chopper);
+	// rewrite SDP, or create new?
+	struct sdp_chopper *chopper = NULL;
+	if (sdp_ml) {
+		chopper = sdp_chopper_new(&sdp_ml->last_in_sdp);
+		bencode_buffer_destroy_add(output->buffer, (free_func_t) sdp_chopper_destroy, chopper);
+	}
 
-	int ret = monologue_subscribe_request(source_ml, dest_ml, &flags);
+	int ret = monologue_subscribe_request(&srcs, dest_ml, &flags);
 	if (ret)
 		return "Failed to request subscription";
 
-	ret = sdp_replace(chopper, &source_ml->last_in_sdp_parsed, dest_ml, &flags);
-	if (ret)
-		return "Failed to rewrite SDP";
+	if (chopper && sdp_ml) {
+		ret = sdp_replace(chopper, &sdp_ml->last_in_sdp_parsed, dest_ml, &flags);
+		if (ret)
+			return "Failed to rewrite SDP";
+	}
+	else {
+		// create new SDP
+		ret = sdp_create(&sdp_out, dest_ml, &flags);
+	}
 
-	if (chopper->output->len)
-		bencode_dictionary_add_string_len(output, "sdp", chopper->output->str, chopper->output->len);
-	bencode_dictionary_add_str_dup(output, "from-tag", &source_ml->tag);
+	// place return output SDP
+	if (chopper) {
+		if (chopper->output->len)
+			bencode_dictionary_add_string_len(output, "sdp", chopper->output->str,
+					chopper->output->len);
+	}
+	else if (sdp_out.len) {
+		bencode_buffer_destroy_add(output->buffer, g_free, sdp_out.s);
+		bencode_dictionary_add_str(output, "sdp", &sdp_out);
+		sdp_out = STR_NULL; // ownership passed to output
+	}
+
+	// add single response ml tag if there's just one, but always add a list
+	if (srcs.length == 1) {
+		struct call_subscription *cs = srcs.head->data;
+		struct call_monologue *source_ml = cs->monologue;
+		bencode_dictionary_add_str_dup(output, "from-tag", &source_ml->tag);
+	}
+	bencode_item_t *tag_medias = NULL, *media_labels = NULL;
+	if (flags.siprec) {
+		tag_medias = bencode_dictionary_add_list(output, "tag-medias");
+		media_labels = bencode_dictionary_add_dictionary(output, "media-labels");
+	}
+	bencode_item_t *from_list = bencode_dictionary_add_list(output, "from-tags");
+	for (GList *l = srcs.head; l; l = l->next) {
+		struct call_subscription *cs = l->data;
+		struct call_monologue *source_ml = cs->monologue;
+		bencode_list_add_str_dup(from_list, &source_ml->tag);
+		if (tag_medias) {
+			bencode_item_t *tag_label = bencode_list_add_dictionary(tag_medias);
+			bencode_dictionary_add_str(tag_label, "tag", &source_ml->tag);
+			if (source_ml->label.len)
+				bencode_dictionary_add_str(tag_label, "label", &source_ml->label);
+			bencode_item_t *medias = bencode_dictionary_add_list(tag_label, "medias");
+			for (GList *k = source_ml->medias.head; k; k = k->next) {
+				struct call_media *media = k->data;
+				bencode_item_t *med_ent = bencode_list_add_dictionary(medias);
+				bencode_dictionary_add_integer(med_ent, "index", media->index);
+				bencode_dictionary_add_str(med_ent, "type", &media->type);
+				bencode_dictionary_add_str(med_ent, "label", &media->label);
+
+				if (media_labels) {
+					bencode_item_t *label =
+						bencode_dictionary_add_dictionary(media_labels, media->label.s);
+					bencode_dictionary_add_str(label, "tag", &source_ml->tag);
+					bencode_dictionary_add_integer(label, "index", media->index);
+					bencode_dictionary_add_str(label, "type", &media->type);
+					if (source_ml->label.len)
+						bencode_dictionary_add_str(label, "label", &source_ml->label);
+				}
+			}
+		}
+	}
+
 	bencode_dictionary_add_str_dup(output, "to-tag", &dest_ml->tag);
 
 	return NULL;
@@ -2625,20 +2844,19 @@ const char *call_subscribe_request_ng(bencode_item_t *input, bencode_item_t *out
 
 
 const char *call_subscribe_answer_ng(bencode_item_t *input, bencode_item_t *output) {
-	const char *err = NULL;
 	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
 	AUTO_CLEANUP(GQueue parsed, sdp_free) = G_QUEUE_INIT;
 	AUTO_CLEANUP(GQueue streams, sdp_streams_free) = G_QUEUE_INIT;
 	AUTO_CLEANUP_NULL(struct call *call, call_unlock_release);
-	struct call_monologue *source_ml;
 
-	// get source monologue
-	err = media_block_match(&call, &source_ml, &flags, input, OP_REQ_ANSWER);
-	if (err)
-		return err;
+	call_ng_process_flags(&flags, input, OP_REQ_ANSWER);
 
-	if (!source_ml)
-		return "No call participant specified";
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	call = call_get_opmode(&flags.call_id, OP_REQ_ANSWER);
+	if (!call)
+		return "Unknown call-ID";
+
 	if (!flags.to_tag.s)
 		return "No to-tag in message";
 	if (!flags.sdp.len)
@@ -2654,7 +2872,7 @@ const char *call_subscribe_answer_ng(bencode_item_t *input, bencode_item_t *outp
 	if (sdp_streams(&parsed, &streams, &flags))
 		return "Incomplete SDP specification";
 
-	int ret = monologue_subscribe_answer(source_ml, dest_ml, &flags, &streams);
+	int ret = monologue_subscribe_answer(dest_ml, &flags, &streams);
 	if (ret)
 		return "Failed to process subscription answer";
 
@@ -2663,18 +2881,17 @@ const char *call_subscribe_answer_ng(bencode_item_t *input, bencode_item_t *outp
 
 
 const char *call_unsubscribe_ng(bencode_item_t *input, bencode_item_t *output) {
-	const char *err = NULL;
 	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
 	AUTO_CLEANUP_NULL(struct call *call, call_unlock_release);
-	struct call_monologue *source_ml;
 
-	// get source monologue
-	err = media_block_match(&call, &source_ml, &flags, input, OP_OTHER);
-	if (err)
-		return err;
+	call_ng_process_flags(&flags, input, OP_REQ_ANSWER);
 
-	if (!source_ml)
-		return "No call participant specified";
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	call = call_get_opmode(&flags.call_id, OP_REQ_ANSWER);
+	if (!call)
+		return "Unknown call-ID";
+
 	if (!flags.to_tag.s)
 		return "No to-tag in message";
 
@@ -2683,7 +2900,7 @@ const char *call_unsubscribe_ng(bencode_item_t *input, bencode_item_t *output) {
 	if (!dest_ml)
 		return "To-tag not found";
 
-	int ret = monologue_unsubscribe(source_ml, dest_ml, &flags);
+	int ret = monologue_unsubscribe(dest_ml, &flags);
 	if (ret)
 		return "Failed to unsubscribe";
 

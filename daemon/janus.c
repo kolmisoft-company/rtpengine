@@ -431,7 +431,13 @@ static const char *janus_videoroom_join(struct websocket_message *wm, struct jan
 			flags.no_rtcp_attr = 1;
 			flags.sdes_off = 1;
 
-			int ret = monologue_subscribe_request(source_ml, dest_ml, &flags);
+			AUTO_CLEANUP(GQueue srcs, call_subscriptions_clear) = G_QUEUE_INIT;
+
+			struct call_subscription *cs = g_slice_alloc0(sizeof(*cs));
+			cs->monologue = source_ml;
+			g_queue_push_tail(&srcs, cs);
+
+			int ret = monologue_subscribe_request(&srcs, dest_ml, &flags);
 			if (ret)
 				return "Subscribe error";
 
@@ -575,7 +581,7 @@ static const char *janus_videoroom_configure(struct websocket_message *wm, struc
 	if (sdp_parse(&sdp_in, &parsed, &flags))
 		return "Failed to parse SDP";
 	if (sdp_streams(&parsed, &streams, &flags))
-		return "Incomplete SDP specificiation";
+		return "Incomplete SDP specification";
 
 	AUTO_CLEANUP_NULL(struct call *call, call_unlock_release);
 
@@ -694,7 +700,7 @@ static const char *janus_videoroom_start(struct websocket_message *wm, struct ja
 	if (sdp_parse(&sdp_in, &parsed, &flags))
 		return "Failed to parse SDP";
 	if (sdp_streams(&parsed, &streams, &flags))
-		return "Incomplete SDP specificiation";
+		return "Incomplete SDP specification";
 
 	AUTO_CLEANUP_NULL(struct call *call, call_unlock_release);
 
@@ -723,6 +729,7 @@ static const char *janus_videoroom_start(struct websocket_message *wm, struct ja
 		struct call_monologue *source_ml = call_get_monologue(call, &source_handle_str);
 		if (!source_ml)
 			return "Feed not found";
+		// XXX verify that dest_ml is subscribed to source_ml
 
 		AUTO_CLEANUP_GBUF(dest_handle_buf);
 		dest_handle_buf = g_strdup_printf("%" PRIu64, handle->id);
@@ -732,7 +739,7 @@ static const char *janus_videoroom_start(struct websocket_message *wm, struct ja
 		if (!dest_ml)
 			return "Subscriber not found";
 
-		int ret = monologue_subscribe_answer(source_ml, dest_ml, &flags, &streams);
+		int ret = monologue_subscribe_answer(dest_ml, &flags, &streams);
 		if (ret)
 			return "Failed to process subscription answer";
 	}

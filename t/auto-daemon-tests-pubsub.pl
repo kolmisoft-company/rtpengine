@@ -11,16 +11,632 @@ use POSIX;
 
 
 autotest_start(qw(--config-file=none -t -1 -i 203.0.113.1 -i 2001:db8:4321::1
-			-n 2223 -c 12345 -f -L 7 -E -u 2222 --silence-detect=1))
+			-n 2223 -c 12345 -f -L 7 -E -u 2222 --log-level-internals=7))
 		or die;
 
 
 
 my ($sock_a, $sock_b, $sock_c, $sock_d, $port_a, $port_b, $port_c, $ssrc_a, $ssrc_b, $resp,
-	$sock_ax, $sock_bx, $port_ax, $port_bx,
+	$sock_ax, $sock_bx, $port_ax, $port_bx, $port_d,
 	$srtp_ctx_a, $srtp_ctx_b, $srtp_ctx_a_rev, $srtp_ctx_b_rev, $ufrag_a, $ufrag_b,
-	@ret1, @ret2, @ret3, @ret4, $srtp_key_a, $srtp_key_b, $ts, $seq,
-	$ftr, $ttr, $ttr2);
+	@ret1, @ret2, @ret3, @ret4, $srtp_key_a, $srtp_key_b, $ts, $seq, $tag_medias, $media_labels,
+	$ftr, $ttr, $fts, $ttr2);
+
+
+
+use_json(1);
+
+
+new_call;
+
+($port_a) = offer('SIPREC sub',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio 6000 RTP/AVP 0
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('SIPREC sub',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio 6002 RTP/AVP 0
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+($ftr, $ttr, $fts, $tag_medias, $media_labels) = subscribe_request('SIPREC sub',
+	{ flags => ['all', 'SIPREC'] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=label:1
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=label:0
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [ft(), tt()], 'from-tags match';
+is_deeply $tag_medias, [
+	{
+		tag => ft(),
+		medias => [
+			{
+				index => 1,
+				type => 'audio',
+				label => '1',
+			},
+		],
+	},
+	{
+		tag => tt(),
+		medias => [
+			{
+				index => 1,
+				type => 'audio',
+				label => '0',
+			},
+		],
+	},
+], 'tag-medias match';
+is_deeply $media_labels, {
+	'1' => {
+		index => 1,
+		type => 'audio',
+		tag => ft(),
+	},
+	'0' => {
+		index => 1,
+		type => 'audio',
+		tag => tt(),
+	},
+}, 'media-labels match';
+
+
+
+new_call;
+
+($port_a) = offer('SIPREC sub w label',
+	{ label => 'caller' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio 6000 RTP/AVP 0
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('SIPREC sub w label',
+	{ label => 'called' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio 6002 RTP/AVP 0
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.2
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+($ftr, $ttr, $fts, $tag_medias, $media_labels) = subscribe_request('SIPREC sub',
+	{ flags => ['all', 'SIPREC'] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=label:1
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=label:0
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [ft(), tt()], 'from-tags match';
+is_deeply $tag_medias, [
+	{
+		tag => ft(),
+		label => 'caller',
+		medias => [
+			{
+				index => 1,
+				type => 'audio',
+				label => '1',
+			},
+		],
+	},
+	{
+		tag => tt(),
+		label => 'called',
+		medias => [
+			{
+				index => 1,
+				type => 'audio',
+				label => '0',
+			},
+		],
+	},
+], 'tag-medias match';
+is_deeply $media_labels, {
+	'1' => {
+		index => 1,
+		type => 'audio',
+		tag => ft(),
+		label => 'caller',
+	},
+	'0' => {
+		index => 1,
+		type => 'audio',
+		tag => tt(),
+		label => 'called',
+	},
+}, 'media-labels match';
+
+
+
+($sock_a, $sock_b, $sock_c, $sock_d) =
+	new_call([qw(198.51.100.14 6080)], [qw(198.51.100.14 6082)], [qw(198.51.100.14 6084)],
+			[qw(198.51.100.14 6086)]);
+
+($port_a) = offer('"all" sub',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6080 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('"all" sub',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6082 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2000, 4000, 0x3456, "\x00" x 160));
+snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4000, 7000, 0x6543, "\x00" x 160));
+
+($ftr, $ttr, $fts, undef, undef, $port_c, undef, $port_d) = subscribe_request('"all" sub',
+	{ 'flags' => ['all'] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [ft(), tt()], 'from-tags match';
+
+subscribe_answer('"all" sub',
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6084 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+m=audio 6086 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+SDP
+
+snd($sock_a, $port_b, rtp(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 4001, 7160, -1, "\x2a" x 160));
+snd($sock_b, $port_a, rtp(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_d, $port_d, rtpm(8, 2001, 4160, -1, "\x2a" x 160));
+
+
+
+
+($sock_a, $sock_b, $sock_c, $sock_d) =
+	new_call([qw(198.51.100.14 6088)], [qw(198.51.100.14 6090)], [qw(198.51.100.14 6092)],
+			[qw(198.51.100.14 6094)]);
+
+($port_a) = offer('sub to multiple tags',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6088 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('sub to multiple tags',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6090 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2000, 4000, 0x3456, "\x00" x 160));
+snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4000, 7000, 0x6543, "\x00" x 160));
+
+($ftr, $ttr, $fts, undef, undef, $port_c, undef, $port_d) = subscribe_request('sub to multiple tags',
+	{ 'from-tags' => [ft(), tt()] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [ft(), tt()], 'from-tags match';
+
+subscribe_answer('sub to multiple tags',
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6092 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+m=audio 6094 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+SDP
+
+snd($sock_a, $port_b, rtp(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 4001, 7160, -1, "\x2a" x 160));
+snd($sock_b, $port_a, rtp(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_d, $port_d, rtpm(8, 2001, 4160, -1, "\x2a" x 160));
+
+
+
+($sock_a, $sock_b, $sock_c, $sock_d) =
+	new_call([qw(198.51.100.14 6096)], [qw(198.51.100.14 6098)], [qw(198.51.100.14 6100)],
+			[qw(198.51.100.14 6102)]);
+
+($port_a) = offer('sub to multiple tags via flags',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6096 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('sub to multiple tags via flags',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6098 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2000, 4000, 0x3456, "\x00" x 160));
+snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4000, 7000, 0x6543, "\x00" x 160));
+
+($ftr, $ttr, $fts, undef, undef, $port_c, undef, $port_d) = subscribe_request('sub to multiple tags via flags',
+	{ flags => ['from-tags-' . ft(), 'from-tags-' . tt()] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [ft(), tt()], 'from-tags match';
+
+subscribe_answer('sub to multiple tags via flags',
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6100 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+m=audio 6102 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+SDP
+
+snd($sock_a, $port_b, rtp(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 4001, 7160, -1, "\x2a" x 160));
+snd($sock_b, $port_a, rtp(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_d, $port_d, rtpm(8, 2001, 4160, -1, "\x2a" x 160));
+
+
+
+($sock_a, $sock_b, $sock_c, $sock_d) =
+	new_call([qw(198.51.100.14 6104)], [qw(198.51.100.14 6106)], [qw(198.51.100.14 6108)],
+			[qw(198.51.100.14 6110)]);
+
+($port_a) = offer('sub to multiple tags - reverse',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6104 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('sub to multiple tags - reverse',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6106 RTP/AVP 0 8
+c=IN IP4 198.51.100.14
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+
+snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2000, 4000, 0x3456, "\x00" x 160));
+snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4000, 7000, 0x6543, "\x00" x 160));
+
+($ftr, $ttr, $fts, undef, undef, $port_c, undef, $port_d) = subscribe_request('sub to multiple tags - reverse',
+	{ 'from-tags' => [tt(), ft()] }, <<SDP);
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+is $ftr, undef, 'from-tag matches';
+is_deeply $fts, [tt(), ft()], 'from-tags match';
+
+subscribe_answer('sub to multiple tags - reverse',
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 6108 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+m=audio 6110 RTP/AVP 8
+c=IN IP4 198.51.100.14
+a=recvonly
+SDP
+
+snd($sock_a, $port_b, rtp(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 4001, 7160, 0x6543, "\x00" x 160));
+rcv($sock_d, $port_d, rtpm(8, 4001, 7160, -1, "\x2a" x 160));
+snd($sock_b, $port_a, rtp(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(0, 2001, 4160, 0x3456, "\x00" x 160));
+rcv($sock_c, $port_c, rtpm(8, 2001, 4160, -1, "\x2a" x 160));
 
 
 
@@ -79,7 +695,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('sub, multi codec, sub w diff codec',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('sub, multi codec, sub w diff codec',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -96,7 +712,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('sub, multi codec, sub w diff codec',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -167,7 +783,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('sub w tc - acc',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('sub w tc - acc',
 	{ 'from-tag' => ft(), codec => { transcode => ['PCMA'] } }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -254,7 +870,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('sub w tc - rej',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('sub w tc - rej',
 	{ 'from-tag' => ft(), codec => { transcode => ['PCMA'] } }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -271,7 +887,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('sub w tc - rej',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -341,7 +957,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('simple sub',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('simple sub',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -357,7 +973,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('simple sub',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -427,7 +1043,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('simple sub w label',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('simple sub w label',
 	{ label => 'foo' }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -443,7 +1059,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('simple sub w label',
-	{ label => 'foo', 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -513,8 +1129,8 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('simple sub w to-tag label',
-	{ label => 'foo' }, <<SDP);
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('simple sub w to-tag label',
+	{ label => 'bar' }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -526,10 +1142,10 @@ a=sendonly
 a=rtcp:PORT
 SDP
 
-is $ftr, ft(), 'from-tag matches';
+is $ftr, tt(), 'from-tag matches';
 
 subscribe_answer('simple sub w to-tag label',
-	{ label => 'bar', 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -599,7 +1215,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c, undef, $srtp_key_a) = subscribe_request('SRTP sub',
+($ftr, $ttr, undef, undef, undef, $port_c, undef, $srtp_key_a) = subscribe_request('SRTP sub',
 	{ 'from-tag' => ft(), 'transport-protocol' => 'RTP/SAVP',
 	SDES => ['no-AEAD_AES_256_GCM', 'no-AEAD_AES_128_GCM'] }, <<SDP);
 v=0
@@ -628,7 +1244,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('SRTP sub',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -705,7 +1321,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c, undef, undef, undef, undef, undef, $srtp_key_a) = subscribe_request('SRTP sub',
+($ftr, $ttr, undef, undef, undef, $port_c, undef, undef, undef, undef, undef, $srtp_key_a) = subscribe_request('SRTP sub',
 	{ 'from-tag' => ft(), 'transport-protocol' => 'RTP/SAVP',
 	SDES => ['no-AEAD_AES_256_GCM', 'no-AEAD_AES_128_GCM'] }, <<SDP);
 v=0
@@ -734,7 +1350,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('SRTP sub',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -838,7 +1454,7 @@ srtp_snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160), $srtp_ctx_b
 srtp_snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160), $srtp_ctx_a);
 ($ssrc_b) = srtp_rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160), $srtp_ctx_a);
 
-($ftr, $ttr, $port_c) = subscribe_request('SRTP call RTP sub',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('SRTP call RTP sub',
 	{ 'from-tag' => ft(), 'transport-protocol' => 'RTP/AVP', }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -854,7 +1470,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('SRTP call RTP sub',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -925,7 +1541,7 @@ snd($sock_b, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 snd($sock_a, $port_b, rtp(0, 4000, 7000, 0x6543, "\x00" x 160));
 ($ssrc_b) = rcv($sock_b, $port_a, rtpm(0, 4000, 7000, -1, "\x00" x 160));
 
-($ftr, $ttr, $port_c) = subscribe_request('ICE sub',
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('ICE sub',
 	{ 'from-tag' => ft(), ICE => 'force' }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -947,7 +1563,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('ICE sub',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -997,7 +1613,7 @@ SDP
 
 snd($sock_a, $port_a, rtp(0, 2000, 4000, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1013,7 +1629,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1026,7 +1642,7 @@ SDP
 snd($sock_a, $port_a, rtp(0, 2001, 4160, 0x3456, "\x00" x 160));
 rcv($sock_b, $port_b, rtpm(0, 2001, 4160, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1042,7 +1658,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1087,7 +1703,7 @@ SDP
 
 snd($sock_a, $port_a, rtp(8, 2000, 4000, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe w codec-accept',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe w codec-accept',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1103,7 +1719,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe w codec-accept',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1116,7 +1732,7 @@ SDP
 snd($sock_a, $port_a, rtp(8, 2001, 4160, 0x3456, "\x00" x 160));
 rcv($sock_b, $port_b, rtpm(8, 2001, 4160, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe w codec-accept',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe w codec-accept',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1132,7 +1748,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe w codec-accept',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1177,7 +1793,7 @@ SDP
 
 snd($sock_a, $port_a, rtp(8, 2000, 4000, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe w unsupp and t/c',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe w unsupp and t/c',
 	{ 'from-tag' => ft() }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1193,7 +1809,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe w unsupp and t/c',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+	{ 'to-tag' => $ttr }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1206,7 +1822,7 @@ SDP
 snd($sock_a, $port_a, rtp(8, 2001, 4160, 0x3456, "\x00" x 160));
 rcv($sock_b, $port_b, rtpm(8, 2001, 4160, 0x3456, "\x00" x 160));
 
-($ftr, $ttr, $port_b) = subscribe_request('publish/subscribe w unsupp and t/c',
+($ftr, $ttr, undef, undef, undef, $port_b) = subscribe_request('publish/subscribe w unsupp and t/c',
 	{ 'from-tag' => ft(), codec => { strip => ['PCMA'], transcode => ['PCMU'] } }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
@@ -1222,7 +1838,7 @@ SDP
 is $ftr, ft(), 'from-tag matches';
 
 subscribe_answer('publish/subscribe w unsupp and t/c',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+	{ 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.1
 s=tester
@@ -1239,3 +1855,4 @@ rcv($sock_c, $port_c, rtpm(0, 2002, 4320, 0x3456, "\x29" x 160));
 
 
 done_testing();
+#done_testing;NGCP::Rtpengine::AutoTest::terminate('f00');exit;

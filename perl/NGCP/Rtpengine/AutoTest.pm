@@ -21,7 +21,7 @@ BEGIN {
 	@ISA = qw(Exporter);
 	our @EXPORT = qw(autotest_start new_call offer answer ft tt snd srtp_snd rtp rcv srtp_rcv
 		srtp_dec escape rtpm rtpmre reverse_tags new_ft new_tt crlf sdp_split rtpe_req offer_answer
-		autotest_init subscribe_request subscribe_answer publish);
+		autotest_init subscribe_request subscribe_answer publish use_json);
 };
 
 
@@ -160,7 +160,8 @@ sub subscribe_request {
 	my ($name, $req, $sdp_exp) = @_;
 	my $resp = rtpe_req('subscribe request', $name, $req);
 	my @matches = sdp_match('subscribe request', $name, $resp->{sdp}, $sdp_exp);
-	return ($resp->{'from-tag'}, $resp->{'to-tag'}, @matches);
+	return ($resp->{'from-tag'}, $resp->{'to-tag'}, $resp->{'from-tags'}, $resp->{'tag-medias'},
+		$resp->{'media-labels'}, @matches);
 }
 sub subscribe_answer {
 	my ($name, $req, $sdp) = @_;
@@ -287,6 +288,11 @@ sub terminate {
 	print "hint: rtpe stderr output is at $rtpe_stderr\n";
 
 	die "error: $msg\n";
+}
+
+sub use_json {
+	my $bool = shift;
+	$c->{json} = $bool;
 }
 
 

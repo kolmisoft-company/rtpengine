@@ -593,7 +593,7 @@ int redis_notify_subscribe_action(struct redis *r, enum subscribe_action action,
 static int redis_delete_async(struct redis *r) {
 	// sanity checks
 	if (!r) {
-		rlog(LOG_ERROR, "redis_delete_async: Don't use Redis async deletions beacause no redis/redis_write.");
+		rlog(LOG_ERROR, "redis_delete_async: Don't use Redis async deletions because no redis/redis_write.");
 		return -1 ;
 	}
 
@@ -721,7 +721,7 @@ void redis_delete_async_loop(void *d) {
 	// sanity checks
 	r = rtpe_redis_write;
 	if (!r) {
-		rlog(LOG_ERROR, "redis_delete_async_loop: Don't use Redis async deletions beacause no redis/redis_write.");
+		rlog(LOG_ERROR, "redis_delete_async_loop: Don't use Redis async deletions because no redis/redis_write.");
 		return ;
 	}
 
@@ -1586,7 +1586,7 @@ static int json_link_tags(struct call *c, struct redis_list *tags, struct redis_
 			other_ml = l->data;
 			if (!other_ml)
 			    return -1;
-			__add_subscription(ml, other_ml, true);
+			__add_subscription(ml, other_ml, true, 0);
 		}
 		g_queue_clear(&q);
 
@@ -1596,7 +1596,7 @@ static int json_link_tags(struct call *c, struct redis_list *tags, struct redis_
 			other_ml = l->data;
 			if (!other_ml)
 			    return -1;
-			__add_subscription(ml, other_ml, false);
+			__add_subscription(ml, other_ml, false, 0); // XXX fix indexing
 		}
 		g_queue_clear(&q);
 
@@ -1604,7 +1604,7 @@ static int json_link_tags(struct call *c, struct redis_list *tags, struct redis_
 		if (!ml->subscriptions.length) {
 			other_ml = redis_list_get_ptr(tags, &tags->rh[i], "active");
 			if (other_ml)
-				__add_subscription(ml, other_ml, true);
+				__add_subscription(ml, other_ml, true, 0);
 		}
 
 		if (json_build_list(&q, c, "other_tags", &c->callid, i, tags, root_reader))

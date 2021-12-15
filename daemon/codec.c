@@ -129,7 +129,6 @@ struct codec_ssrc_handler {
 	int bytes_per_packet;
 	unsigned long first_ts; // for output TS scaling
 	unsigned long last_ts; // to detect input lag and handle lost packets
-	unsigned long ts_in; // for DTMF dupe detection
 	struct timeval first_send;
 	unsigned long first_send_ts;
 	long output_skew;
@@ -192,7 +191,7 @@ static codec_handler_func handler_func_t38;
 
 static struct ssrc_entry *__ssrc_handler_transcode_new(void *p);
 static struct ssrc_entry *__ssrc_handler_new(void *p);
-static void __ssrc_handler_stop(void *p);
+static void __ssrc_handler_stop(void *p, void *dummy);
 static void __free_ssrc_handler(void *);
 INLINE struct codec_handler *codec_handler_lookup(GHashTable *ht, int pt, struct call_media *sink);
 
@@ -227,10 +226,9 @@ static struct codec_handler codec_handler_stub_ssrc = {
 
 
 static void __handler_shutdown(struct codec_handler *handler) {
-	if (handler->ssrc_hash) {
-		ssrc_hash_foreach(handler->ssrc_hash, __ssrc_handler_stop);
-		free_ssrc_hash(&handler->ssrc_hash);
-	}
+	ssrc_hash_foreach(handler->ssrc_hash, __ssrc_handler_stop, NULL);
+	free_ssrc_hash(&handler->ssrc_hash);
+
 	if (handler->ssrc_handler)
 		obj_put(&handler->ssrc_handler->h);
 	handler->ssrc_handler = NULL;
@@ -319,6 +317,10 @@ static void __make_passthrough_ssrc(struct codec_handler *handler) {
 	handler->passthrough = 1;
 }
 
+static void __reset_sequencer(void *p, void *dummy) {
+	struct ssrc_entry_call *s = p;
+	s->sequencer.seq = -1;
+}
 static void __make_transcoder(struct codec_handler *handler, struct rtp_payload_type *dest,
 		GHashTable *output_transcoders, int dtmf_payload_type, int pcm_dtmf_detect,
 		int cn_payload_type)
@@ -391,6 +393,8 @@ reset:
 	mutex_unlock(&rtpe_codec_stats_lock);
 
 	g_atomic_int_inc(&stats_entry->num_transcoders);
+
+	ssrc_hash_foreach(handler->media->monologue->ssrc_hash, __reset_sequencer, NULL);
 
 check_output:;
 	// check if we have multiple decoders transcoding to the same output PT
@@ -873,9 +877,9 @@ INLINE struct codec_handler *codec_handler_lookup(GHashTable *ht, int pt, struct
 void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 		const struct sdp_ng_flags *flags, const struct stream_params *sp)
 {
-	ilogs(codec, LOG_DEBUG, "Setting up codec handlers for " STR_FORMAT_M " -> " STR_FORMAT_M " (media #%u)",
-			STR_FMT_M(&receiver->monologue->tag), STR_FMT_M(&sink->monologue->tag),
-			receiver->index);
+	ilogs(codec, LOG_DEBUG, "Setting up codec handlers for " STR_FORMAT_M " #%u -> " STR_FORMAT_M " #%u",
+			STR_FMT_M(&receiver->monologue->tag), receiver->index,
+			STR_FMT_M(&sink->monologue->tag), sink->index);
 
 	MEDIA_CLEAR(receiver, GENERATOR);
 	MEDIA_CLEAR(sink, GENERATOR);
@@ -1416,9 +1420,11 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 
 	if (packet->bypass_seq) {
 		// bypass sequencer
+		__ssrc_lock_both(mp);
 		int ret = packet->func(ch, ch, packet, mp);
 		if (ret != 1)
 			__transcode_packet_free(packet);
+		__ssrc_unlock_both(mp);
 		goto out_ch;
 	}
 
@@ -1746,17 +1752,21 @@ static struct codec_handler *__input_handler(struct codec_handler *h, struct med
 static int packet_dtmf(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 		struct transcode_packet *packet, struct media_packet *mp)
 {
-	if (ch->ts_in != packet->ts) { // ignore already processed events
-		int ret = dtmf_event(mp, packet->payload, ch->encoder_format.clockrate);
-		if (G_UNLIKELY(ret == -1)) // error
-			return -1;
-		if (ret == 1) {
-			// END event
-			ch->ts_in = packet->ts;
-			input_ch->dtmf_start_ts = 0;
+	{
+		LOCK(&mp->media->dtmf_lock);
+
+		if (mp->media->dtmf_ts != packet->ts) { // ignore already processed events
+			int ret = dtmf_event_packet(mp, packet->payload, ch->encoder_format.clockrate);
+			if (G_UNLIKELY(ret == -1)) // error
+				return -1;
+			if (ret == 1) {
+				// END event
+				mp->media->dtmf_ts = packet->ts;
+				input_ch->dtmf_start_ts = 0;
+			}
+			else
+				input_ch->dtmf_start_ts = packet->ts ? packet->ts : 1;
 		}
-		else
-			input_ch->dtmf_start_ts = packet->ts ? packet->ts : 1;
 	}
 
 	int ret = 0;
@@ -2466,7 +2476,7 @@ static void __dtx_setup(struct codec_ssrc_handler *ch) {
 	dtx->clockrate = ch->handler->source_pt.clock_rate;
 	dtx->tspp = dtx->ptime * dtx->clockrate / 1000;
 }
-static void __ssrc_handler_stop(void *p) {
+static void __ssrc_handler_stop(void *p, void *dummy) {
 	struct codec_ssrc_handler *ch = p;
 	if (ch->dtx_buffer) {
 		mutex_lock(&ch->dtx_buffer->lock);
@@ -2479,8 +2489,7 @@ static void __ssrc_handler_stop(void *p) {
 void codec_handlers_stop(GQueue *q) {
 	for (GList *l = q->head; l; l = l->next) {
 		struct codec_handler *h = l->data;
-		if (h->ssrc_hash)
-			ssrc_hash_foreach(h->ssrc_hash, __ssrc_handler_stop);
+		ssrc_hash_foreach(h->ssrc_hash, __ssrc_handler_stop, NULL);
 	}
 }
 
@@ -2723,11 +2732,14 @@ static int packet_encoded_rtp(encoder_t *enc, void *u1, void *u2) {
 
 		unsigned int repeats = 0;
 		int payload_type = -1;
+		int dtmf_pt = ch->handler->dtmf_payload_type;
+		int is_dtmf = 0;
 
-		int is_dtmf = dtmf_event_payload(&inout, (uint64_t *) &enc->avpkt->pts, enc->avpkt->duration,
-				&ch->dtmf_event, &ch->dtmf_events);
+		if (dtmf_pt != -1)
+			is_dtmf = dtmf_event_payload(&inout, (uint64_t *) &enc->avpkt->pts, enc->avpkt->duration,
+					&ch->dtmf_event, &ch->dtmf_events);
 		if (is_dtmf) {
-			payload_type = ch->handler->dtmf_payload_type;
+			payload_type = dtmf_pt;
 			if (is_dtmf == 1)
 				ch->rtp_mark = 1; // DTMF start event
 			else if (is_dtmf == 3)
@@ -2922,6 +2934,27 @@ out:
 }
 
 #endif
+
+
+void codec_update_all_handlers(struct call_monologue *ml) {
+	for (GList *l = ml->subscribers.head; l; l = l->next) {
+		struct call_subscription *cs = l->data;
+		struct call_monologue *sink = cs->monologue;
+
+		// iterate both simultaneously
+		GList *source_media_it = ml->medias.head;
+		GList *sink_media_it = sink->medias.head;
+		while (source_media_it && sink_media_it) {
+			struct call_media *source_media = source_media_it->data;
+			struct call_media *sink_media = sink_media_it->data;
+			codec_handlers_update(source_media, sink_media, NULL, NULL);
+			source_media_it = source_media_it->next;
+			sink_media_it = sink_media_it->next;
+		}
+	}
+
+	dialogue_unkernelize(ml);
+}
 
 
 void codec_calc_jitter(struct ssrc_ctx *ssrc, unsigned long ts, unsigned int clockrate,

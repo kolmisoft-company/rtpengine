@@ -21,6 +21,7 @@ struct sdp_ng_flags {
 	enum call_opmode opmode;
 	str call_id;
 	str from_tag;
+	GQueue from_tags;
 	str to_tag;
 	str via_branch;
 	str sdp;
@@ -108,6 +109,7 @@ struct sdp_ng_flags {
 	             osrtp_offer:1,
 	             reset:1,
 	             all:1,
+		     siprec:1,
 	             fragment:1,
 	             record_call:1,
 		     debug:1,

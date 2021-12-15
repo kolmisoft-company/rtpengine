@@ -363,6 +363,7 @@ struct call_media {
 	struct ice_agent	*ice_agent;
 
 	str			media_id;
+	str			label;
 	GQueue			sdes_in, sdes_out;
 	struct dtls_fingerprint fingerprint; /* as received */
 	const struct dtls_hash_func *fp_hash_func; // outgoing
@@ -382,6 +383,10 @@ struct call_media {
 	//struct codec_handler	*dtmf_injector;
 	struct t38_gateway	*t38_gateway;
 	struct codec_handler	*t38_handler;
+
+	mutex_t			dtmf_lock;
+	unsigned long		dtmf_ts; // TS of last processed end event
+
 #ifdef WITH_TRANSCODING
 	union {
 		struct {
@@ -399,6 +404,7 @@ struct call_media {
 struct call_subscription {
 	struct call_monologue	*monologue;
 	GList			*link; // link into the corresponding opposite list
+	unsigned int		media_offset; // 0 if media indexes match up
 	unsigned int		offer_answer:1; // bidirectional, exclusive
 };
 
@@ -596,11 +602,13 @@ struct call_monologue *__monologue_create(struct call *call);
 void __monologue_tag(struct call_monologue *ml, const str *tag);
 void __monologue_viabranch(struct call_monologue *ml, const str *viabranch);
 struct packet_stream *__packet_stream_new(struct call *call);
-void __add_subscription(struct call_monologue *ml, struct call_monologue *other, bool offer_answer);
+void __add_subscription(struct call_monologue *ml, struct call_monologue *other, bool offer_answer,
+		unsigned int media_offset);
 void free_sink_handler(void *);
 void __add_sink_handler(GQueue *, struct packet_stream *);
 
 void call_subscription_free(void *);
+void call_subscriptions_clear(GQueue *q);
 
 
 struct call *call_get_or_create(const str *callid, bool foreign, bool exclusive);
@@ -616,10 +624,10 @@ int monologue_offer_answer(struct call_monologue *dialogue[2], GQueue *streams, 
 void codecs_offer_answer(struct call_media *media, struct call_media *other_media,
 		struct stream_params *sp, struct sdp_ng_flags *flags);
 int monologue_publish(struct call_monologue *ml, GQueue *streams, struct sdp_ng_flags *flags);
-int monologue_subscribe_request(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *);
-int monologue_subscribe_answer(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *,
+int monologue_subscribe_request(const GQueue *srcs, struct call_monologue *dst, struct sdp_ng_flags *);
+int monologue_subscribe_answer(struct call_monologue *dst, struct sdp_ng_flags *,
 		GQueue *);
-int monologue_unsubscribe(struct call_monologue *src, struct call_monologue *dst, struct sdp_ng_flags *);
+int monologue_unsubscribe(struct call_monologue *dst, struct sdp_ng_flags *);
 int monologue_destroy(struct call_monologue *ml);
 int call_delete_branch(const str *callid, const str *branch,
 	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay);
@@ -629,6 +637,7 @@ void call_media_free(struct call_media **mdp);
 enum call_stream_state call_stream_state_machine(struct packet_stream *);
 void call_media_state_machine(struct call_media *m);
 void call_media_unkernelize(struct call_media *media);
+void dialogue_unkernelize(struct call_monologue *ml);
 void __monologue_unkernelize(struct call_monologue *monologue);
 
 int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,

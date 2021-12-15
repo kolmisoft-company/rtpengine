@@ -3,6 +3,7 @@
 
 #include <sys/uio.h>
 #include <string.h>
+#include <json-glib/json-glib.h>
 
 #include "compat.h"
 
@@ -185,6 +186,9 @@ INLINE str *bencode_get_str(bencode_item_t *in, str *out);
 /* Creates a new integer object. Returns NULL if no memory could be allocated. */
 bencode_item_t *bencode_integer(bencode_buffer_t *buf, long long int i);
 
+// Return integer, possibly converted from string
+INLINE long long bencode_get_integer_str(bencode_item_t *item, long long int defval);
+
 
 
 
@@ -219,13 +223,16 @@ struct iovec *bencode_iovec(bencode_item_t *root, int *cnt, unsigned int head, u
 char *bencode_collapse(bencode_item_t *root, size_t *len);
 
 /* Identical to bencode_collapse() but fills in a "str" object. Returns "out". */
-static str *bencode_collapse_str(bencode_item_t *root, str *out);
+INLINE str *bencode_collapse_str(bencode_item_t *root, str *out);
 
 /* Identical to bencode_collapse(), but the memory for the returned string is not allocated from
  * a bencode_buffer_t object, but instead using the function defined as BENCODE_MALLOC (normally
  * malloc() or pkg_malloc()), similar to strdup(). Using this function, the bencode_buffer_t
  * object can be destroyed, but the returned string remains valid and usable. */
 char *bencode_collapse_dup(bencode_item_t *root, size_t *len);
+
+// Collapse into a JSON document. Otherwise identical to bencode_collapse_str.
+str *bencode_collapse_str_json(bencode_item_t *root, str *out);
 
 
 
@@ -289,6 +296,9 @@ INLINE bencode_item_t *bencode_decode_expect_str(bencode_buffer_t *buf, const st
 
 /* Returns the number of bytes that could successfully be decoded from 's', -1 if more bytes are needed or -2 on error */
 ssize_t bencode_valid(const char *s, size_t len);
+
+// Convert a GLib JSON document to bencode
+bencode_item_t *bencode_convert_json(bencode_buffer_t *buf, JsonParser *json);
 
 
 /*** DICTIONARY LOOKUP & EXTRACTION ***/
@@ -504,9 +514,7 @@ INLINE long long int bencode_dictionary_get_integer(bencode_item_t *dict, const 
 	return val->value;
 }
 
-INLINE long long int bencode_dictionary_get_int_str(bencode_item_t *dict, const char *key, long long int defval) {
-	bencode_item_t *val;
-	val = bencode_dictionary_get(dict, key);
+INLINE long long bencode_get_integer_str(bencode_item_t *val, long long int defval) {
 	if (!val)
 		return defval;
 	if (val->type == BENCODE_INTEGER)
@@ -526,6 +534,12 @@ INLINE long long int bencode_dictionary_get_int_str(bencode_item_t *dict, const 
 	if (errp != val->iov[1].iov_base + val->iov[1].iov_len)
 		return defval;
 	return ret;
+}
+
+INLINE long long int bencode_dictionary_get_int_str(bencode_item_t *dict, const char *key, long long int defval) {
+	bencode_item_t *val;
+	val = bencode_dictionary_get(dict, key);
+	return bencode_get_integer_str(val, defval);
 }
 
 INLINE bencode_item_t *bencode_decode_expect(bencode_buffer_t *buf, const char *s, size_t len, bencode_type_t expect) {

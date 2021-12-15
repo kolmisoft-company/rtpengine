@@ -568,21 +568,30 @@ Call recording can be accomplished in one of two ways:
 The *ng* Control Protocol
 =========================
 
-In order to enable several advanced features in *rtpengine*, a new advanced control protocol has been devised
-which passes the complete SDP body from the SIP proxy to the *rtpengine* daemon, has the body rewritten in
-the daemon, and then passed back to the SIP proxy to embed into the SIP message.
+In order to enable several advanced features in *rtpengine*, a new advanced
+control protocol has been devised which passes the complete SDP body from the
+SIP proxy to the *rtpengine* daemon, has the body rewritten in the daemon, and
+then passed back to the SIP proxy to embed into the SIP message.
 
-This control protocol is based on the [bencode](http://en.wikipedia.org/wiki/Bencode) standard and runs over
-UDP transport. *Bencoding* supports a similar feature set as the more popular JSON encoding (dictionaries/hashes,
-lists/arrays, arbitrary byte strings) but offers some benefits over JSON encoding, e.g. simpler and more efficient
-encoding, less encoding overhead, deterministic encoding and faster encoding and decoding. A disadvantage over
-JSON is that it's not a readily human readable format.
-
-Each message passed between the SIP proxy and the media proxy contains of two parts: a message cookie, and a
-bencoded dictionary, separated by a single space. The message cookie serves the same purpose as in the control
-protocol used by *Kamailio*'s *rtpproxy* module: matching requests to responses, and retransmission detection.
-The message cookie in the response generated to a particular request therefore must be the same as in the
+This control protocol is supported over a number of different transports (plain
+UDP, plain TCP, HTTP, WebSocket) and loosely follows the same format as used by
+*Kamailio*'s *rtpproxy* module. Each message passed between the SIP proxy and
+the media proxy contains of two parts: a unique message cookie and a dictionary
+document, separated by a single space. The message cookie is used to match
+requests to responses and to detect retransmissions. The message cookie in the
+response generated to a particular request therefore must be the same as in the
 request.
+
+The dictionary document can be in one of two formats. It can be a JSON object
+or it can be a dictionary in [bencode](http://en.wikipedia.org/wiki/Bencode)
+format. *Bencoding* supports a subset of the features of JSON
+(dictionaries/hashes, lists/arrays, arbitrary byte strings) but offers some
+benefits over JSON encoding, e.g. simpler and more efficient encoding, less
+encoding overhead, deterministic encoding and faster encoding and decoding.
+Disadvantages compared to JSON are that it's not a readily human readable
+format and that support in programming languages might be difficult to come by.
+Internally *rtpengine* uses *bencoding* natively, leading to additional
+overhead when JSON is in use as it has to be converted.
 
 The dictionary of each request must contain at least one key called `command`. The corresponding value must be
 a string and determines the type of message. Currently the following commands are defined:
@@ -623,7 +632,8 @@ For example, a `ping` message and its corresponding `pong` reply would be writte
 	{ "command": "ping" }
 	{ "result": "pong" }
 
-While the actual messages as encoded on the wire, including the message cookie, might look like this:
+While the actual messages as encoded on the wire, including the message cookie,
+might look like this in *bencode* format:
 
 	5323_1 d7:command4:pinge
 	5323_1 d6:result4:ponge
@@ -631,7 +641,13 @@ While the actual messages as encoded on the wire, including the message cookie, 
 All keys and values are case-sensitive unless specified otherwise. The requirement stipulated by the *bencode*
 standard that dictionary keys must be present in lexicographical order is not currently honoured.
 
-The *ng* protocol is used by *Kamailio*'s *rtpengine* module, which is based on the older module called *rtpproxy-ng*.
+The *ng* protocol is used by *Kamailio*'s *rtpengine* module, which is based on
+the older module called *rtpproxy-ng*, and utilises *bencoding* and the UDP
+transport by default, or alternatively WebSocket if so configured.
+
+Of course the agent controlling *rtpengine* via the *ng* protocol does not have
+to be a SIP proxy. Any process that involves SDP can potentially talk to
+*rtpengine* via this protocol.
 
 `ping` Message
 --------------
@@ -657,6 +673,13 @@ The request dictionary must contain at least the following keys:
   The SIP `From` tag as string.
 
 Optionally included keys are:
+
+* `from-tags`
+
+	Contains a list of strings used to selected multiple existing call
+	participants (e.g. for the `subscribe request` message). An alternative
+	way to list multiple tags is by putting them into the `flags` list,
+	each prefixed with `from-tags-`.
 
 * `via-branch`
 
@@ -809,7 +832,6 @@ Optionally included keys are:
 	- `pad crypto`
 
 		Legacy alias to SDES=pad.
-
 
 	- `generate mid`
 
@@ -2095,32 +2117,41 @@ described above.
 ---------------------------
 
 This message is used to request subscription (i.e. receiving a copy of the
-media) to an existing call participant, which must have been created either
-through the offer/answer mechanism, or through the publish mechanism.
+media) to one or multiple existing call participants, which must have been
+created either through the offer/answer mechanism, or through the publish
+mechanism.
 
-The call participant is selected in the same way as described under `block
-DTMF` except that one call participant must be selected (i.e. the `all` keyword
-cannot be used). This message then creates a new call participant, which
-corresponds to the subscription. This new call participant will be identified
-by a newly generated unique tag, or by the tag given in the `to-tag` key. If a
-label is to be set for the newly created subscription, it can be set through
-`set-label`.
+A single call participant can be selected in the same way as described under
+`block DTMF`. Multiple call participants can be selected either by using the
+`all` keyword, in which case all call participants that were created through
+the offer/answer mechanism will be selected, or by providing a list of tags
+(from-tags) in the `from-tags` list.
+
+This message then creates a new call participant, which corresponds to the
+subscription. This new call participant will be identified by a newly generated
+unique tag, or by the tag given in the `to-tag` key. If a label is to be set
+for the newly created subscription, it can be set through `set-label`.
 
 The reply message will contain a sendonly offer SDP in `sdp` which by default
-will mirror the SDP of the call participant being subscribed to. This offer SDP
-can be manipulated with the same flags as used in an `offer` message, including
-the option to manipulate the codecs. The reply message will also contain the
-`from-tag` (corresponding to the call participant being subscribed to) and the
-`to-tag` (corresponding to the subscription, either generated or taken from the
-received message).
+will mirror the SDP of the call participant being subscribed to. If multiple
+call participants are subscribed to at the same time, then this SDP will
+contain multiple media sections, combined out of the media sections of all
+selected call participants. This offer SDP can be manipulated with the same
+flags as used in an `offer` message, including the option to manipulate the
+codecs. The reply message will also contain the `from-tags` (corresponding to
+the call participants being subscribed to) and the `to-tag` (corresponding to
+the subscription, either generated or taken from the received message).
+
+If a `subscribe request` is made for an existing `to-tag` then all existing
+subscriptions for that `to-tag` are deleted before the new subscriptions are
+created.
 
 `subscribe answer` Message
 --------------------------
 
 This message is expected to be received after responding to a `subscribe
-request` message. The message should contain the same `from-tag` and `to-tag`
-is the reply to the `subscribe request` (although `label` etc can also be used
-instead of the `from-tag`), as well as the answer SDP in `sdp`.
+request` message. The message should contain the same `to-tag` as the reply to
+the `subscribe request` as well as the answer SDP in `sdp`.
 
 By default, the answer SDP must accept all codecs that were presented in the
 offer SDP (given in the reply to `subscribe request`). If not all codecs were
@@ -2139,8 +2170,7 @@ forwarding will start to the endpoint given in the answer SDP.
 ---------------------
 
 This message is a counterpart to `subsscribe answer` to stop an established
-subscription. The subscription to be stopped is identified by `from-tag` and
-`to`tag`.
+subscription. The subscription to be stopped is identified by the `to-tag`.
 
 The *tcp-ng* Control Protocol
 =========================
