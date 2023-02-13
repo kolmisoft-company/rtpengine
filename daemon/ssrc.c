@@ -53,7 +53,8 @@ static void __free_ssrc_entry_call(void *ep) {
 	g_queue_clear_full(&e->sender_reports, (GDestroyNotify) free_sender_report);
 	g_queue_clear_full(&e->rr_time_reports, (GDestroyNotify) free_rr_time);
 	g_queue_clear_full(&e->stats_blocks, (GDestroyNotify) free_stats_block);
-	packet_sequencer_destroy(&e->sequencer);
+	if (e->sequencers)
+		g_hash_table_destroy(e->sequencers);
 }
 static void ssrc_entry_put(void *ep) {
 	struct ssrc_entry_call *e = ep;
@@ -350,7 +351,7 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 	mutex_unlock(&e->lock);
 	obj_put(e);
 }
-void ssrc_receiver_report(struct call_media *m, const struct ssrc_receiver_report *rr,
+void ssrc_receiver_report(struct call_media *m, struct stream_fd *sfd, const struct ssrc_receiver_report *rr,
 		const struct timeval *tv)
 {
 	ilog(LOG_DEBUG, "RR from %s%x%s about %s%x%s: FL %u TL %u HSR %u J %u LSR %u DLSR %u",
@@ -394,9 +395,19 @@ void ssrc_receiver_report(struct call_media *m, const struct ssrc_receiver_repor
 		.reported = *tv,
 		.packetloss = (unsigned int) rr->fraction_lost * 100 / 256,
 	};
+
+	RTPE_SAMPLE_SFD(jitter, jitter, sfd);
+	RTPE_SAMPLE_SFD(rtt_e2e, rtt_end2end, sfd);
+	RTPE_SAMPLE_SFD(rtt_dsct, rtt, sfd);
+	RTPE_SAMPLE_SFD(packetloss, ssb->packetloss, sfd);
+
 	other_e->packets_lost = rr->packets_lost;
 	mos_calc(ssb);
-	ilog(LOG_DEBUG, "Calculated MOS from RR for %s%x%s is %.1f", FMT_M(rr->from), (double) ssb->mos / 10.0);
+	if (ssb->mos) {
+		ilog(LOG_DEBUG, "Calculated MOS from RR for %s%x%s is %.1f", FMT_M(rr->from),
+				(double) ssb->mos / 10.0);
+		RTPE_SAMPLE_SFD(mos, ssb->mos, sfd);
+	}
 
 	// got a new stats block, add it to reporting ssrc
 	mutex_lock(&other_e->h.lock);
@@ -563,9 +574,7 @@ void payload_tracker_add(struct payload_tracker *t, int pt) {
 	}
 
 	// fill in new entry
-	t->last[t->last_idx++] = pt;
-	if (t->last_idx >= G_N_ELEMENTS(t->last))
-		t->last_idx = 0;
+	t->last[t->last_idx] = pt;
 
 	// increase new counter
 	PT_DBG("increasing new pt count from %u", t->count[pt]);
@@ -586,5 +595,34 @@ void payload_tracker_add(struct payload_tracker *t, int pt) {
 		__pt_sort(t, old_pt);
 
 out:
+	if (++t->last_idx >= G_N_ELEMENTS(t->last))
+		t->last_idx = 0;
 	mutex_unlock(&t->lock);
+}
+
+
+// call master lock held in R
+void ssrc_collect_metrics(struct call_media *media) {
+	if (!media->streams.head)
+		return;
+	struct packet_stream *ps = media->streams.head->data;
+	for (int i = 0; i < RTPE_NUM_SSRC_TRACKING; i++) {
+		struct ssrc_ctx *s = ps->ssrc_in[i];
+		if (!s)
+			break; // end of list
+		struct ssrc_entry_call *e = s->parent;
+
+		// exclude zero values - technically possible but unlikely and probably just unset
+		if (!e->jitter)
+			continue;
+
+		if (e->input_ctx.tracker.most_len > 0 && e->input_ctx.tracker.most[0] != 255) {
+			const struct rtp_payload_type *rpt = rtp_payload_type(e->input_ctx.tracker.most[0],
+					&ps->media->codecs);
+			if (rpt && rpt->clock_rate)
+				e->jitter = e->jitter * 1000 / rpt->clock_rate;
+		}
+
+		RTPE_SAMPLE_SFD(jitter_measured, e->jitter, ps->selected_sfd);
+	}
 }

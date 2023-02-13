@@ -44,14 +44,15 @@ struct recording_stream_proc {
 };
 
 struct recording {
-	union {
+	struct {
 		struct recording_pcap pcap;
 		struct recording_proc proc;
 	} u;
 
 	char		*escaped_callid; // call-id with dangerous characters escaped
 	char		*meta_prefix; // escaped call-id plus random suffix
-	char		*meta_filepath; // full file path
+	char		*meta_filepath_proc; // full file path
+	char		*meta_filepath_pcap; // full file path
 };
 
 struct recording_stream {
@@ -71,7 +72,7 @@ struct recording_method {
 	void (*sdp_after)(struct recording *, GString *, struct call_monologue *,
 			enum call_opmode);
 	void (*meta_chunk)(struct recording *, const char *, const str *);
-	void (*update_flags)(struct call *call);
+	void (*update_flags)(struct call *call, bool streams);
 
 	void (*dump_packet)(struct media_packet *, const str *s);
 	void (*finish)(struct call *);
@@ -116,10 +117,13 @@ void recording_fs_free(void);
  *
  * Returns a boolean for whether or not the call is being recorded.
  */
-void detect_setup_recording(struct call *call, const str *recordcall, str *metadata);
+void detect_setup_recording(struct call *call, const str *recordcall);
+void update_metadata_call(struct call *call, str *metadata);
+void update_metadata_monologue(struct call_monologue *ml, str *metadata);
 
-void recording_start(struct call *call, const char *prefix, str *metadata, str *output_dest);
-void recording_stop(struct call *call, str *metadata);
+void recording_start(struct call *call, const char *prefix, str *output_dest);
+void recording_pause(struct call *call);
+void recording_stop(struct call *call);
 
 
 /**

@@ -20,6 +20,7 @@ CFLAGS+=	$(shell pkg-config --cflags libavutil)
 CFLAGS+=	$(shell pkg-config --cflags libswresample)
 CFLAGS+=	$(shell pkg-config --cflags libavfilter)
 CFLAGS+=	$(shell pkg-config --cflags spandsp)
+CFLAGS+=	$(shell pkg-config --cflags opus)
 CFLAGS+=	-DWITH_TRANSCODING
 CFLAGS+=	$(shell pkg-config --cflags zlib)
 CFLAGS+=	$(shell pkg-config --cflags libwebsockets)
@@ -35,7 +36,7 @@ else
 CFLAGS+=	-DWITHOUT_CODECLIB
 endif
 
-LDLIBS=		-lm
+LDLIBS=		-lm -ldl
 LDLIBS+=	$(shell pkg-config --libs glib-2.0)
 LDLIBS+=	$(shell pkg-config --libs gthread-2.0)
 LDLIBS+=	$(shell pkg-config --libs libcrypto)
@@ -49,6 +50,7 @@ LDLIBS+=	$(shell pkg-config --libs libavutil)
 LDLIBS+=	$(shell pkg-config --libs libswresample)
 LDLIBS+=	$(shell pkg-config --libs libavfilter)
 LDLIBS+=	$(shell pkg-config --libs spandsp)
+LDLIBS+=	$(shell pkg-config --libs opus)
 LDLIBS+=	$(shell pkg-config --libs zlib)
 LDLIBS+=	$(shell pkg-config --libs libwebsockets)
 LDLIBS+=	-lpcap
@@ -72,7 +74,7 @@ SRCS+=		spandsp_recv_fax_pcm.c spandsp_recv_fax_t38.c spandsp_send_fax_pcm.c \
 ifeq ($(with_amr_tests),yes)
 SRCS+=		test-amr-decode.c test-amr-encode.c
 endif
-LIBSRCS+=	codeclib.c resample.c socket.c streambuf.c dtmflib.c
+LIBSRCS+=	codeclib.strhash.c resample.c socket.c streambuf.c dtmflib.c
 DAEMONSRCS+=	codec.c call.c ice.c kernel.c media_socket.c stun.c bencode.c poller.c \
 		dtls.c recording.c statistics.c rtcp.c redis.c iptables.c graphite.c \
 		cookie_cache.c udp_listener.c homer.c load.c cdr.c dtmf.c timerthread.c \
@@ -88,7 +90,8 @@ include ../lib/common.Makefile
 
 .PHONY:		all-tests unit-tests daemon-tests daemon-tests \
 	daemon-tests-main daemon-tests-jb daemon-tests-dtx daemon-tests-dtx-cn daemon-tests-pubsub \
-	daemon-tests-intfs daemon-tests-stats
+	daemon-tests-intfs daemon-tests-stats daemon-tests-delay-buffer daemon-tests-delay-timing \
+	daemon-tests-evs daemon-tests-player-cache daemon-tests-redis
 
 TESTS=		test-bitstr aes-crypt aead-aes-crypt test-const_str_hash.strhash
 ifeq ($(with_transcoding),yes)
@@ -98,7 +101,7 @@ TESTS+=		test-amr-decode test-amr-encode
 endif
 endif
 
-ADD_CLEAN=	tests-preload.so $(TESTS)
+ADD_CLEAN=	tests-preload.so time-fudge-preload.so $(TESTS)
 
 ifeq ($(with_transcoding),yes)
 all-tests:	unit-tests daemon-tests
@@ -108,10 +111,23 @@ endif
 	true # override linking recipe from common.Makefile
 
 unit-tests:	$(TESTS)
-	for x in $(TESTS); do echo testing: $$x; G_DEBUG=fatal-warnings ./$$x || exit 1; done
+	failed="" ; \
+	for x in $(TESTS); do \
+	  echo `date +"%Y-%m-%d %H:%M:%S"` testing: $$x ; \
+	  G_DEBUG=fatal-warnings ./$$x ; \
+	  if [ $$? -eq 0 ] ; \
+	    then echo `date +"%Y-%m-%d %H:%M:%S"` test $$x: succeeded ; \
+	    else echo `date +"%Y-%m-%d %H:%M:%S"` test $$x: failed ; failed="$$failed $$x" ; \
+	  fi ; \
+	done ; \
+	if [ -n "$$failed" ] ; then \
+	  echo "Tests failed: $$failed" ; \
+	  exit 1 ; \
+	fi
 
 daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-pubsub daemon-tests-websocket \
-	daemon-tests-intfs daemon-tests-stats
+	daemon-tests-evs \
+	daemon-tests-intfs daemon-tests-stats daemon-tests-player-cache daemon-tests-redis
 
 daemon-test-deps:	tests-preload.so
 	$(MAKE) -C ../daemon
@@ -180,6 +196,46 @@ daemon-tests-intfs:	daemon-test-deps
 	test "$$(ls fake-$@-sockets)" = ""
 	rmdir fake-$@-sockets
 
+daemon-tests-delay-buffer:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-delay-buffer.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-delay-timing:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-delay-timing.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-evs:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-evs.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-player-cache:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-player-cache.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
+daemon-tests-redis:	daemon-test-deps
+	rm -rf fake-$@-sockets
+	mkdir fake-$@-sockets
+	LD_PRELOAD=../t/tests-preload.so RTPE_BIN=../daemon/rtpengine TEST_SOCKET_PATH=./fake-$@-sockets \
+		   perl -I../perl auto-daemon-tests-redis.pl
+	test "$$(ls fake-$@-sockets)" = ""
+	rmdir fake-$@-sockets
+
 test-bitstr:	test-bitstr.o
 
 spandsp_send_fax_pcm:	spandsp_send_fax_pcm.o
@@ -192,9 +248,9 @@ spandsp_recv_fax_t38:	spandsp_recv_fax_t38.o
 
 spandsp_raw_fax_tests: spandsp_send_fax_pcm spandsp_recv_fax_pcm spandsp_send_fax_t38 spandsp_recv_fax_t38
 
-test-amr-decode: test-amr-decode-test.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
+test-amr-decode: test-amr-decode-test.o $(COMMONOBJS) codeclib.strhash.o resample.o dtmflib.o
 
-test-amr-encode: test-amr-encode-test.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
+test-amr-encode: test-amr-encode-test.o $(COMMONOBJS) codeclib.strhash.o resample.o dtmflib.o
 
 test-dtmf-detect: test-dtmf-detect.o
 
@@ -202,7 +258,7 @@ aes-crypt:	aes-crypt.o $(COMMONOBJS) crypto.o
 
 aead-aes-crypt:	aead-aes-crypt.o $(COMMONOBJS) crypto.o
 
-test-stats:	test-stats.o $(COMMONOBJS) codeclib.o resample.o codec.o ssrc.o call.o ice.o aux.o \
+test-stats:	test-stats.o $(COMMONOBJS) codeclib.strhash.o resample.o codec.o ssrc.o call.o ice.o aux.o \
 	kernel.o media_socket.o stun.o bencode.o socket.o poller.o dtls.o recording.o statistics.o \
 	rtcp.o redis.o iptables.o graphite.o call_interfaces.strhash.o sdp.strhash.o rtp.o crypto.o \
 	control_ng.strhash.o graphite.o \
@@ -210,7 +266,7 @@ test-stats:	test-stats.o $(COMMONOBJS) codeclib.o resample.o codec.o ssrc.o call
 	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o \
 	websocket.o cli.o
 
-test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.o resample.o codec.o ssrc.o call.o ice.o aux.o \
+test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.strhash.o resample.o codec.o ssrc.o call.o ice.o aux.o \
 	kernel.o media_socket.o stun.o bencode.o socket.o poller.o dtls.o recording.o statistics.o \
 	rtcp.o redis.o iptables.o graphite.o call_interfaces.strhash.o sdp.strhash.o rtp.o crypto.o \
 	control_ng.strhash.o \
@@ -218,9 +274,9 @@ test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.o resample.o codec.o ssr
 	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o websocket.o \
 	cli.o
 
-test-resample:	test-resample.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
+test-resample:	test-resample.o $(COMMONOBJS) codeclib.strhash.o resample.o dtmflib.o
 
-test-payload-tracker: test-payload-tracker.o $(COMMONOBJS) ssrc.o aux.o auxlib.o rtp.o crypto.o codeclib.o \
+test-payload-tracker: test-payload-tracker.o $(COMMONOBJS) ssrc.o aux.o auxlib.o rtp.o crypto.o codeclib.strhash.o \
 	resample.o dtmflib.o
 
 test-kernel-module: test-kernel-module.o $(COMMONOBJS) kernel.o
@@ -231,6 +287,9 @@ PRELOAD_CFLAGS += -D_GNU_SOURCE -std=c99
 PRELOAD_LIBS += -ldl
 
 tests-preload.so:	tests-preload.c
+	$(CC) $(PRELOAD_CFLAGS) -o $@ -shared -fPIC $< $(LDFLAGS) $(PRELOAD_LIBS)
+
+time-fudge-preload.so:	time-fudge-preload.c
 	$(CC) $(PRELOAD_CFLAGS) -o $@ -shared -fPIC $< $(LDFLAGS) $(PRELOAD_LIBS)
 
 spandsp_send_fax_pcm.c:	spandsp_logging.h

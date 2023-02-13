@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netinet/tcp.h>
+#include <stdbool.h>
 
 
 
@@ -180,6 +182,10 @@ INLINE ssize_t socket_sendiov(socket_t *s, const struct iovec *v, unsigned int l
 
 
 /* XXX obsolete these? */
+INLINE void usertimeout(int fd, unsigned int val) {
+	// coverity[check_return : FALSE]
+	setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &val, sizeof(val));
+}
 INLINE void nonblock(int fd) {
 	// coverity[check_return : FALSE]
 	fcntl(fd, F_SETFL, O_NONBLOCK);
@@ -211,6 +217,8 @@ int connect_socket(socket_t *r, int type, const endpoint_t *ep);
 int connect_socket_nb(socket_t *r, int type, const endpoint_t *ep); // 1 == in progress
 int connect_socket_retry(socket_t *r); // retries connect() while in progress
 int close_socket(socket_t *r);
+void move_socket(socket_t *dst, socket_t *src);
+void dummy_socket(socket_t *r, const sockaddr_t *);
 
 sockfamily_t *get_socket_family_rfc(const str *s);
 sockfamily_t *__get_socket_family_enum(enum socket_families);
@@ -218,20 +226,21 @@ int sockaddr_parse_any(sockaddr_t *dst, const char *src);
 int sockaddr_parse_any_str(sockaddr_t *dst, const str *src);
 int sockaddr_parse_str(sockaddr_t *dst, sockfamily_t *fam, const str *src);
 int endpoint_parse_any(endpoint_t *, const char *); // address (ip) optional
-int sockaddr_getaddrinfo(sockaddr_t *a, const char *s);
-int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s); // address (ip or hostname) optional
+int sockaddr_getaddrinfo_alt(sockaddr_t *a, sockaddr_t *a2, const char *s);
+int endpoint_parse_any_getaddrinfo_alt(endpoint_t *d, endpoint_t *d2, const char *s); // address (ip or hostname) optional
+INLINE int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s);
 void endpoint_parse_sockaddr_storage(endpoint_t *, struct sockaddr_storage *);
 void kernel2endpoint(endpoint_t *ep, const struct re_address *ra);
 
 unsigned int sockaddr_hash(const sockaddr_t *);
-int sockaddr_eq(const sockaddr_t *, const sockaddr_t *); /* true/false */
-unsigned int g_sockaddr_hash(const void *);
-int g_sockaddr_eq(const void *, const void *); /* true/false */
+bool sockaddr_eq(const sockaddr_t *, const sockaddr_t *);
+guint sockaddr_t_hash(gconstpointer); // for glib
+gint sockaddr_t_eq(gconstpointer, gconstpointer); // true/false, for glib
 
 unsigned int endpoint_hash(const endpoint_t *);
-int endpoint_eq(const endpoint_t *, const endpoint_t *); /* true/false */
-unsigned int g_endpoint_hash(const void *);
-int g_endpoint_eq(const void *, const void *); /* true/false */
+bool endpoint_eq(const endpoint_t *, const endpoint_t *); /* true/false */
+guint endpoint_t_hash(gconstpointer); // for glib
+gint endpoint_t_eq(gconstpointer, gconstpointer); // true/false, for glib
 
 INLINE sockfamily_t *get_socket_family_enum(enum socket_families i) {
 	if (i >= __SF_LAST)
@@ -263,6 +272,12 @@ INLINE int endpoint_parse_any_getaddrinfo_full(endpoint_t *d, const char *s) {
 	if (is_addr_unspecified(&d->address))
 		return -1;
 	return 0;
+}
+INLINE int sockaddr_getaddrinfo(sockaddr_t *a, const char *s) {
+	return sockaddr_getaddrinfo_alt(a, NULL, s);
+}
+INLINE int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s) {
+	return endpoint_parse_any_getaddrinfo_alt(d, NULL, s);
 }
 INLINE int ipv46_any_convert(endpoint_t *ep) {
 	if (ep->address.family->af != AF_INET)

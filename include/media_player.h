@@ -25,8 +25,28 @@ struct rtp_payload_type;
 #include <libavcodec/avcodec.h>
 
 
+struct media_player_cache_entry;
+
+struct media_player_content_index {
+	enum { MP_OTHER = 0, MP_FILE = 1, MP_DB, MP_BLOB } type;
+	long long db_id;
+	str file; // file name or binary blob
+};
+
+
 typedef void (*media_player_run_func)(struct media_player *);
 
+
+struct media_player_coder {
+	AVFormatContext *fmtctx;
+	AVStream *avstream;
+	unsigned long duration; // in milliseconds
+	AVPacket *pkt;
+	AVIOContext *avioctx;
+	str *blob;
+	str read_pos;
+	struct codec_handler *handler;
+};
 
 struct media_player {
 	struct timerthread_obj tt_obj;
@@ -41,18 +61,17 @@ struct media_player {
 	struct timeval next_run;
 	unsigned long repeat;
 
-	AVFormatContext *fmtctx;
-	unsigned long duration; // in milliseconds
-	AVPacket *pkt;
-	struct codec_handler *handler;
+	struct media_player_coder coder;
+	struct media_player_content_index cache_index;
+	struct media_player_cache_entry *cache_entry;
+	unsigned int cache_read_idx;
+
 	struct ssrc_ctx *ssrc_out;
 	unsigned long seq;
+	unsigned long buffer_ts;
 	unsigned long sync_ts;
 	struct timeval sync_ts_tv;
-
-	AVIOContext *avioctx;
-	str *blob;
-	str read_pos;
+	long long last_frame_ts;
 };
 
 INLINE void media_player_put(struct media_player **mp) {
@@ -86,12 +105,13 @@ struct send_timer {
 
 
 struct media_player *media_player_new(struct call_monologue *);
-int media_player_play_file(struct media_player *, const str *, long long);
-int media_player_play_blob(struct media_player *, const str *, long long);
-int media_player_play_db(struct media_player *, long long, long long);
-void media_player_stop(struct media_player *);
+int media_player_play_file(struct media_player *, const str *, long long, long long);
+int media_player_play_blob(struct media_player *, const str *, long long, long long);
+int media_player_play_db(struct media_player *, long long, long long, long long);
+long long media_player_stop(struct media_player *);
 
-int media_player_setup(struct media_player *mp, const struct rtp_payload_type *src_pt);
+int media_player_setup(struct media_player *mp, const struct rtp_payload_type *src_pt,
+		const struct rtp_payload_type *dst_pt);
 void media_player_set_media(struct media_player *mp, struct call_media *media);
 void media_player_add_packet(struct media_player *mp, char *buf, size_t len,
 		long long us_dur, unsigned long long pts);

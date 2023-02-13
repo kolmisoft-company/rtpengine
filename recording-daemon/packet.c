@@ -84,6 +84,8 @@ static void packet_free(void *p) {
 
 
 static void ssrc_tls_shutdown(ssrc_t *ssrc) {
+	if (!ssrc->tls_fwd_stream)
+		return;
 	streambuf_destroy(ssrc->tls_fwd_stream);
 	ssrc->tls_fwd_stream = NULL;
 	resample_shutdown(&ssrc->tls_fwd_resampler);
@@ -142,14 +144,20 @@ void ssrc_tls_state(ssrc_t *ssrc) {
 }
 
 
+void ssrc_close(ssrc_t *s) {
+	output_close(s->metafile, s->output, tag_get(s->metafile, s->stream->tag));
+	s->output = NULL;
+	for (int i = 0; i < G_N_ELEMENTS(s->decoders); i++) {
+		decoder_free(s->decoders[i]);
+		s->decoders[i] = NULL;
+	}
+	ssrc_tls_shutdown(s);
+}
+
 void ssrc_free(void *p) {
 	ssrc_t *s = p;
 	packet_sequencer_destroy(&s->sequencer);
-	output_close(s->output);
-	for (int i = 0; i < G_N_ELEMENTS(s->decoders); i++)
-		decoder_free(s->decoders[i]);
-	if (s->tls_fwd_stream)
-		ssrc_tls_shutdown(s);
+	ssrc_close(s);
 	g_slice_free1(sizeof(*s), s);
 }
 
@@ -187,22 +195,22 @@ out:
 			if (sep) {
 				char *filename = sep + 1;
 				*sep = 0;
-				ret->output = output_new_from_full_path(path, filename);
+				ret->output = output_new_from_full_path(path, filename, "single");
 				ret->output->skip_filename_extension = TRUE;
 			}
 			else {
-				ret->output = output_new_from_full_path(output_dir, path);
+				ret->output = output_new_from_full_path(output_dir, path, "single");
 			}
 		}
 		else {
 			char buf[16];
 			snprintf(buf, sizeof(buf), "%08lx", ssrc);
 			tag_t *tag = tag_get(mf, stream->tag);
-			ret->output = output_new(output_dir, mf->parent, buf, tag->label);
+			ret->output = output_new(output_dir, mf->parent, buf, "single", tag->label);
 		}
-		db_do_stream(mf, ret->output, "single", stream, ssrc);
+		db_do_stream(mf, ret->output, stream, ssrc);
 	}
-	if ((stream->forwarding_on || mf->forwarding_on) && !ret->tls_fwd_stream) {
+	if ((stream->forwarding_on || mf->forwarding_on) && !ret->tls_fwd_stream && tls_send_to_ep.port) {
 		// initialise the connection
 		ZERO(ret->tls_fwd_poller);
 		dbg("Starting TLS connection to %s", endpoint_print_buf(&tls_send_to_ep));

@@ -18,6 +18,7 @@
 #include "streambuf.h"
 #include "main.h"
 #include "packet.h"
+#include "tag.h"
 
 
 int resample_audio;
@@ -48,7 +49,7 @@ decode_t *decoder_new(const char *payload_str, const char *format, int ptime, ou
 			channels = 1;
 	}
 
-	const codec_def_t *def = codec_find(&name, MT_AUDIO);
+	codec_def_t *def = codec_find(&name, MT_AUDIO);
 	if (!def) {
 		ilog(LOG_WARN, "No decoder for payload %s", payload_str);
 		return NULL;
@@ -61,7 +62,7 @@ decode_t *decoder_new(const char *payload_str, const char *format, int ptime, ou
 
 	// decoder_new_fmt already handles the clockrate_mult scaling
 	int rtp_clockrate = clockrate;
-	clockrate *= def->clockrate_mult;
+	clockrate = fraction_mult(clockrate, &def->default_clockrate_fact);
 
 	// we can now config our output, which determines the sample format we convert to
 	format_t out_format = {
@@ -79,11 +80,13 @@ decode_t *decoder_new(const char *payload_str, const char *format, int ptime, ou
 			out_format = outp->requested_format;
 		output_config(outp, &out_format, &out_format);
 	}
+	else
+		out_format.format = AV_SAMPLE_FMT_S16; // needed for TLS-only scenarios
 
 	str fmtp;
 	str_init(&fmtp, (char *) format);
 
-	decoder_t *dec = decoder_new_fmtp(def, rtp_clockrate, channels, ptime, &out_format, &fmtp, NULL);
+	decoder_t *dec = decoder_new_fmtp(def, rtp_clockrate, channels, ptime, &out_format, NULL, &fmtp, NULL);
 	if (!dec)
 		return NULL;
 	decode_t *deco = g_slice_alloc0(sizeof(decode_t));
@@ -148,8 +151,17 @@ no_recording:
 		ssrc_tls_state(ssrc);
 
 		if (!ssrc->sent_intro) {
-			if (metafile->metadata) {
-				dbg("Writing metadata header to TLS");
+			tag_t *tag = NULL;
+
+			if (ssrc->stream)
+				tag = tag_get(metafile, ssrc->stream->tag);
+
+			if (tag && tag->metadata) {
+				dbg("Writing tag metadata header to TLS");
+				streambuf_write(ssrc->tls_fwd_stream, tag->metadata, strlen(tag->metadata) + 1);
+			}
+			else if (metafile->metadata) {
+				dbg("Writing call metadata header to TLS");
 				streambuf_write(ssrc->tls_fwd_stream, metafile->metadata, strlen(metafile->metadata) + 1);
 			}
 			else {
@@ -159,9 +171,9 @@ no_recording:
 			ssrc->sent_intro = 1;
 		}
 
-		dbg("Writing %u bytes PCM to TLS", dec_frame->linesize[0]);
-		streambuf_write(ssrc->tls_fwd_stream, (char *) dec_frame->extended_data[0],
-				dec_frame->linesize[0]);
+		int linesize = av_get_bytes_per_sample(dec_frame->format) * dec_frame->nb_samples;
+		dbg("Writing %u bytes PCM to TLS", linesize);
+		streambuf_write(ssrc->tls_fwd_stream, (char *) dec_frame->extended_data[0], linesize);
 		av_frame_free(&dec_frame);
 
 	}

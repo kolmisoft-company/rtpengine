@@ -187,8 +187,12 @@ static void dump_cert(struct dtls_cert *cert) {
 static int cert_init(void) {
 	X509 *x509 = NULL;
 	EVP_PKEY *pkey = NULL;
-	BIGNUM *exponent = NULL, *serial_number = NULL;
+	BIGNUM *serial_number = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 	RSA *rsa = NULL;
+	EC_KEY *ec_key = NULL;
+	BIGNUM *exponent = NULL;
+#endif
 	ASN1_INTEGER *asn1_serial_number;
 	X509_NAME *name;
 	struct dtls_cert *new_cert;
@@ -197,26 +201,70 @@ static int cert_init(void) {
 
 	/* objects */
 
-	pkey = EVP_PKEY_new();
-	exponent = BN_new();
-	rsa = RSA_new();
 	serial_number = BN_new();
 	name = X509_NAME_new();
 	x509 = X509_new();
-	if (!exponent || !pkey || !rsa || !serial_number || !name || !x509)
+	if (!serial_number || !name || !x509)
 		goto err;
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+	pkey = EVP_PKEY_new();
+	if (!pkey)
+		goto err;
+#endif
 
 	/* key */
 
-	if (!BN_set_word(exponent, 0x10001))
-		goto err;
+	if (rtpe_config.dtls_cert_cipher == DCC_RSA) {
+		ilogs(crypto, LOG_DEBUG, "Using %i-bit RSA key for DTLS certificate",
+				rtpe_config.dtls_rsa_key_size);
 
-	if (!RSA_generate_key_ex(rsa, rtpe_config.dtls_rsa_key_size, exponent, NULL))
-		goto err;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		pkey = EVP_RSA_gen(rtpe_config.dtls_rsa_key_size);
+#else // <3.0
+		exponent = BN_new();
+		rsa = RSA_new();
+		if (!exponent || !rsa)
+			goto err;
 
-	if (!EVP_PKEY_assign_RSA(pkey, rsa))
-		goto err;
+		if (!BN_set_word(exponent, 0x10001))
+			goto err;
 
+		if (!RSA_generate_key_ex(rsa, rtpe_config.dtls_rsa_key_size, exponent, NULL))
+			goto err;
+
+		if (!EVP_PKEY_assign_RSA(pkey, rsa))
+			goto err;
+		rsa = NULL;
+#endif
+
+	}
+	else if (rtpe_config.dtls_cert_cipher == DCC_EC_PRIME256v1) {
+		ilogs(crypto, LOG_DEBUG, "Using EC-prime256v1 key for DTLS certificate");
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		pkey = EVP_EC_gen("prime256v1");
+#else
+		ec_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+
+		if (!ec_key)
+			goto err;
+
+		if (!EC_KEY_generate_key(ec_key))
+			goto err;
+
+		if (!EVP_PKEY_assign_EC_KEY(pkey, ec_key))
+			goto err;
+		ec_key = NULL;
+#endif
+	}
+	else
+		abort();
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	if (!pkey)
+		goto err;
+#endif
 	/* x509 cert */
 
 	if (!X509_set_pubkey(x509, pkey))
@@ -224,8 +272,13 @@ static int cert_init(void) {
 
 	/* serial */
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	if (!BN_pseudo_rand(serial_number, 64, 0, 0))
 		goto err;
+#else
+	if (!BN_rand(serial_number, 64, 0, 0))
+		goto err;
+#endif
 
 	asn1_serial_number = X509_get_serialNumber(x509);
 	if (!asn1_serial_number)
@@ -241,8 +294,10 @@ static int cert_init(void) {
 
 	/* common name */
 
+	const char *cn = rtpe_config.software_id ?: "rtpengine";
+	size_t cn_len = MIN(strlen(cn), 63);
 	if (!X509_NAME_add_entry_by_NID(name, NID_commonName, MBSTRING_UTF8,
-				(unsigned char *) "rtpengine", -1, -1, 0))
+				(unsigned char *) cn, cn_len, -1, 0))
 		goto err;
 
 	if (!X509_set_subject_name(x509, name))
@@ -261,7 +316,7 @@ static int cert_init(void) {
 
 	/* sign it */
 
-	if (!X509_sign(x509, pkey, rtpe_config.dtls_signature == 1 ? EVP_sha1() : EVP_sha256()))
+	if (!X509_sign(x509, pkey, rtpe_config.dtls_signature == DSIG_SHA1 ? EVP_sha1() : EVP_sha256()))
 		goto err;
 
 	/* digest */
@@ -293,7 +348,9 @@ static int cert_init(void) {
 
 	/* cleanup */
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 	BN_free(exponent);
+#endif
 	BN_free(serial_number);
 	X509_NAME_free(name);
 
@@ -304,10 +361,14 @@ err:
 
 	if (pkey)
 		EVP_PKEY_free(pkey);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 	if (exponent)
 		BN_free(exponent);
 	if (rsa)
 		RSA_free(rsa);
+	if (ec_key)
+		EC_KEY_free(ec_key);
+#endif
 	if (x509)
 		X509_free(x509);
 	if (serial_number)
@@ -345,6 +406,9 @@ static void __dtls_timer(void *p) {
 	long int left;
 
 	c = dtls_cert();
+	if (!c)
+		return;
+
 	left = c->expires - rtpe_now.tv_sec;
 	if (left > CERT_EXPIRY_TIME/2)
 		goto out;
@@ -397,7 +461,7 @@ struct dtls_cert *dtls_cert() {
 	struct dtls_cert *ret;
 
 	rwlock_lock_r(&__dtls_cert_lock);
-	ret = obj_get(__dtls_cert);
+	ret = __dtls_cert ? obj_get(__dtls_cert) : NULL;
 	rwlock_unlock_r(&__dtls_cert_lock);
 
 	return ret;
@@ -517,6 +581,11 @@ static int try_connect(struct dtls_connection *d) {
 int dtls_connection_init(struct dtls_connection *d, struct packet_stream *ps, int active,
 		struct dtls_cert *cert)
 {
+	if (!cert) {
+		ilogs(crypto, LOG_ERR, "Cannot establish DTLS: no certificate available");
+		return -1;
+	}
+
 	unsigned long err;
 
 	if (d->init) {
@@ -566,12 +635,17 @@ int dtls_connection_init(struct dtls_connection *d, struct packet_stream *ps, in
 	d->init = 1;
 	SSL_set_mode(d->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	int ec_groups[1] = { NID_X9_62_prime256v1 };
+	SSL_set1_groups(d->ssl, &ec_groups, G_N_ELEMENTS(ec_groups));
+#else // <3.0
 	EC_KEY* ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
 	if (ecdh == NULL)
 		goto error;
 	SSL_set_options(d->ssl, SSL_OP_SINGLE_ECDH_USE);
 	SSL_set_tmp_ecdh(d->ssl, ecdh);
 	EC_KEY_free(ecdh);
+#endif
 
 #if defined(SSL_OP_NO_QUERY_MTU)
 	SSL_CTX_set_options(d->ssl_ctx, SSL_OP_NO_QUERY_MTU);
@@ -582,6 +656,8 @@ int dtls_connection_init(struct dtls_connection *d, struct packet_stream *ps, in
 #endif
 
 	d->active = active ? -1 : 0;
+
+	random_string(d->tls_id, sizeof(d->tls_id));
 
 done:
 	return 0;
@@ -777,6 +853,8 @@ int dtls(struct stream_fd *sfd, const str *s, const endpoint_t *fsin) {
 		if (fsin) {
 			ilogs(srtp, LOG_DEBUG, "Sending DTLS packet");
 			socket_sendto(&sfd->socket, buf, ret, fsin);
+			atomic64_inc(&ps->stats_out.packets);
+			atomic64_add(&ps->stats_out.bytes, ret);
 		}
 	}
 
@@ -791,9 +869,11 @@ void dtls_shutdown(struct packet_stream *ps) {
 
 	__DBG("dtls_shutdown");
 
+	bool had_dtls = false;
 
 	if (ps->ice_dtls.init) {
 		if (ps->ice_dtls.connected && ps->ice_dtls.ssl) {
+			had_dtls = true;
 			SSL_shutdown(ps->ice_dtls.ssl);
 		}
 		dtls_connection_cleanup(&ps->ice_dtls);
@@ -806,6 +886,7 @@ void dtls_shutdown(struct packet_stream *ps) {
 			continue;
 
 		if (d->connected && d->ssl) {
+			had_dtls = true;
 			SSL_shutdown(d->ssl);
 			dtls(sfd, NULL, &ps->endpoint);
 		}
@@ -821,7 +902,8 @@ void dtls_shutdown(struct packet_stream *ps) {
 		ps->dtls_cert = NULL;
 	}
 
-	call_stream_crypto_reset(ps);
+	if (had_dtls)
+		call_stream_crypto_reset(ps);
 }
 
 void dtls_connection_cleanup(struct dtls_connection *c) {

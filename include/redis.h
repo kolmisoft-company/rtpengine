@@ -107,9 +107,9 @@ void redis_delete_async_loop(void *d);
 
 
 struct redis *redis_new(const endpoint_t *, int, const char *, enum redis_role, int);
+struct redis *redis_dup(const struct redis *r, int db);
 void redis_close(struct redis *r);
 int redis_restore(struct redis *, bool foreign, int db);
-void redis_update(struct call *, struct redis *);
 void redis_update_onekey(struct call *c, struct redis *r);
 void redis_delete(struct call *, struct redis *);
 void redis_wipe(struct redis *);

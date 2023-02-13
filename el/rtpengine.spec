@@ -1,5 +1,5 @@
 Name:		ngcp-rtpengine
-Version:	10.3.0.0+0~mr10.3.0.0
+Version:	11.3.0.0+0~mr11.3.0.0
 Release:	1%{?dist}
 Summary:	The Sipwise NGCP rtpengine daemon
 Group:		System Environment/Daemons
@@ -20,13 +20,15 @@ BuildRequires:	gperf perl-IPC-Cmd
 BuildRequires:	perl-podlators
 BuildRequires:	pkgconfig(libwebsockets)
 BuildRequires:	pkgconfig(spandsp)
+BuildRequires:	pkgconfig(opus)
 Requires(pre):	shadow-utils
 
 %if 0%{?with_transcoding} > 0
-BuildRequires:  ffmpeg-devel
+BuildRequires:	ffmpeg-devel
 Requires(pre):	ffmpeg-libs
 %endif
 
+Requires:	perl-Config-Tiny
 Requires:	nc
 # Remain compat with other installations
 Provides:	ngcp-rtpengine = %{version}-%{release}
@@ -45,7 +47,7 @@ Group:		System Environment/Daemons
 BuildRequires:	gcc make redhat-rpm-config iptables-devel
 Requires:	iptables %{?iptables_ipv6:iptables-ipv6}
 Requires:	%{name}%{?_isa} = %{version}-%{release}
-Requires: 	%{name}-dkms = %{version}-%{release}
+Requires:	%{name}-dkms = %{version}-%{release}
 
 %description kernel
 %{summary}.
@@ -75,9 +77,9 @@ Requires(preun): dkms
 
 %if 0%{?with_transcoding} > 0
 %package recording
-Summary:        The Sipwise NGCP rtpengine recording daemon
-Group:          System Environment/Daemons
-BuildRequires:  gcc make redhat-rpm-config %{mysql_devel_pkg} ffmpeg-devel
+Summary:	The Sipwise NGCP rtpengine recording daemon
+Group:		System Environment/Daemons
+BuildRequires:	gcc make redhat-rpm-config %{mysql_devel_pkg} ffmpeg-devel
 
 %description recording
 The Sipwise rtpengine media proxy has support for exporting media (RTP) packets 
@@ -112,14 +114,14 @@ cd ..
 
 %install
 # Install the userspace daemon
-install -D -p -m755 daemon/%{binname} %{buildroot}%{_sbindir}/%{binname}
+install -D -p -m755 daemon/%{binname} %{buildroot}%{_bindir}/%{binname}
 # Install CLI (command line interface)
-install -D -p -m755 utils/%{binname}-ctl %{buildroot}%{_sbindir}/%{binname}-ctl
+install -D -p -m755 utils/%{binname}-ctl %{buildroot}%{_bindir}/%{binname}-ctl
 # Install helper
 install -D -p -m755 utils/%{binname}-get-table %{buildroot}%{_sbindir}/%{binname}-get-table
 # Install recording daemon
 %if 0%{?with_transcoding} > 0
-install -D -p -m755 recording-daemon/%{binname}-recording %{buildroot}%{_sbindir}/%{binname}-recording
+install -D -p -m755 recording-daemon/%{binname}-recording %{buildroot}%{_bindir}/%{binname}-recording
 %endif
 
 ## Install the init.d script and configuration file
@@ -138,7 +140,7 @@ install -D -p -m644 el/%{binname}-recording.service \
 	%{buildroot}%{_unitdir}/%{binname}-recording.service
 %else
 install -D -p -m755 el/%{binname}-recording.init \
-        %{buildroot}%{_initrddir}/%{name}-recording
+	%{buildroot}%{_initrddir}/%{name}-recording
 %endif
 %endif
 install -D -p -m644 el/%{binname}.sysconfig \
@@ -148,13 +150,14 @@ install -D -p -m644 el/%{binname}-recording.sysconfig \
 	%{buildroot}%{_sysconfdir}/sysconfig/%{binname}-recording
 %endif
 mkdir -p %{buildroot}%{_sharedstatedir}/%{name}
+mkdir -p %{buildroot}%{_var}/lib/%{binname}-recording
 mkdir -p %{buildroot}%{_var}/spool/%{binname}
 
 # Install config files
-install -D -p -m644 etc/%{binname}.sample.conf \
+install -D -p -m644 etc/%{binname}.conf \
 	%{buildroot}%{_sysconfdir}/%{binname}/%{binname}.conf
 %if 0%{?with_transcoding} > 0
-install -D -p -m644 etc/%{binname}-recording.sample.conf \
+install -D -p -m644 etc/%{binname}-recording.conf \
 	%{buildroot}%{_sysconfdir}/%{binname}/%{binname}-recording.conf
 %endif
 
@@ -175,12 +178,6 @@ install -D -p -m644 kernel-module/rtpengine_config.h \
 install -D -p -m644 debian/dkms.conf.in %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/dkms.conf
 sed -i -e "s/__VERSION__/%{version}-%{release}/g" %{buildroot}%{_usrsrc}/%{name}-%{version}-%{release}/dkms.conf
 
-# For RHEL 7, load the compiled kernel module on boot.
-%if 0%{?rhel} == 7
-  install -D -p -m644 kernel-module/xt_RTPENGINE.modules.load.d \
-           %{buildroot}%{_sysconfdir}/modules-load.d/xt_RTPENGINE.conf
-%endif
-
 %pre
 getent group %{name} >/dev/null || /usr/sbin/groupadd -r %{name}
 getent passwd %{name} >/dev/null || /usr/sbin/useradd -r -g %{name} \
@@ -190,9 +187,9 @@ getent passwd %{name} >/dev/null || /usr/sbin/useradd -r -g %{name} \
 %post
 if [ $1 -eq 1 ]; then
 %if 0%{?has_systemd_dirs}
-        systemctl daemon-reload
+  systemctl daemon-reload
 %else
-        /sbin/chkconfig --add %{name} || :
+  /sbin/chkconfig --add %{name} || :
 %endif
 fi
 
@@ -218,12 +215,12 @@ true
 %preun
 if [ $1 = 0 ] ; then
 %if 0%{?has_systemd_dirs}
-        systemctl stop %{binname}.service
-        systemctl disable %{binname}.service
+  systemctl stop %{binname}.service
+  systemctl disable %{binname}.service
 
 %else
-        /sbin/service %{name} stop >/dev/null 2>&1
-        /sbin/chkconfig --del %{name}
+  /sbin/service %{name} stop >/dev/null 2>&1
+  /sbin/chkconfig --del %{name}
 %endif
 fi
 
@@ -235,9 +232,9 @@ true
 
 %files
 # Userspace daemon
-%{_sbindir}/%{binname}
+%{_bindir}/%{binname}
 # CLI (command line interface)
-%{_sbindir}/%{binname}-ctl
+%{_bindir}/%{binname}-ctl
 # CLI table helper
 %{_sbindir}/%{binname}-get-table
 # init.d script and configuration file
@@ -249,12 +246,12 @@ true
 %{_initrddir}/%{name}
 %endif
 %config(noreplace) %{_sysconfdir}/sysconfig/%{binname}
-%attr(0750,%{name},%{name}) %dir %{_sharedstatedir}/%{name}
 # default config
 %config(noreplace) %{_sysconfdir}/%{binname}/%{binname}.conf
+# spool directory
+%attr(0750,%{name},%{name}) %dir %{_var}/spool/%{binname}
 # Documentation
 %doc LICENSE README.md debian/changelog debian/copyright
-
 
 %files kernel
 /%{_lib}/xtables/libxt_RTPENGINE.so
@@ -262,15 +259,12 @@ true
 
 %files dkms
 %{_usrsrc}/%{name}-%{version}-%{release}/
-%if 0%{?rhel} == 7
-  %{_sysconfdir}/modules-load.d/xt_RTPENGINE.conf
-%endif
 
 
 %if 0%{?with_transcoding} > 0
 %files recording
 # Recording daemon
-%{_sbindir}/%{binname}-recording
+%{_bindir}/%{binname}-recording
 # Init script
 %if 0%{?has_systemd_dirs}
 %{_unitdir}/%{binname}-recording.service
@@ -281,12 +275,12 @@ true
 %config(noreplace) %{_sysconfdir}/sysconfig/%{binname}-recording
 # Default config
 %config(noreplace) %{_sysconfdir}/%{binname}/%{binname}-recording.conf
-# spool directory
-%attr(0750,%{name},%{name}) %dir %{_var}/spool/%{binname}
+# recording directory
+%attr(0750,%{name},%{name}) %dir %{_sharedstatedir}/%{binname}-recording
 %endif
 
 %changelog
-* Wed Nov 11 2021 Anton Voylenko <anton.voylenko@novait.com.ua>
+* Thu Nov 11 2021 Anton Voylenko <anton.voylenko@novait.com.ua>
   - update packages metadata
   - remove the "archname" variable
   - do not override service configuration
@@ -308,4 +302,3 @@ true
   - Builds and installs userspace daemon (but no init.d scripts etc yet)
   - Builds and installs the iptables plugin
   - DKMS package for the kernel module
-

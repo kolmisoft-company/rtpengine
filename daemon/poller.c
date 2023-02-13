@@ -19,6 +19,7 @@
 
 #include "aux.h"
 #include "obj.h"
+#include "log_funcs.h"
 
 
 
@@ -365,6 +366,7 @@ static void poller_timers_run(struct poller *p) {
 	for (l = p->timers; l; l = l->next) {
 		ti = l->data;
 		ti->func(ti->obj_ptr);
+		log_info_reset();
 	}
 
 	mutex_lock(&p->timers_add_del_lock);
@@ -384,13 +386,11 @@ int poller_poll(struct poller *p, int timeout) {
 
 	mutex_lock(&p->lock);
 
-	ret = -1;
-	if (!p->items || !p->items_size)
-		goto out;
-
 	mutex_unlock(&p->lock);
 	errno = 0;
+	thread_cancel_enable();
 	ret = epoll_wait(p->fd, evs, sizeof(evs) / sizeof(*evs), timeout);
+	thread_cancel_disable();
 	mutex_lock(&p->lock);
 
 	if (errno == EINTR)
@@ -445,6 +445,7 @@ int poller_poll(struct poller *p, int timeout) {
 
 next:
 		obj_put(it);
+		log_info_reset();
 		mutex_lock(&p->lock);
 	}
 
@@ -571,17 +572,23 @@ int poller_add_timer(struct poller *p, void (*f)(void *), struct obj *o) {
 /* run in thread separate from poller_poll() */
 void poller_timer_loop(void *d) {
 	struct poller *p = d;
-	struct timeval tv;
-	int wt;
 
 	while (!rtpe_shutdown) {
-		gettimeofday(&tv, NULL);
-		if (tv.tv_sec != rtpe_now.tv_sec)
+		// run once a second on top of each second
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		struct timeval next = { rtpe_now.tv_sec + 1, 0 };
+		if (now.tv_sec >= next.tv_sec)
 			goto now;
 
-		wt = 1000000 - tv.tv_usec;
-		wt = MIN(wt, 100000);
-		usleep(wt);
+		long long sleeptime = timeval_diff(&next, &now);
+		if (sleeptime <= 0)
+			goto now;
+
+		thread_cancel_enable();
+		usleep(sleeptime);
+		thread_cancel_disable();
+
 		continue;
 
 now:
@@ -609,7 +616,7 @@ void poller_loop2(void *d) {
 	struct poller *p = d;
 
 	while (!rtpe_shutdown) {
-		int ret = poller_poll(p, 100);
+		int ret = poller_poll(p, thread_sleep_time);
 		if (ret < 0)
 			usleep(20 * 1000);
 	}

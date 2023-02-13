@@ -40,6 +40,7 @@ struct sdp_ng_flags {
 	str metadata;
 	str label;
 	str set_label;
+	str to_label;
 	str address;
 	sockaddr_t xmlrpc_callback;
 	GQueue codec_strip;
@@ -52,7 +53,10 @@ struct sdp_ng_flags {
 	GHashTable *codec_set;
 	int ptime,
 	    rev_ptime;
-	GHashTable *sdes_no;
+	GHashTable *sdes_no;		/* individual crypto suites which are excluded */
+	GHashTable *sdes_only;		/* individual crypto suites which are only accepted */
+	GQueue sdes_order;		/* the order, in which crypto suites are being added to the SDP */
+	GQueue sdes_offerer_pref;	/* preferred crypto suites to be selected for the offerer */
 	str dtls_fingerprint;
 	enum {
 		ICE_DEFAULT = 0,
@@ -75,7 +79,33 @@ struct sdp_ng_flags {
 		MEO_BKW,
 		MEO_BOTH,
 	} media_echo:3;
+	enum {
+		ALL_NONE = 0,
+		ALL_ALL,
+		ALL_OFFER_ANSWER,
+		ALL_NON_OFFER_ANSWER,
+		ALL_FLOWS,
+	} all;
 	enum endpoint_learning el_option;
+	enum block_dtmf_mode block_dtmf_mode;
+	int delay_buffer;
+	GArray *frequencies;
+	int volume;
+	char digit;
+	str trigger;
+	enum block_dtmf_mode block_dtmf_mode_trigger;
+	str trigger_end;
+	enum block_dtmf_mode block_dtmf_mode_trigger_end;
+	int trigger_end_digits;
+	int trigger_end_ms;
+	int dtmf_delay;
+	int repeat_times;
+	str file;
+	str blob;
+	long long db_id;
+	long long duration;
+	long long pause;
+	long long start_pos;
 	unsigned int asymmetric:1,
 	             protocol_accept:1,
 	             no_redis_update:1,
@@ -86,6 +116,7 @@ struct sdp_ng_flags {
 	             replace_origin:1,
 	             replace_sess_conn:1,
 	             replace_sdp_version:1,
+	             force_inc_sdp_ver:1,
 	             replace_username:1,
 	             replace_sess_name:1,
 	             replace_zero_address:1,
@@ -94,6 +125,8 @@ struct sdp_ng_flags {
 	             rtcp_mux_demux:1,
 	             rtcp_mux_accept:1,
 	             rtcp_mux_reject:1,
+		     ice_reject:1,
+		     rtcp_mirror:1,
 		     trickle_ice:1,
 	             no_rtcp_attr:1,
 	             full_rtcp_attr:1,
@@ -105,10 +138,12 @@ struct sdp_ng_flags {
 	             media_handover:1,
 	             dtls_passive:1,
 	             dtls_reverse_passive:1,
-	             osrtp_accept:1,
+	             osrtp_accept_legacy:1,
+	             osrtp_accept_rfc:1,
 	             osrtp_offer:1,
+	             osrtp_offer_legacy:1,
 	             reset:1,
-	             all:1,
+		     egress:1,
 		     siprec:1,
 	             fragment:1,
 	             record_call:1,
@@ -120,6 +155,7 @@ struct sdp_ng_flags {
 		     allow_transcoding:1,
 		     accept_any:1,
 	             inject_dtmf:1,
+		     detect_dtmf:1,
 	             t38_decode:1,
 	             t38_force:1,
 	             t38_stop:1,
@@ -141,7 +177,8 @@ struct sdp_ng_flags {
 	             sdes_authenticated_srtp:1,
 	             sdes_lifetime:1,
 	             sdes_pad:1,
-		     sdes_static:1,
+	             sdes_static:1,
+	             sdes_nonew:1,
 	             drop_traffic_start:1,
 	             drop_traffic_stop:1,
 	             passthrough_on:1,
@@ -173,6 +210,7 @@ const char *call_query_ng(bencode_item_t *, bencode_item_t *);
 const char *call_list_ng(bencode_item_t *, bencode_item_t *);
 const char *call_start_recording_ng(bencode_item_t *, bencode_item_t *);
 const char *call_stop_recording_ng(bencode_item_t *, bencode_item_t *);
+const char *call_pause_recording_ng(bencode_item_t *, bencode_item_t *);
 const char *call_start_forwarding_ng(bencode_item_t *, bencode_item_t *);
 const char *call_stop_forwarding_ng(bencode_item_t *, bencode_item_t *);
 const char *call_block_dtmf_ng(bencode_item_t *, bencode_item_t *);

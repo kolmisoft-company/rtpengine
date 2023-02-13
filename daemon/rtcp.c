@@ -1277,7 +1277,7 @@ static void mos_sr(struct rtcp_process_ctx *ctx, struct sender_report_packet *sr
 	ssrc_sender_report(ctx->mp->media, &ctx->scratch.sr, &ctx->mp->tv);
 }
 static void mos_rr(struct rtcp_process_ctx *ctx, struct report_block *rr) {
-	ssrc_receiver_report(ctx->mp->media, &ctx->scratch.rr, &ctx->mp->tv);
+	ssrc_receiver_report(ctx->mp->media, ctx->mp->sfd, &ctx->scratch.rr, &ctx->mp->tv);
 }
 static void mos_xr_rr_time(struct rtcp_process_ctx *ctx, const struct xr_rb_rr_time *rr) {
 	ssrc_receiver_rr_time(ctx->mp->media, &ctx->scratch.xr_rr, &ctx->mp->tv);
@@ -1449,8 +1449,8 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 	while (rrs->length) {
 		struct ssrc_ctx *s = g_queue_pop_head(rrs);
 		if (i < 30) {
-			struct report_block *rr = (void *) ret->str + ret->len;
-			g_string_set_size(ret, ret->len + sizeof(*rr));
+			g_string_set_size(ret, ret->len + sizeof(struct report_block));
+			struct report_block *rr = (void *) ret->str + ret->len - sizeof(struct report_block);
 
 			// XXX unify with transcode_rr
 
@@ -1503,6 +1503,7 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 		i++;
 	}
 
+	sr = (void *) ret->str; // reacquire ptr after g_string_set_size
 	sr->rtcp.header.count = n;
 	sr->rtcp.header.length = htons((ret->len >> 2) - 1);
 
@@ -1520,8 +1521,8 @@ static GString *rtcp_sender_report(struct ssrc_sender_report *ssr,
 
 	assert(sizeof(*sdes) == 24);
 
-	sdes = (void *) ret->str + ret->len;
 	g_string_set_size(ret, ret->len + sizeof(*sdes));
+	sdes = (void *) ret->str + ret->len - sizeof(*sdes);
 
 	*sdes = (__typeof(*sdes)) {
 		.sdes.header.version = 2,
@@ -1543,7 +1544,6 @@ void rtcp_receiver_reports(GQueue *out, struct ssrc_hash *hash, struct call_mono
 	rwlock_lock_r(&hash->lock);
 	for (GList *l = hash->q.head; l; l = l->next) {
 		struct ssrc_entry_call *e = l->data;
-		//ilog(LOG_DEBUG, "xxxxx %x %i %i %p %p %p", e->h.ssrc, (int) atomic64_get(&e->input_ctx.packets), (int) atomic64_get(&e->output_ctx.packets), ml, e->input_ctx.ref, e->output_ctx.ref);
 		struct ssrc_ctx *i = &e->input_ctx;
 		if (i->ref != ml)
 			continue;
@@ -1561,17 +1561,19 @@ void rtcp_receiver_reports(GQueue *out, struct ssrc_hash *hash, struct call_mono
 void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 	// figure out where to send it
 	struct packet_stream *ps = media->streams.head->data;
+	// crypto context is held separately
+	struct packet_stream *rtcp_ps = media->streams.head->next ? media->streams.head->next->data : ps;
+
 	if (MEDIA_ISSET(media, RTCP_MUX))
 		;
-	else if (!media->streams.head->next)
-		;
 	else {
-		struct packet_stream *next_ps = media->streams.head->next->data;
-		if (PS_ISSET(next_ps, RTCP))
-			ps = next_ps;
+		if (PS_ISSET(rtcp_ps, RTCP))
+			ps = rtcp_ps;
+		else
+			rtcp_ps = ps;
 	}
 
-	if (!ps->selected_sfd)
+	if (!ps->selected_sfd || !rtcp_ps->selected_sfd)
 		return;
 
 	media_update_stats(media);
@@ -1594,7 +1596,20 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 			atomic64_get(&ssrc_out->octets),
 			&rrs, &srrs);
 
-	socket_sendto(&ps->selected_sfd->socket, sr->str, sr->len, &ps->endpoint);
+	// handle crypto
+
+	str rtcp_packet = STR_CONST_INIT_LEN(sr->str, sr->len);
+
+	const struct streamhandler *crypt_handler = determine_handler(&transport_protocols[PROTO_RTP_AVP],
+			media, true);
+
+	if (crypt_handler && crypt_handler->out->rtcp_crypt) {
+		g_string_set_size(sr, sr->len + RTP_BUFFER_TAIL_ROOM);
+		rtcp_packet = STR_CONST_INIT_LEN(sr->str, sr->len - RTP_BUFFER_TAIL_ROOM);
+		crypt_handler->out->rtcp_crypt(&rtcp_packet, ps, ssrc_out);
+	}
+
+	socket_sendto(&ps->selected_sfd->socket, rtcp_packet.s, rtcp_packet.len, &ps->endpoint);
 	g_string_free(sr, TRUE);
 
 	GQueue *sinks = ps->rtp_sinks.length ? &ps->rtp_sinks : &ps->rtcp_sinks;
@@ -1608,7 +1623,7 @@ void rtcp_send_report(struct call_media *media, struct ssrc_ctx *ssrc_out) {
 		ssrc_sender_report(other_media, &ssr, &rtpe_now);
 		for (GList *k = srrs.head; k; k = k->next) {
 			struct ssrc_receiver_report *srr = k->data;
-			ssrc_receiver_report(other_media, srr, &rtpe_now);
+			ssrc_receiver_report(other_media, sink->selected_sfd, srr, &rtpe_now);
 		}
 	}
 	while (srrs.length) {

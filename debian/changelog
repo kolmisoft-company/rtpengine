@@ -1,3 +1,546 @@
+ngcp-rtpengine (11.3.0.0+0~mr11.3.0.0) unstable; urgency=medium
+
+  [ Andreas Granig ]
+  * [3a54a1f] Squashed commit of the following:
+  * [673c241] Only set mqtt alpn if mosquitto lib supports it
+
+  [ Victor Seva ]
+  * [4d148cd] MT#55283 pkg: fix missing systemd template file
+  * [72dad51] TT#14008 websockets test: expose the real problem when connecting
+  * [aab897d] TT#14008 websockets test: skip tests if version is not supported
+
+  [ Richard Fuchs ]
+  * [f0b0fee] MT#55283 don't use frame->linesize for output
+  * [ea51fe1] MT#55283 use env var as test case switch
+  * [ced1467] MT#55447 remove unneeded include
+  * [a65954b] MT#55447 refactor encoder callback struct
+  * [9a3ced0] MT#55283 fix nopacket_relayed_sess stats
+  * [7a5069b] MT#55283 simplify statistics_update_oneway a bit
+  * [e8d3bf5] MT#55283 fix deprecation warning
+  * [f82e0ae] MT#55447 introduce proper a=fmtp parsing
+  * [e0ad15d] MT#55447 change rtp_payload_type_cmp to _eq
+  * [ec2aaf0] MT#55447 support non-exact matching of codecs
+  * [1c03323] MT#55447 refactor codec_add_payload_type
+  * [1ff6813] MT#55447 add payload_type_destroy
+  * [8a169c1] MT#55447 parse out a=fmtp early
+  * [60b8299] MT#55447 amend codec_store_add_*
+  * [7fa0569] MT#55447 add codec_store_find_matching_codecs
+  * [59e4707] MT#55447 take a=fmtp into account for transcode=
+  * [302f7d6] MT#55283 fix legacy protocols
+  * [f772115] MT#55447 take a=fmtp into account for accept=
+  * [114a2b6] MT#55447 support parsing and matching AMR a=fmtp
+  * [c815f35] MT#55447 add dedicated format printing function
+  * [cbecca7] MT#55447 add dedicated codec format answer stub
+  * [0c413b0] MT#55283 add more options to /list output
+  * [7ed04c3] MT#55283 add dedicated "unknown" transport protocol
+  * [e811cd4] MT#55283 don't set RTP flag for legacy protocols
+  * [435e5b6] MT#55283 honour `pt_filter` flag
+  * [5188f24] MT#55524 fix typo
+  * [08a05e7] MT#55524 add thread cancel helper macros
+  * [0c4fc1c] MT#55524 use define for thread sleep time
+  * [c9a5714] MT#55524 work around buggy libasan
+  * [69640db] TT#14008 don't use f'' strings in python tests
+  * [dc1a44f] MT#55447 add support for EVS
+  * [8a99171] MT#55283 allow for delay in kernel mode
+  * [40b4d57] MT#55283 fix `single-codec` with odd codec order
+  * [7e9a62d] MT#55283 explicitly track `skb`
+  * [202d26a] MT#55283 allow recording + blackhole
+  * [f95495d] TT#136957 move rand_code from _send to _recv
+  * [25e2640] TT#136957 support multiple frequencies for `tone`
+  * [fc13d02] TT#136957 reset frequency iter counter
+  * [09550bc] MT#55283 support "replace-" flags alternative
+  * [5a5caf9] MT#55283 remove reciprocal subscriptions
+  * [6f0ad0d] MT#55984 introduce `associated_tags` hash table
+  * [53dbef7] MT#55984 fix call teardown logic
+  * [8712e3b] MT#55984 obsolete `other_tags` table
+  * [8d413f6] MT#55984 obsolete `branches` hash table
+  * [c8171f7] MT#55984 safeguard against possible null return
+  * [afb4255] MT#55984 cancel scheduled deletion during offer/answer
+  * [f976f21] MT#56008 switch to fractional clock rate factor
+  * [0114728] MT#56008 support variable clock rate factors
+  * [e7b9ab2] MT#56008 fix G.722 ptime/multiplier confusion
+  * [9c54e97] MT#56008 support encoded-selected clock rates
+  * [bb2316d] MT#56008 use libopus directly
+  * [52dd832] MT#56008 support different Opus "applications"
+  * [0448e12] MT#56008 use hashed string lookup in codeclib.c
+  * [0630ab7] MT#55283 add time-fudging helper .so
+  * [04f9cd8] MT#55283 fix time tracking race condition
+  * [ee941cd] MT#56008 add EVS mode clamping function
+  * [8737d19] MT#56008 support encoder-selected clock rate for EVS
+  * [2f4ed35] MT#55283 relax tests-preload.so AF check
+  * [3bdb434] MT#55283 add extra output on fatal error
+  * [40a1741] MT#54294 mandate "const" codec_def_t
+  * [2565336] MT#56008 extend encoder format selection
+  * [47ba87b] MT#56008 allow Opus single-channel encoding
+  * [edeb41d] MT#56008 decoder-selected clock rates and channels
+  * [b02cced] MT#56126 fix tests for Stretch etc
+  * [797fc0e] MT#55283 provide "make install" targets
+  * [d16e9c5] MT#55283 list libopus as a build requirement
+  * [38b0351] MT#55283 add minimum_ptime codec attribute
+  * [4009d58] MT#55283 don't crash on packet underflows
+  * [5a2981b] MT#55283 shortcut a=fingerprint printing
+  * [8f17f14] MT#55283 support generating a=tls-id
+  * [af37022] MT#55283 split up __fingerprint_changed()
+  * [819f1a0] MT#55283 use signed integers to prevent underflows
+  * [af0db8f] MT#55283 refactor mqtt packet/SSRC stats
+  * [c81859f] MT#55283 fix SSRC stats tracking
+  * [2cf74b6] MT#55283 add media player stats to MQTT
+  * [f642a9e] MT#55283 move __ensure_codec_handler call
+  * [70ef2f1] MT#55283 separate destination PT determination
+  * [2b31fea] MT#55283 determine dest PT early
+  * [54f797c] MT#55283 store AVStream in media_player
+  * [a3b30f0] MT#55283 split out media_player_coder
+  * [f885284] MT#55283 abstract out some _coder code
+  * [fe57810] MT#55283 add repeat-times auto test
+  * [bec9975] MT#55283 abstract RTP sending and scheduling
+  * [cf12ffc] MT#55283 support buffered media player
+  * [ca09549] MT#55283 fix coverity false positive
+  * [973dc67] MT#55283 fix backports
+  * [57ae65c] TT#146201 remove unused function arguments
+
+  [ Stefan Mititelu ]
+  * [abc2630] Send metadata mid-call
+
+  [ Dup4 ]
+  * [ad5d98e] MT#55283 Squashed commit of the following:
+
+  [ Damir Nedžibović ]
+  * [bab3c94] Implement playing from a start position.
+  * [dd2956d] Implement playing from a given position for db and blob.
+
+  [ Donat Zenichev ]
+  * [eb9aae1] MT#55897 Document general objects in RTPEgnine code (part 1)
+  * [919e3d1] MT#55897 Introduce 'assets' folder for repository resources
+  * [47375c5] MT#55897 Document general objects/funcs in RTPEgnine code (part 2)
+  * [50ba97b] MT#56129 Add a flag to force increasing the SDP version
+  * [3db66a5] MT#55897 Add a diagram for the 'Flags and options parsing' chapter
+  * [3ba1f54] MT#56125 Add a flag to only accept/add allowed SDES crypto suits
+  * [6dcda68] MT#56125 Move sdes_no / sdes_only checks to a separate function
+  * [4f3468c] MT#56125 Update the readme for the 'SDES-no' and 'SDES-only' flags
+  * [2f8e6a5] MT#56126 Introduce a new helper function for parsing flags
+  * [bffd5c9] MT#56126 New function: crypto_params_sdes_cmp()
+  * [8595f95] MT#56126 Introduce a preference list for crypto suites
+  * [40a0451] MT#56126 Add more tests to cover new 'SDES-order:' option flag
+  * [aaff886] MT#56126 Fix a defect noticed by Cov.Scan (introduced by: 8595f95)
+  * [83fc4c9] MT#56127 Improve the way we accept crypto suites
+
+  [ H. Yavari ]
+  * [3934534] added EVS 3GPP references
+
+  [ Michael Prokop ]
+  * [6515067] MT#56190 Adjust init scripts for shellcheck v0.9.0
+
+  [ Denial ]
+  * [7480ae8] add mix_num_inputs variable to config file
+  * [d751bca] add mix_num_inputs variable to config file
+
+  [ Дилян Палаузов ]
+  * [756fbb8] rtpengine.pod: add dtx to «Some (if not all) logging subsystems»
+  * [a7a9da8] make install: put libxt_RTPENGINE.so and xt_RTPENGINE.ko on the right places
+  * [92ef924] kernel-module/Makefile: install - create the /lib/modules/…/updates directory
+  * [4878540] MT#55283 make install - the man pages
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Tue, 17 Jan 2023 17:45:22 +0100
+
+ngcp-rtpengine (11.2.0.0+0~mr11.2.0.0) unstable; urgency=medium
+
+  [ Richard Fuchs ]
+  * [6d26df0] TT#189900 fix SSRC tracking indexing
+  * [85ec6e2] TT#189900 use explicit flag to enable kernel SSRC tracking
+  * [02adda7] TT#14008 fix no-transcoding compilation
+  * [9eb7b64] TT#14008 add explicit lws_cancel_service at shutdown
+  * [3ac4863] TT#14008 don't try to offer RTCP after previous mux
+  * [81a80f8] TT#14008 add test for GH #1494
+  * [c109644] TT#189201 change block/silence media flags to bool
+  * [ba56e37] TT#189201 unify media blocking/silencing interface functions
+  * [7be1d0a] TT#189201 refactor sink/handler attributes
+  * [2463c5e] TT#189201 simplify attrs handling in __init_streams
+  * [9e22709] TT#189201 add convenience function call_get_call_subscription
+  * [0b8d74a] TT#189201 preserve existing attributes after repeated offer/answer
+  * [1699c90] TT#189201 refactor __add_subscription arguments
+  * [d7ef87d] TT#189201 clear "no kernel support" flag on demand
+  * [f316dea] TT#189201 retain list of sorted payload types
+  * [1efc3d9] TT#189201 move kernel media silencing from input to output
+  * [4a19714] TT#189201 support per-sink media blocking/silencing
+  * [71a5cec] TT#189201 allow `to-label` usage for media blocking
+  * [d492268] TT#189201 upgrade `all` flag to key/value and enum
+  * [354c4ea] TT#189201 add extra `all=` options for media blocking
+  * [103901e] TT#44805 sort keys in script output
+  * [e7abe3b] TT#44805 rename `stats` to `stats_in`
+  * [265067b] TT#44805 refactor stats keeping macro to allow flexbility
+  * [387895b] TT#44805 add bookkeeping for output stream stats
+  * [b8ccbcc] TT#14008 clarify codec options for `publish`
+  * [1add191] MT#55283 kernel module: compile fix for RHEL 9.x
+  * [1ee1f14] MT#55283 remove obsolete backports manipulation
+  * [6432a45] MT#55283 remove bullseye backports manipulation
+  * [c53f213] MT#55283 fix iptables install path for backports
+  * [84c1198] MT#55283 update pointer argument to const
+  * [9e09cf3] MT#55283 fix padding/SRTP order
+  * [dc395d5] MT#55283 typo fix for I6aecff636efd420401856bb8110b3d784f989179
+  * [06efa83] MT#55283 fix AVFrame linesize after resampling
+  * [fd545cd] MT#55283 close recording SSRCs early
+  * [5d17e5e] MT#55283 fix compiler warning
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Tue, 04 Oct 2022 13:52:33 +0200
+
+ngcp-rtpengine (11.1.0.0+0~mr11.1.0.0) unstable; urgency=medium
+
+  [ Michael Prokop ]
+  * [2166590] TT#124273 GitHub actions: enable Ubuntu PPA for debhelper backport
+  * [b657af1] TT#124273 GitHub actions: use pkg script for execution
+  * [e425e82] TT#71950 Fix typos
+  * [81a9366] TT#182450 systemd hardening: mention required capabilities when running as root
+  * [26bf2b0] TT#182450 systemd hardening: allow R/W access to /var/spool/rtpengine
+  * [fd2dfd0] TT#182450 systemd: allow LimitMEMLOCK usage for secure memory usage by libgcrypt
+  * [64650e6] TT#182450 debian/ngcp-rtpengine-*.postinst: fix shellcheck issues
+
+  [ Nick Hainke ]
+  * [2a6d5cd] fix compilation with iptables 1.8.8
+
+  [ Richard Fuchs ]
+  * [17bda4b] TT#156900 fix master/slave race condition with early closed ports
+  * [447f0f5] TT#14008 test correct port for rejected stream
+  * [e157fe1] TT#14008 update some int types to bool
+  * [5d33a42] TT#14008 websockets test: update for Python 3.10
+  * [b057a2b] TT#14008 retain "codec touched" status after answer
+  * [7b8fa51] TT#14008 ICE test robustness
+  * [38ebbfc] TT#14008 add additional log_info_reset
+  * [59a16e7] TT#14008 add log_info_pop_until()
+  * [de8b3d5] TT#182450 manage /var/spool/rtpengine in rtpengine-daemon
+  * [3139a8a] TT#14008 DTX buffer PT change: take supp PTs into account
+  * [12d59b0] TT#185100 fix codec-set with bitrate for Opus
+  * [343bde8] TT#185100 update int type to bool
+  * [58b4173] TT#185100 Perl syntax fixes
+  * [0870181] TT#185100 support setting opus encoding complexity
+  * [e683b81] TT#14008 fix possible AMR decoder mem leak
+  * [19c8d1e] TT#14008 change Redis restore order
+  * [40ba019] TT#14008 solve Redis restore race condition
+  * [5df21de] TT#14008 skip free list when allocating requested port
+  * [206ea9e] TT#14008 update for ffmpeg 5.1+
+  * [98a5270] TT#14008 update int type to bool
+  * [6e0c4f3] TT#14008 fix mem leak
+  * [6b5a8f5] TT#178352 generalise metrics gathering and printing
+  * [ae0971a] TT#178400 ignore implausibly large jitter values
+  * [9b4669d] TT#178352 export additional VoIP metrics
+  * [e29835b] TT#178352 report additional metrics at end of call
+  * [778ec46] TT#178400 support reporting out measured jitter
+  * [0558cfb] TT#178400 collect and report RTP sequencing metrics
+  * [a11cb4a] TT#14008 fix typo in man page
+  * [7d5c9f2] TT#14008 don't use zero connection addresses on ICE enabled media
+  * [9e95681] TT#14008 fix typo
+
+  [ Chris Lamb ]
+  * [821fbf7] make the build reproducible
+
+  [ Stefan Mititelu ]
+  * [3813821] Add 'all' recording method
+
+  [ Victor Seva ]
+  * [9ec69c5] TT#182950 pkg/deb: add ubuntu jammy support
+  * [9cd3cc7] TT#186700 systemd template units
+
+  [ Guillem Jover ]
+  * [d8388f0] TT#124273 Fix building arch:all packages
+
+  [ S-P Chan ]
+  * [b649aaa] rtpengine.service: match installation location in /usr/bin
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Mon, 22 Aug 2022 20:03:19 +0200
+
+ngcp-rtpengine (11.0.0.0+0~mr11.0.0.0) unstable; urgency=medium
+
+  [ Richard Fuchs ]
+  * [a3062b5] TT#14008 install binaries in /usr/bin
+  * [2b74e64] TT#14008 prevent double-free of MKI
+  * [bf8cb9f] TT#155900 remove obsolete function argument
+  * [c0d9f84] TT#14008 rename instance of `func` for clarity
+  * [2240921] TT#136957 use separate sequencer per sink/destination
+  * [0518cbd] TT#155900 store subscriptions to Redis with options
+  * [50b8f54] TT#155900 add `RTCP mirror` flag
+  * [c6e7cc5] TT#136957 refactor __send_timer_send_common
+  * [ac4f9de] TT#136957 rename sink variable for clarity
+  * [84fed5c] TT#136957 obsolete TRANSCODE flag
+  * [d055a5d] TT#136957 add `egress` subscription support
+  * [4deff72] TT#136957 don't remove DTMF PT from SDP with DTMF-delay active
+  * [f160a30] TT#136957 update kernel module after 84fed5ca
+  * [aac9f99] TT#14008 fix possible NULL pointer deref
+  * [af948b4] TT#172650 don't segfault if no DTLS cert is available
+  * [008c4c7] TT#172650 update dtls_signature field to enum
+  * [25bf003] TT#172650 add missing options in docs and sample config
+  * [4ce91f5] TT#172650 use custom software ID string for cert CN
+  * [b171029] TT#172650 don't double free RSA key in case of failure
+  * [cf076fc] TT#172650 support EC keys for DTLS certificate
+  * [aed9279] TT#172650 update for OpenSSL >= 3.0
+  * [71c91ae] TT#14008 add missing auto-cleanup for flags in play_media_select_party
+  * [eb68314] TT#14008 allow passing flags obj to play_media_select_party
+  * [e8f16db] TT#14008 offload flags parsing for play_dtmf/media
+  * [7b594c3] TT#14008 skip codec answer routine for rejected media
+  * [b907dea] TT#14008 fix "Connection: Close" HTTP breakage
+  * [5e18648] TT#14008 restart DTX and delay buffers after shutdown
+  * [442b26e] TT#173752 support per-tag metadata for recording
+  * [667c154] TT#14008 handle possible NULL dtxp->packet
+  * [9ba0dd9] TT#14008 fix TLS-send-only w/o recording scenario
+  * [2137618] TT#14008 don't open a mixed output file unless recording is on
+  * [e0e9bdc] TT#14008 remove unused arguments
+  * [0da7a06] TT#14008 fix Redis restore logic re legacy format
+  * [74075f6] TT#14008 shut down DTX buffer when payload type changes
+  * [fd08351] TT#89352 document Janus replacement mode in README
+  * [2b7a1a1] TT#14008 use interrupt-safe lock for ssrc_stats_lock
+  * [314c6f6] TT#14008 fix test for different G.722 encodings
+
+  [ Michael Prokop ]
+  * [ffd11fa] TT#14008 Update RPM configs + README for /usr/bin usage
+  * [91169cc] TT#157800 Add CAP_CHOWN capabilities to recording-daemon
+  * [3f1a3d5] TT#76552 Harden ngcp-rtpengine-daemon service
+  * [16693a4] TT#124273 GitHub actions: upgrade from buster to bullseye
+
+  [ szcom ]
+  * [11098d8] TT#14008 dont look at null packets
+
+  [ Guillem Jover ]
+  * [4beedbf] TT#124273 debian: Remove module-assistant support
+  * [0432926] TT#124273 debian: Mark non-kernel-module packages as Multi-Arch:foreign
+  * [cb47e89] TT#124273 debian: Switch to Standards-Version 4.5.1
+  * [bbfaf2f] TT#124273 debian: Update copyright years
+  * [a4ee01d] TT#124273 Update packaging for bullseye
+  * [2f15811] TT#124273 Use execute_after/before_ instead of override_ for dh command
+
+  [ Victor Seva ]
+  * [10060d3] TT#124273 add missing manpages
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Tue, 07 Jun 2022 11:45:39 +0200
+
+ngcp-rtpengine (10.5.0.0+0~mr10.5.0.0) unstable; urgency=medium
+
+  [ Richard Fuchs ]
+  * [54ee927] TT#14008 fix websockets test for older python3
+  * [8d99ef0] TT#14008 use glib allocators for LWS setup
+  * [6d0eba9] TT#157801 explicitly handle v4/v6 also for libwebsockets
+  * [db0dbd3] TT#157801 skip libwebsockets IPv6 bindings if not available
+  * [d3d11c1] TT#157801 don't tell libwebsockets to bind to ADDR_ANY twice
+  * [da5b7ab] TT#136957 add DTMF-delay= options to CLI script
+  * [1bc15de] TT#14008 prevent possible NULL dereference
+  * [261e6a6] TT#14008 disable unstable tests
+  * [30c2de8] TT#157800 run rtpengine as non-root
+  * [cfaa029] TT#14008 don't use internal function when not necessary
+  * [c42af68] TT#14008 always unkernelize before closing sockets
+  * [3c1f4b1] TT#14008 remember last used local socket for reporting purposes
+  * [e923616] TT#14008 fix segfault using legacy UDP protocol
+  * [533d4b7] TT#14008 remove obsolete config option
+  * [ca83df7] TT#14008 provide a more complete default config file
+  * [a834572] TT#14008 fix typo
+  * [6d1dfab] TT#14008 convert logging context to stack
+  * [6a0961f] TT#14008 perform ROC guessing also for AEAD
+  * [258f02b] TT#14008 add extra logging for packet recv/send
+  * [4a173c2] TT#14008 fix erroneous crypto reset after rejecting DTLS
+  * [f738752] TT#14008 add packaging for Debian Stretch
+  * [23f5660] TT#14008 unload kernel module after shutdown
+  * [6c96993] TT#162750 add tests for TT#162750
+  * [3c00a60] TT#14008 anonymise addresses used in tests
+  * [3fbdb49] TT#14008 set package-specific home for non-NGCP packaging
+  * [198754e] TT#14008 emit log messages for ROC resets
+  * [4eecec9] TT#156900 add extra check for closed socket
+  * [4080151] TT#14008 fix SRTP index not being updated from kernel
+  * [014301b] TT#14008 add extra logging for SRTP/SSRC updates
+  * [fd7a6b3] TT#14008 add test for ROC reset
+  * [3571fb1] TT#14008 remove obsolete plugins location define
+  * [866d3da] TT#14008 fix logic test for SSRC substitution
+  * [f8216b7] TT#14008 update supported flags in ng script
+  * [22d8db9] TT#14008 don't accept stray answer codecs that were not offered
+  * [6d5bc8c] TT#156900 enable single-port use with rtcp-mux=demux/accept
+  * [4658b90] TT#14008 don't open extra interface ports when ICE is not in use
+  * [a26601a] TT#14008 add new `reject-ICE` flag
+  * [e59c062] TT#14008 allow ICE reset only during an offer
+  * [97e8c1d] TT#109800 fix mismatched CN generator format
+  * [b259af6] TT#136957 double free fix for 3a90f4438
+  * [d172f20] TT#14008 update for kernels >= 5.17
+  * [6466416] TT#14008 typo fix for d172f20b
+  * [429e3da] TT#14008 fix ports mixed up in tests
+  * [85fa5a8] TT#14008 ignore cross-family endpoint changes for ICE
+  * [45a3065] TT#14008 return logical interface matching the address family
+  * [fa130dd] TT#14008 only reset SRTP ROC when doing RTP reset
+  * [2645375] TT#14008 don't skip parsing a=rtcp with a=rtcp-mux
+  * [e37871c] TT#14008 better logging for ICE completion
+  * [f327b5b] TT#14008 silence compiler warning
+  * [b9f9d1d] TT#14008 eliminate unnecessary and pointless abort()
+  * [aae30a4] TT#14008 fix possible use-after-free
+  * [0bd80f4] TT#14008 fix test race condition
+  * [799773b] TT#14008 fix format list printing logic
+  * [16583ef] TT#166107 fix stray ICE reset with rtcp-mux=require
+  * [e46fdf0] TT#162850 delete DB entries without matching streams
+  * [626defa] TT#14008 eliminate compiler warning
+  * [abc7944] TT#14008 shut down codec background tasks during re-invites
+  * [8467cc0] TT#14008 fix duplicate mutex_destroy
+  * [5b2fec7] TT#14008 flag coverity false positive
+  * [5005cc3] TT#14008 handle HMAC() returning error
+  * [87e283f] TT#14008 fix integer handling/overflow
+  * [dd38ff2] TT#14008 silence coverity warning
+  * [d06460d] TT#14008 add additional NULL checks for `flags`
+  * [b2ae39a] TT#14008 fix unaligned 64-bit memory access
+  * [5a23422] TT#14008 remove unneeded perl module usage
+  * [3d18cff] TT#14008 more quiet test output
+  * [a67525e] TT#14008 generalise sub stun_succ
+  * [24ed843] TT#14008 keep track of ICE candidates based on their priorities
+  * [89f5a98] TT#14008 attempt to match ICE foundations for learned prflx cands
+  * [5d923ed] TT#14008 tests for 89f5a988
+  * [44e06b8] TT#14008 fix man page typo
+  * [f869c23] TT#14008 add new "reject-invalid-sdp" option
+
+  [ Anton Voylenko ]
+  * [09527f6] FIx bogus date
+  * [b2ef2a7] Following configuration rename
+  * [0d495c2] Run services as non root user
+  * [79a461f] Fix segfault when 'tls-send-to' option not set
+
+  [ Michael Prokop ]
+  * [378c791] TT#14008 Shellcheck fixes
+
+  [ Stefan Mititelu ]
+  * [c485408] Add more info about ok/failed t tests
+
+  [ Razvan Crainea ]
+  * [9c62de8] provide sendrecv mode in siprec tag-medias and media-labels
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Thu, 31 Mar 2022 00:02:18 +0200
+
+ngcp-rtpengine (10.4.0.0+0~mr10.4.0.0) unstable; urgency=medium
+
+  [ antonvoylenko ]
+  * [7b04aa2] Tune RPM building
+
+  [ Richard Fuchs ]
+  * [179b7ed] TT#14008 fix possible segfault
+  * [0c95b12] TT#151150 don't call __get_logical_interface with NULL name
+  * [835ba08] TT#14008 handle NULL selected_sfd in rtcp_send_report
+  * [80e0021] TT#14008 rate limit error messages from sendmsg
+  * [ba14e05] TT#14008 use correct accumulator for managed_sess and avg call duration
+  * [56d4ff7] TT#14008 add config knob for max log line length
+  * [271a2a2] TT#14008 fix local SDP copy incorrectly returned from function
+  * [9c2b53b] TT#147800 don't clutter output dict with empty SSRC entries
+  * [5ed13a1] TT#124273 remove `rtpengine-kernel` Debian package name
+  * [30c124f] TT#124273 use symlinks instead of Install/Alias for aliases
+  * [bbfe168] TT#124273 add non-NGCP Debian packaging
+  * [ca0c699] TT#113650 support "active-replica" alternative to "master"
+  * [e6405c4] TT#14008 add locking for `bypass_seq` case
+  * [190a9e9] TT#14008 allow null TABLE variable
+  * [730cc64] TT#14008 eliminate duplicate DTMF reports when forking media
+  * [a3f2781] TT#147451 refactor media_block_match
+  * [4cbeb15] TT#147451 obsolete necessity for `from-tag` in unsub/sub ans
+  * [4f70536] TT#136952 test-transcode: hold reference to mock call
+  * [bcb912b] TT#136952 allow passing user data to ssrc_hash_foreach
+  * [740bdb4] TT#136957 reset SSRC sequencers when going to transcoding
+  * [31ad47a] TT#136952 split up call info CLI writer
+  * [ef141e6] TT#136952 split up CLI tag info writer
+  * [ea7d04a] TT#136952 add CLI options to manipulate calls and tags
+  * [fdb529e] TT#136955 refactor DTMF event reporting
+  * [61ad51b] TT#136955 only do DTMF event output if we have a PT
+  * [a1a0b03] TT#136956 refactor DTMF frequency generator code
+  * [fbf6491] TT#136956 convert pow() usage to lookup table
+  * [2e5a5f6] TT#147451 rename helper function
+  * [77be8a0] TT#136952 add convenience function to reset all codec handlers
+  * [a7e22ba] TT#147451 add support for multi-ml subscriptions
+  * [f1d37e9] TT#147451 add support for SIPREC style SDPs
+  * [0043814] TT#14008 improve pseudo string hash for YCM
+  * [72504a0] TT#14008 null-proof string hashing and address parsing
+  * [16f2f9a] TT#14008 switch from repeated hash lookups to list iterator
+  * [e11407a] TT#144701 support JSON in NG protocol
+  * [11549cc] TT#144701 support JSON in tests and CLI tool
+  * [219982b] TT#14008 call g_string_set_size before grabbing pointer
+  * [aea33b7] TT#14008 switch must_recrypt argument to bool
+  * [9c0d233] TT#14008 support SRTCP with generate-RTCP
+  * [75ddfd4] TT#14008 add tests for SRTCP generation
+  * [f613cf6] TT#156052 rename total_calls_duration to _intv
+  * [45cb995] TT#156052 add call->destroyed timestamp
+  * [49b79e8] TT#156052 use `destroyed` timestamp for call duration stats
+  * [970757d] TT#156052 add call duration metric to Prom
+  * [7b5b52e] TT#156052 add MOS stats to stats output
+  * [8b79a60] TT#156052 add call duration stddev metric
+  * [9be9ceb] TT#156052 set `destroyed` TS also for delayed deletes
+  * [757cee2] TT#136957 correctly schedule send-now RTP packets
+  * [912524a] TT#136957 use scheduled timestamp when running timers
+  * [f79593e] TT#136957 use output PT clock rate instead of encoder clock rate
+  * [3535d96] TT#136957 fix TS tracking with supplemental codecs
+  * [cf7dcb3] TT#14008 add fallback if codec list is empty
+  * [43523b8] TT#146201 fix kernel test script
+  * [649fdb9] TT#146201 fix incorrect variable used in proc_list_show
+  * [4c2c50d] TT#14008 update for YCM config
+  * [31e41d1] TT#14008 fix poller-per-thread behaviour
+  * [3732354] TT#14008 suppress ICE attribute warning
+  * [f5a148f] TT#14008 change local ICE ufrag/pwd after ICE restart
+  * [aad3fb3] TT#157801 support "any" interface config
+  * [12f23b3] TT#157801 shift handling of v4/v6 addresses
+  * [6b65131] TT#157800 support file mode mask for /proc interface
+  * [2e578d4] TT#157800 add dependency recording-daemon -> daemon
+  * [838433d] TT#157801 add working default config
+  * [8e8e78a] TT#136952 add new delay_buffer struct
+  * [19a5d3c] TT#136953 use delay_buffer for passthrough streams
+  * [a22c3a5] TT#136952 add CLI command to set delay buffer
+  * [975cd33] TT#136954 switch pcm_dtmf_detect to bool type
+  * [e7edfc0] TT#136954 add explicit flag to en/disable DTMF detection
+  * [ba556db] TT#136955 tie in DSP DTMF events with other DTMF reporting
+  * [1ce4f66] TT#136955 trigger DTMF state also when decoding DTMF to PCM
+  * [478c260] TT#136956 upgrade `block_dtmf` to enum to allow for different modes
+  * [38f97c2] TT#136956 support DTMF silence replacement
+  * [20ae998] TT#136956 flush delay buffer at shutdown
+  * [320642d] TT#136956 support DTMF-security=tone
+  * [9da5a46] TT#136956 support DTMF-security=random
+  * [efcd137] TT#136956 add tests for DTMF-security
+  * [5767746] TT#136956 add support for DTMF-security=zero
+  * [9608ae6] TT#136956 refactor DTMF block mode setting function
+  * [6ac4f12] TT#136956 add more options for DTMF replacement
+  * [2ca6434] TT#136957 support DTMF triggers for blocking
+  * [3a90f44] TT#136957 peg seq num tracking to position in delay buffer
+  * [c794c00] TT#136957 refactor DTMF event tracking into a list
+  * [1ef4eeb] TT#136957 split up DTMF event queue into in and out
+  * [3582b62] TT#136957 DTMF delay support
+  * [6d85fb6] TT#136957 tests for delay timing
+  * [a684025] TT#14008 avoid pointless open/close of kernel list
+  * [b1d17cd] TT#14008 use pthread_cancel semantics for shutdown
+  * [cf34ecc] TT#156900 rename functions to avoid namespace conflict
+  * [941a50e] TT#156900 add helper functions and macros
+  * [6b85138] TT#14008 use stream_open for main kernel interface
+  * [c1d238b] TT#144701 extra warnings for unknown flags and keys
+  * [2a58426] TT#155900 update phc flags to bool type
+  * [ee5d01b] TT#155900 add tests to make sure no packet was received
+  * [5fc658e] Squashed commit of the following:
+  * [45a9ce3] TT#156900 track local media sockets in hash table
+  * [d199199] TT#156900 eliminate helper hash table in timer iterator
+  * [6f8ad8f] TT#156900 close sockets on branch deletion
+  * [2d2d766] TT#156900 support single/odd ports for RTCP-mux
+  * [88c6568] TT#14008 Fix use-after-free
+  * [1ccb8de] TT#14008 fix warning as `value` cannot be NULL
+  * [28e3ca3] TT#14008 fix possible NULL pointer dereference
+  * [0cc41a5] TT#14008 fix warning as `output_ch` cannot be NULL
+  * [4be6ff2] TT#14008 fix warning as `ch` cannot be NULL
+  * [60fe710] TT#14008 fix possible unintentional integer overflow
+  * [7836035] TT#14008 fix double mutex unlock
+  * [b8a554c] TT#14008 fix kernel module compilation for older kernels
+
+  [ John Burke ]
+  * [fab19ed] Add support for endpoint-learning on a per call basis
+
+  [ Victor Seva ]
+  * [23d0dad] TT#124273 fix typos detected by lintian
+  * [6e7aab6] TT#124273 pkg: use backports scripts to generate different flavours
+  * [9e2bf2b] TT#124273 pkg: add ubuntu focal support
+  * [bc09e94] TT#124273 pkg/deb/generator.sh
+
+  [ Stefan Mititelu ]
+  * [7adf6ac] Add 'seconds' to some stats duration
+  * [528e108] Add new graphite-timeout parameter
+
+  [ Ryan Fowler ]
+  * [61b0e3d] Fix README typo
+
+  [ Michael Prokop ]
+  * [0f1dd7b] TT#108003 GH coverity workflow: ensure to use up2date repository
+
+  [ hdikme ]
+  * [85ec0fa] TT#14008 send NG command stats count to Graphite
+  * [b79fc34] TT#14008 fix possible NULL pointer dereference
+
+ -- Sipwise Jenkins Builder <jenkins@sipwise.com>  Mon, 24 Jan 2022 16:58:18 +0100
+
 ngcp-rtpengine (10.3.0.0+0~mr10.3.0.0) unstable; urgency=medium
 
   [ Richard Fuchs ]

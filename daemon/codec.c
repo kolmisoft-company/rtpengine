@@ -17,6 +17,9 @@
 #include "timerthread.h"
 #include "log_funcs.h"
 #include "mqtt.h"
+#ifdef WITH_TRANSCODING
+#include "fix_frame_channel_layout.h"
+#endif
 
 
 
@@ -24,7 +27,7 @@
 struct codec_timer {
 	struct timerthread_obj tt_obj;
 	struct timeval next;
-	void (*func)(struct codec_timer *);
+	void (*timer_func)(struct codec_timer *);
 };
 struct mqtt_timer {
 	struct codec_timer ct;
@@ -32,6 +35,17 @@ struct mqtt_timer {
 	struct call *call;
 	struct call_media *media;
 };
+struct timer_callback {
+	struct codec_timer ct;
+	void (*timer_callback_func)(struct call *, void *);
+	struct call *call;
+	void *ptr;
+};
+
+typedef void (*raw_input_func_t)(struct media_packet *mp, unsigned int);
+
+static void __buffer_delay_raw(struct delay_buffer *dbuf, struct codec_handler *handler,
+		raw_input_func_t input_func, struct media_packet *mp, unsigned int clockrate);
 
 
 static codec_handler_func handler_func_passthrough;
@@ -46,7 +60,7 @@ static void codec_calc_lost(struct ssrc_ctx *ssrc, uint16_t seq);
 static struct codec_handler codec_handler_stub = {
 	.source_pt.payload_type = -1,
 	.dest_pt.payload_type = -1,
-	.func = handler_func_passthrough,
+	.handler_func = handler_func_passthrough,
 	.kernelize = 1,
 	.passthrough = 1,
 };
@@ -109,8 +123,41 @@ struct dtx_packet {
 	struct media_packet mp;
 	struct codec_ssrc_handler *decoder_handler; // holds reference
 	struct codec_ssrc_handler *input_handler; // holds reference
-	int (*func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+	int (*dtx_func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 			struct transcode_packet *packet, struct media_packet *mp);
+};
+
+typedef int (*encoder_input_func_t)(encoder_t *enc, AVFrame *frame,
+		int (*callback)(encoder_t *, void *u1, void *u2), void *u1, void *u2);
+typedef int (*packet_input_func_t)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+		struct transcode_packet *packet,
+		unsigned long ts_delay,
+		int payload_type,
+		struct media_packet *mp);
+
+struct delay_buffer {
+	struct codec_timer ct;
+	struct call *call;
+	struct codec_handler *handler;
+	mutex_t lock;
+	unsigned int delay;
+	GQueue frames; // in reverse order: newest packet first, oldest last
+};
+struct delay_frame {
+	AVFrame *frame;
+	struct media_packet mp;
+	struct transcode_packet *packet;
+	unsigned long ts_delay;
+	int payload_type;
+	unsigned int clockrate;
+	uint32_t ts;
+	encoder_input_func_t encoder_func;
+	raw_input_func_t raw_func;
+	packet_input_func_t packet_func;
+	struct codec_handler *handler;
+	struct codec_ssrc_handler *ch;
+	struct codec_ssrc_handler *input_ch;
+	int seq_adj;
 };
 
 struct silence_event {
@@ -127,11 +174,7 @@ struct codec_ssrc_handler {
 	int bitrate;
 	int ptime;
 	int bytes_per_packet;
-	unsigned long first_ts; // for output TS scaling
-	unsigned long last_ts; // to detect input lag and handle lost packets
-	struct timeval first_send;
-	unsigned long first_send_ts;
-	long output_skew;
+	struct codec_scheduler csch;
 	GString *sample_buffer;
 	struct dtx_buffer *dtx_buffer;
 
@@ -141,7 +184,8 @@ struct codec_ssrc_handler {
 	format_t dtmf_format;
 	uint64_t dtmf_ts, last_dtmf_event_ts;
 	GQueue dtmf_events;
-	struct dtmf_event dtmf_event;
+	struct dtmf_event dtmf_event; // for replacing PCM with DTMF event
+	struct dtmf_event dtmf_state; // state tracker for DTMF actions
 
 	// silence detection
 	GQueue silence_events;
@@ -162,7 +206,7 @@ struct transcode_packet {
 	struct codec_handler *handler;
 	unsigned int marker:1,
 	             bypass_seq:1;
-	int (*func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *, struct transcode_packet *,
+	int (*packet_func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *, struct transcode_packet *,
 			struct media_packet *);
 	int (*dup_func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *, struct transcode_packet *,
 			struct media_packet *);
@@ -208,17 +252,32 @@ static void codec_touched(struct codec_store *cs, struct rtp_payload_type *pt);
 static int __buffer_dtx(struct dtx_buffer *dtxb, struct codec_ssrc_handler *ch,
 		struct codec_ssrc_handler *input_handler,
 		struct transcode_packet *packet, struct media_packet *mp,
-		int (*func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+		int (*dtx_func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 			struct transcode_packet *packet,
 			struct media_packet *mp));
 static void __dtx_shutdown(struct dtx_buffer *dtxb);
 static struct codec_handler *__input_handler(struct codec_handler *h, struct media_packet *mp);
 
+static void __delay_frame_process(struct delay_buffer *, struct delay_frame *dframe);
+static void __dtx_restart(struct codec_handler *h);
+static void __delay_buffer_setup(struct delay_buffer **dbufp,
+		struct codec_handler *h, struct call *call, unsigned int delay);
+static void __delay_buffer_shutdown(struct delay_buffer *dbuf, bool);
+static void delay_buffer_stop(struct delay_buffer **pcmbp);
+static int __buffer_delay_packet(struct delay_buffer *dbuf,
+		struct codec_ssrc_handler *ch,
+		struct codec_ssrc_handler *input_ch,
+		struct transcode_packet *packet,
+		unsigned long ts_delay,
+		int payload_type,
+		packet_input_func_t packet_func, struct media_packet *mp, unsigned int clockrate);
+static void __buffer_delay_seq(struct delay_buffer *dbuf, struct media_packet *mp, int seq_adj);
+
 
 static struct codec_handler codec_handler_stub_ssrc = {
 	.source_pt.payload_type = -1,
 	.dest_pt.payload_type = -1,
-	.func = handler_func_passthrough_ssrc,
+	.handler_func = handler_func_passthrough_ssrc,
 	.kernelize = 1,
 	.passthrough = 1,
 };
@@ -226,8 +285,12 @@ static struct codec_handler codec_handler_stub_ssrc = {
 
 
 static void __handler_shutdown(struct codec_handler *handler) {
-	ssrc_hash_foreach(handler->ssrc_hash, __ssrc_handler_stop, NULL);
+	ssrc_hash_foreach(handler->ssrc_hash, __ssrc_handler_stop, (void *) true);
 	free_ssrc_hash(&handler->ssrc_hash);
+	if (handler->delay_buffer) {
+		__delay_buffer_shutdown(handler->delay_buffer, true);
+		delay_buffer_stop(&handler->delay_buffer);
+	}
 
 	if (handler->ssrc_handler)
 		obj_put(&handler->ssrc_handler->h);
@@ -236,6 +299,7 @@ static void __handler_shutdown(struct codec_handler *handler) {
 	handler->transcoder = 0;
 	handler->output_handler = handler; // reset to default
 	handler->dtmf_payload_type = -1;
+	handler->real_dtmf_payload_type = -1;
 	handler->cn_payload_type = -1;
 	handler->pcm_dtmf_detect = 0;
 	handler->passthrough = 0;
@@ -273,6 +337,7 @@ static struct codec_handler *__handler_new(const struct rtp_payload_type *pt, st
 	handler->dest_pt.payload_type = -1;
 	handler->output_handler = handler; // default
 	handler->dtmf_payload_type = -1;
+	handler->real_dtmf_payload_type = -1;
 	handler->cn_payload_type = -1;
 	handler->packet_encoded = packet_encoded_rtp;
 	handler->packet_decoded = packet_decoded_fifo;
@@ -286,9 +351,9 @@ static void __make_passthrough(struct codec_handler *handler, int dtmf_pt, int c
 	ilogs(codec, LOG_DEBUG, "Using passthrough handler for " STR_FORMAT " with DTMF %i, CN %i",
 			STR_FMT(&handler->source_pt.encoding_with_params), dtmf_pt, cn_pt);
 	if (handler->source_pt.codec_def && handler->source_pt.codec_def->dtmf)
-		handler->func = handler_func_dtmf;
+		handler->handler_func = handler_func_dtmf;
 	else {
-		handler->func = handler_func_passthrough;
+		handler->handler_func = handler_func_passthrough;
 		handler->kernelize = 1;
 	}
 	rtp_payload_type_copy(&handler->dest_pt, &handler->source_pt);
@@ -296,6 +361,14 @@ static void __make_passthrough(struct codec_handler *handler, int dtmf_pt, int c
 	handler->dtmf_payload_type = dtmf_pt;
 	handler->cn_payload_type = cn_pt;
 	handler->passthrough = 1;
+
+#ifdef WITH_TRANSCODING
+	if (handler->media->buffer_delay) {
+		__delay_buffer_setup(&handler->delay_buffer, handler, handler->media->call,
+				handler->media->buffer_delay);
+		handler->kernelize = 0;
+	}
+#endif
 }
 static void __make_passthrough_ssrc(struct codec_handler *handler) {
 	int dtmf_pt = handler->dtmf_payload_type;
@@ -305,9 +378,9 @@ static void __make_passthrough_ssrc(struct codec_handler *handler) {
 	ilogs(codec, LOG_DEBUG, "Using passthrough handler with new SSRC for " STR_FORMAT,
 			STR_FMT(&handler->source_pt.encoding_with_params));
 	if (handler->source_pt.codec_def && handler->source_pt.codec_def->dtmf)
-		handler->func = handler_func_dtmf;
+		handler->handler_func = handler_func_dtmf;
 	else {
-		handler->func = handler_func_passthrough_ssrc;
+		handler->handler_func = handler_func_passthrough_ssrc;
 		handler->kernelize = 1;
 	}
 	rtp_payload_type_copy(&handler->dest_pt, &handler->source_pt);
@@ -315,14 +388,24 @@ static void __make_passthrough_ssrc(struct codec_handler *handler) {
 	handler->dtmf_payload_type = dtmf_pt;
 	handler->cn_payload_type = cn_pt;
 	handler->passthrough = 1;
+
+#ifdef WITH_TRANSCODING
+	if (handler->media->buffer_delay) {
+		__delay_buffer_setup(&handler->delay_buffer, handler, handler->media->call,
+				handler->media->buffer_delay);
+		handler->kernelize = 0;
+	}
+#endif
 }
 
 static void __reset_sequencer(void *p, void *dummy) {
 	struct ssrc_entry_call *s = p;
-	s->sequencer.seq = -1;
+	if (s->sequencers)
+		g_hash_table_destroy(s->sequencers);
+	s->sequencers = NULL;
 }
 static void __make_transcoder(struct codec_handler *handler, struct rtp_payload_type *dest,
-		GHashTable *output_transcoders, int dtmf_payload_type, int pcm_dtmf_detect,
+		GHashTable *output_transcoders, int dtmf_payload_type, bool pcm_dtmf_detect,
 		int cn_payload_type)
 {
 	assert(handler->source_pt.codec_def != NULL);
@@ -332,13 +415,15 @@ static void __make_transcoder(struct codec_handler *handler, struct rtp_payload_
 	// don't reset handler if it already matches what we want
 	if (!handler->transcoder)
 		goto reset;
-	if (rtp_payload_type_cmp(dest, &handler->dest_pt))
+	if (!rtp_payload_type_eq_exact(dest, &handler->dest_pt))
 		goto reset;
-	if (handler->func != handler_func_transcode)
+	if (handler->handler_func != handler_func_transcode)
 		goto reset;
 	if (handler->cn_payload_type != cn_payload_type)
 		goto reset;
 	if (handler->dtmf_payload_type != dtmf_payload_type)
+		goto reset;
+	if ((pcm_dtmf_detect ? 1 : 0) != handler->pcm_dtmf_detect)
 		goto reset;
 
 	ilogs(codec, LOG_DEBUG, "Leaving transcode context for " STR_FORMAT " (%i) -> " STR_FORMAT " (%i) intact",
@@ -347,13 +432,15 @@ static void __make_transcoder(struct codec_handler *handler, struct rtp_payload_
 			STR_FMT(&dest->encoding_with_params),
 			dest->payload_type);
 
-	goto check_output;
+	goto no_handler_reset;
 
 reset:
 	__handler_shutdown(handler);
 
 	rtp_payload_type_copy(&handler->dest_pt, dest);
-	handler->func = handler_func_transcode;
+	if (dest->codec_def->format_answer)
+		dest->codec_def->format_answer(&handler->dest_pt);
+	handler->handler_func = handler_func_transcode;
 	handler->transcoder = 1;
 	handler->dtmf_payload_type = dtmf_payload_type;
 	handler->cn_payload_type = cn_payload_type;
@@ -361,7 +448,7 @@ reset:
 
 	// DTMF transcoder/scaler?
 	if (handler->source_pt.codec_def && handler->source_pt.codec_def->dtmf)
-		handler->func = handler_func_dtmf;
+		handler->handler_func = handler_func_dtmf;
 
 	ilogs(codec, LOG_DEBUG, "Created transcode context for " STR_FORMAT " (%i) -> " STR_FORMAT
 		" (%i) with DTMF output %i and CN output %i",
@@ -396,7 +483,9 @@ reset:
 
 	ssrc_hash_foreach(handler->media->monologue->ssrc_hash, __reset_sequencer, NULL);
 
-check_output:;
+no_handler_reset:
+	__delay_buffer_setup(&handler->delay_buffer, handler, handler->media->call, handler->media->buffer_delay);
+	__dtx_restart(handler);
 	// check if we have multiple decoders transcoding to the same output PT
 	struct codec_handler *output_handler = NULL;
 	if (output_transcoders)
@@ -418,11 +507,11 @@ struct codec_handler *codec_handler_make_playback(const struct rtp_payload_type 
 {
 	struct codec_handler *handler = __handler_new(src_pt, media, NULL);
 	rtp_payload_type_copy(&handler->dest_pt, dst_pt);
-	handler->func = handler_func_playback;
+	handler->handler_func = handler_func_playback;
 	handler->ssrc_handler = (void *) __ssrc_handler_transcode_new(handler);
-	handler->ssrc_handler->first_ts = last_ts;
-	while (handler->ssrc_handler->first_ts == 0)
-		handler->ssrc_handler->first_ts = ssl_random();
+	handler->ssrc_handler->csch.first_ts = last_ts;
+	while (handler->ssrc_handler->csch.first_ts == 0)
+		handler->ssrc_handler->csch.first_ts = ssl_random();
 	handler->ssrc_handler->rtp_mark = 1;
 
 	ilogs(codec, LOG_DEBUG, "Created media playback context for " STR_FORMAT " -> " STR_FORMAT "",
@@ -431,7 +520,15 @@ struct codec_handler *codec_handler_make_playback(const struct rtp_payload_type 
 
 	return handler;
 }
+struct codec_handler *codec_handler_make_dummy(const struct rtp_payload_type *dst_pt, struct call_media *media)
+{
+	struct codec_handler *handler = __handler_new(NULL, media, NULL);
+	rtp_payload_type_copy(&handler->dest_pt, dst_pt);
+	return handler;
+}
 
+
+// does not init/parse a=fmtp
 static void ensure_codec_def_type(struct rtp_payload_type *pt, enum media_type type) {
 	if (pt->codec_def)
 		return;
@@ -442,10 +539,13 @@ static void ensure_codec_def_type(struct rtp_payload_type *pt, enum media_type t
 	if (!pt->codec_def->support_encoding || !pt->codec_def->support_decoding)
 		pt->codec_def = NULL;
 }
+// does init/parse a=fmtp
 void ensure_codec_def(struct rtp_payload_type *pt, struct call_media *media) {
 	if (!media)
 		return;
 	ensure_codec_def_type(pt, media->type_id);
+	if (pt->codec_def)
+		codec_parse_fmtp(pt->codec_def, &pt->format, &pt->format_parameters, NULL);
 }
 
 // only called from codec_handlers_update()
@@ -560,7 +660,7 @@ static int __unused_pt_number(struct call_media *media, struct call_media *other
 
 next:
 		// is this actually the same?
-		if (pt && !rtp_payload_type_cmp_nf(pt, pt_match))
+		if (pt && rtp_payload_type_eq_nf(pt, pt_match))
 			break;
 		num++;
 		if (num < 96) // if an RFC type was taken already
@@ -602,7 +702,7 @@ static void __check_dtmf_injector(struct call_media *receiver, struct call_media
 
 	parent->dtmf_injector = __handler_new(&src_pt, receiver, sink);
 	__make_transcoder(parent->dtmf_injector, &parent->dest_pt, output_transcoders, -1, 0, -1);
-	parent->dtmf_injector->func = handler_func_inject_dtmf;
+	parent->dtmf_injector->handler_func = handler_func_inject_dtmf;
 }
 
 
@@ -616,7 +716,7 @@ static struct codec_handler *__get_pt_handler(struct call_media *receiver, struc
 	handler = codec_handler_lookup(receiver->codec_handlers, pt->payload_type, sink);
 	if (handler) {
 		// make sure existing handler matches this PT
-		if (rtp_payload_type_cmp(pt, &handler->source_pt)) {
+		if (!rtp_payload_type_eq_exact(pt, &handler->source_pt)) {
 			ilogs(codec, LOG_DEBUG, "Resetting codec handler for PT %i", pt->payload_type);
 			g_hash_table_remove(receiver->codec_handlers, handler);
 			__handler_shutdown(handler);
@@ -650,7 +750,7 @@ static void __check_t38_decoder(struct call_media *t38_media) {
 		return;
 	ilogs(codec, LOG_DEBUG, "Creating T.38 packet handler");
 	t38_media->t38_handler = __handler_new(NULL, t38_media, NULL);
-	t38_media->t38_handler->func = handler_func_t38;
+	t38_media->t38_handler->handler_func = handler_func_t38;
 }
 
 static int packet_encoded_t38(encoder_t *enc, void *u1, void *u2) {
@@ -695,9 +795,7 @@ static void __check_t38_gateway(struct call_media *pcm_media, struct call_media 
 	}
 	__t38_options_from_flags(&t_opts, flags);
 
-	MEDIA_SET(pcm_media, TRANSCODE);
 	MEDIA_SET(pcm_media, GENERATOR);
-	MEDIA_SET(t38_media, TRANSCODE);
 	MEDIA_SET(t38_media, GENERATOR);
 
 	if (t38_gateway_pair(t38_media, pcm_media, &t_opts))
@@ -781,7 +879,7 @@ static void __codec_rtcp_timer_schedule(struct call_media *media) {
 		rt->call = obj_get(media->call);
 		rt->media = media;
 		rt->ct.next = rtpe_now;
-		rt->ct.func = __rtcp_timer_run;
+		rt->ct.timer_func = __rtcp_timer_run;
 	}
 
 	timeval_add_usec(&rt->ct.next, 5000000 + (ssl_random() % 2000000));
@@ -828,6 +926,7 @@ static void __rtcp_timer_run(struct codec_timer *ct) {
 	for (unsigned int u = 0; u < RTPE_NUM_SSRC_TRACKING; u++) {
 		if (!ssrc_out[u]) // end of list
 			break;
+		// coverity[use : FALSE]
 		rtcp_send_report(media, ssrc_out[u]);
 	}
 
@@ -840,7 +939,7 @@ static void __rtcp_timer_run(struct codec_timer *ct) {
 	}
 
 out:
-	log_info_clear();
+	log_info_pop();
 }
 // master lock held in W
 static void __codec_rtcp_timer(struct call_media *receiver) {
@@ -874,26 +973,28 @@ INLINE struct codec_handler *codec_handler_lookup(GHashTable *ht, int pt, struct
 }
 
 // call must be locked in W
-void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
+bool codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 		const struct sdp_ng_flags *flags, const struct stream_params *sp)
 {
 	ilogs(codec, LOG_DEBUG, "Setting up codec handlers for " STR_FORMAT_M " #%u -> " STR_FORMAT_M " #%u",
 			STR_FMT_M(&receiver->monologue->tag), receiver->index,
 			STR_FMT_M(&sink->monologue->tag), sink->index);
 
+	MEDIA_CLEAR(receiver, TRANSCODE);
 	MEDIA_CLEAR(receiver, GENERATOR);
 	MEDIA_CLEAR(sink, GENERATOR);
 
 	// non-RTP protocol?
 	if (proto_is(receiver->protocol, PROTO_UDPTL)) {
 		if (codec_handler_udptl_update(receiver, sink, flags))
-			return;
+			return true;
 	}
 	// everything else is unsupported: pass through
 	if (proto_is_not_rtp(receiver->protocol)) {
 		__generator_stop(receiver);
 		__generator_stop(sink);
-		return;
+		codec_handlers_stop(&receiver->codec_handlers_store);
+		return false;
 	}
 
 	if (!receiver->codec_handlers)
@@ -902,15 +1003,17 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 	// should we transcode to a non-RTP protocol?
 	if (proto_is_not_rtp(sink->protocol)) {
 		if (codec_handler_non_rtp_update(receiver, sink, flags, sp))
-			return;
+			return true;
 	}
 
 	// we're doing some kind of media passthrough - shut down local generators
 	__generator_stop(receiver);
 	__generator_stop(sink);
+	codec_handlers_stop(&receiver->codec_handlers_store);
 
-	MEDIA_CLEAR(receiver, TRANSCODE);
+	bool is_transcoding = false;
 	receiver->rtcp_handler = NULL;
+	receiver->dtmf_count = 0;
 	GSList *passthrough_handlers = NULL;
 
 	// first gather info about what we can send
@@ -928,6 +1031,21 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 	AUTO_CLEANUP(GHashTable *output_transcoders, __g_hash_table_destroy)
 		= g_hash_table_new(g_direct_hash, g_direct_equal);
 
+	enum block_dtmf_mode dtmf_block_mode = dtmf_get_block_mode(NULL, receiver->monologue);
+	bool do_pcm_dtmf_blocking = is_pcm_dtmf_block_mode(dtmf_block_mode);
+	bool do_dtmf_blocking = is_dtmf_replace_mode(dtmf_block_mode);
+
+	if (receiver->monologue->dtmf_delay) // received DTMF must be replaced by silence initially, therefore:
+		do_pcm_dtmf_blocking = true;
+
+	bool do_dtmf_detect = false;
+	if (receiver->monologue->dtmf_trigger.len)
+		do_dtmf_detect = true;
+
+	// do we have to force everything through the transcoding engine even if codecs match?
+	bool force_transcoding = do_pcm_dtmf_blocking || do_dtmf_blocking;
+	if (sink->monologue->inject_dtmf)
+		force_transcoding = true;
 
 	for (GList *l = receiver->codecs.codec_prefs.head; l; ) {
 		struct rtp_payload_type *pt = l->data;
@@ -952,7 +1070,7 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 				"telephone-event");
 		struct rtp_payload_type *recv_cn_pt = __supp_payload_type(supplemental_recvs, pt->clock_rate,
 				"CN");
-		int pcm_dtmf_detect = 0;
+		bool pcm_dtmf_detect = false;
 
 		// find the matching sink codec
 
@@ -961,7 +1079,7 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 			sink_pt = g_hash_table_lookup(sink->codecs.codecs,
 					GINT_TO_POINTER(pt->payload_type));
 			// is it actually the same?
-			if (sink_pt && rtp_payload_type_cmp(pt, sink_pt))
+			if (sink_pt && !rtp_payload_type_eq_compat(pt, sink_pt))
 				sink_pt = NULL;
 		}
 
@@ -996,6 +1114,10 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 				sink_pt = pref_dest_codec;
 		}
 
+		// ignore DTMF sink if we're blocking DTMF in PCM replacement mode
+		if (do_pcm_dtmf_blocking && sink_pt && sink_pt->codec_def && sink_pt->codec_def->dtmf)
+			sink_pt = NULL;
+
 		// still no output? pick the preferred sink codec
 		if (!sink_pt)
 			sink_pt = pref_dest_codec;
@@ -1017,6 +1139,7 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 				sink_pt->clock_rate, "telephone-event");
 		struct rtp_payload_type *sink_cn_pt = __supp_payload_type(supplemental_sinks,
 				sink_pt->clock_rate, "CN");
+		struct rtp_payload_type *real_sink_dtmf_pt = NULL; // for DTMF delay
 
 		// XXX synthesise missing supp codecs according to codec tracker XXX needed?
 
@@ -1037,70 +1160,102 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 		// do we need DTMF detection?
 		if (!pt->codec_def->supplemental && !recv_dtmf_pt && sink_dtmf_pt
 				&& sink_dtmf_pt->for_transcoding)
-		{
-			pcm_dtmf_detect = 1;
-			ilogs(codec, LOG_DEBUG, "Enabling PCM DTMF detection from " STR_FORMAT
-					" to " STR_FORMAT
-					"/" STR_FORMAT,
-					STR_FMT(&pt->encoding_with_params),
-					STR_FMT(&sink_pt->encoding_with_params),
-					STR_FMT(&sink_dtmf_pt->encoding_with_params));
+			pcm_dtmf_detect = true;
+
+		if (receiver->monologue->detect_dtmf)
+			pcm_dtmf_detect = true;
+
+		// special mode for DTMF blocking
+		if (do_pcm_dtmf_blocking) {
+			real_sink_dtmf_pt = sink_dtmf_pt; // remember for DTMF delay
+			sink_dtmf_pt = NULL; // always transcode DTMF to PCM
+
+			// enable DSP if we expect DTMF to be carried as PCM
+			if (!recv_dtmf_pt)
+				pcm_dtmf_detect = true;
+		}
+		else if (do_dtmf_blocking && !pcm_dtmf_detect) {
+			// we only need the DSP if there's no DTMF payload present, as otherwise
+			// we expect DTMF event packets
+			if (!recv_dtmf_pt)
+				pcm_dtmf_detect = true;
+		}
+
+		// same logic if we need to detect DTMF
+		if (do_dtmf_detect && !pcm_dtmf_detect) {
+			if (!recv_dtmf_pt)
+				pcm_dtmf_detect = true;
+		}
+
+		if (pcm_dtmf_detect) {
+			if (sink_dtmf_pt)
+				ilogs(codec, LOG_DEBUG, "Enabling PCM DTMF detection from " STR_FORMAT
+						" to " STR_FORMAT
+						"/" STR_FORMAT,
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params),
+						STR_FMT(&sink_dtmf_pt->encoding_with_params));
+			else
+				ilogs(codec, LOG_DEBUG, "Enabling PCM DTMF detection from " STR_FORMAT
+						" to " STR_FORMAT,
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params));
 		}
 
 		// we can now decide whether we can do passthrough, or transcode
 
-		// different codecs?
+		// different codecs? this will only be true for non-supplemental codecs
 		// XXX needs more intelligent fmtp matching
-		if (rtp_payload_type_cmp_nf(pt, sink_pt))
+		if (!rtp_payload_type_eq_nf(pt, sink_pt))
 			goto transcode;
 
-		// different ptime?
-		if (sink_pt->ptime && pt->ptime && sink_pt->ptime != pt->ptime) {
-			if (MEDIA_ISSET(sink, PTIME_OVERRIDE) || MEDIA_ISSET(receiver, PTIME_OVERRIDE)) {
+		// supplemental codecs are always matched up. we want them as passthrough if
+		// possible. skip checks that are only applicable for real codecs
+		if (!pt->codec_def->supplemental) {
+			// different ptime?
+			if (sink_pt->ptime && pt->ptime && sink_pt->ptime != pt->ptime) {
+				if (MEDIA_ISSET(sink, PTIME_OVERRIDE) || MEDIA_ISSET(receiver, PTIME_OVERRIDE)) {
+					ilogs(codec, LOG_DEBUG, "Mismatched ptime between source and sink (%i <> %i), "
+							"enabling transcoding",
+						sink_pt->ptime, pt->ptime);
+					goto transcode;
+				}
 				ilogs(codec, LOG_DEBUG, "Mismatched ptime between source and sink (%i <> %i), "
-						"enabling transcoding",
+						"but no override requested",
 					sink_pt->ptime, pt->ptime);
+			}
+
+			if (force_transcoding)
+				goto transcode;
+
+			// compare supplemental codecs
+			// DTMF
+			if (pcm_dtmf_detect)
+				goto transcode;
+			if (recv_dtmf_pt && (recv_dtmf_pt->for_transcoding || do_pcm_dtmf_blocking) && !sink_dtmf_pt) {
+				ilogs(codec, LOG_DEBUG, "Transcoding DTMF events to PCM from " STR_FORMAT
+						" to " STR_FORMAT,
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params));
 				goto transcode;
 			}
-			ilogs(codec, LOG_DEBUG, "Mismatched ptime between source and sink (%i <> %i), "
-					"but no override requested",
-				sink_pt->ptime, pt->ptime);
-		}
-
-		if (sink->monologue->inject_dtmf) {
-			// we have a matching output codec, but we were told that we might
-			// want to inject DTMF, so we must still go through our transcoding
-			// engine, despite input and output codecs being the same.
-			goto transcode;
-		}
-
-		// compare supplemental codecs
-		// DTMF
-		if (pcm_dtmf_detect)
-			goto transcode;
-		if (recv_dtmf_pt && recv_dtmf_pt->for_transcoding && !sink_dtmf_pt) {
-			ilogs(codec, LOG_DEBUG, "Transcoding DTMF events to PCM from " STR_FORMAT
-					" to " STR_FORMAT,
-					STR_FMT(&pt->encoding_with_params),
-					STR_FMT(&sink_pt->encoding_with_params));
-			goto transcode;
-		}
-		// CN
-		if (!recv_cn_pt && sink_cn_pt && sink_cn_pt->for_transcoding) {
-			ilogs(codec, LOG_DEBUG, "Enabling CN silence detection from " STR_FORMAT
-					" to " STR_FORMAT
-					"/" STR_FORMAT,
-					STR_FMT(&pt->encoding_with_params),
-					STR_FMT(&sink_pt->encoding_with_params),
-					STR_FMT(&sink_cn_pt->encoding_with_params));
-			goto transcode;
-		}
-		if (recv_cn_pt && recv_cn_pt->for_transcoding && !sink_cn_pt) {
-			ilogs(codec, LOG_DEBUG, "Transcoding CN packets to PCM from " STR_FORMAT
-					" to " STR_FORMAT,
-					STR_FMT(&pt->encoding_with_params),
-					STR_FMT(&sink_pt->encoding_with_params));
-			goto transcode;
+			// CN
+			if (!recv_cn_pt && sink_cn_pt && sink_cn_pt->for_transcoding) {
+				ilogs(codec, LOG_DEBUG, "Enabling CN silence detection from " STR_FORMAT
+						" to " STR_FORMAT
+						"/" STR_FORMAT,
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params),
+						STR_FMT(&sink_cn_pt->encoding_with_params));
+				goto transcode;
+			}
+			if (recv_cn_pt && recv_cn_pt->for_transcoding && !sink_cn_pt) {
+				ilogs(codec, LOG_DEBUG, "Transcoding CN packets to PCM from " STR_FORMAT
+						" to " STR_FORMAT,
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params));
+				goto transcode;
+			}
 		}
 
 		// everything matches - we can do passthrough
@@ -1123,17 +1278,22 @@ transcode:;
 				str_init_dup_str(&sink_pt->codec_opts, &reverse_pt->codec_opts);
 			}
 		}
-		MEDIA_SET(receiver, TRANSCODE);
+		is_transcoding = true;
 		__make_transcoder(handler, sink_pt, output_transcoders,
 				sink_dtmf_pt ? sink_dtmf_pt->payload_type : -1,
 				pcm_dtmf_detect, sink_cn_pt ? sink_cn_pt->payload_type : -1);
+		// for DTMF delay: we pretend that there is no output DTMF payload type (sink_dtmf_pt == NULL)
+		// so that DTMF is converted to audio (so it can be replaced with silence). we still want
+		// to output DTMF event packets when we can though, so we need to remember the DTMF payload
+		// type here.
+		handler->real_dtmf_payload_type = real_sink_dtmf_pt ? real_sink_dtmf_pt->payload_type : -1;
 		__check_dtmf_injector(receiver, sink, handler, output_transcoders);
 
 next:
 		l = l->next;
 	}
 
-	if (MEDIA_ISSET(receiver, TRANSCODE)) {
+	if (is_transcoding) {
 		// we have to translate RTCP packets
 		receiver->rtcp_handler = rtcp_transcode_handler;
 
@@ -1175,6 +1335,11 @@ next:
 		sink->rtcp_handler = rtcp_sink_handler;
 		__codec_rtcp_timer(sink);
 	}
+
+	if (is_transcoding)
+		MEDIA_SET(receiver, TRANSCODE);
+
+	return is_transcoding;
 }
 
 
@@ -1215,28 +1380,51 @@ static void __mqtt_timer_free(void *p) {
 		obj_put(mqt->call);
 }
 static void __codec_mqtt_timer_schedule(struct mqtt_timer *mqt);
-static void __mqtt_timer_run(struct codec_timer *ct) {
-	struct mqtt_timer *mqt = (struct mqtt_timer *) ct;
+INLINE bool __mqtt_timer_common_call(struct mqtt_timer *mqt) {
 	struct call *call = mqt->call;
 
-	if (call)
-		rwlock_lock_w(&call->master_lock);
+	rwlock_lock_w(&call->master_lock);
 
 	if (!*mqt->self) {
-		if (call)
-			rwlock_unlock_w(&call->master_lock);
-		goto out;
+		rwlock_unlock_w(&call->master_lock);
+		return false;
 	}
+
+	log_info_call(call);
 
 	__codec_mqtt_timer_schedule(mqt);
 
-	if (call)
-		rwlock_unlock_w(&call->master_lock);
+	rwlock_unlock_w(&call->master_lock);
 
-	mqtt_timer_run(call, mqt->media);
-
-out:
-	log_info_clear();
+	return true;
+}
+static void __mqtt_timer_run_media(struct codec_timer *ct) {
+	struct mqtt_timer *mqt = (struct mqtt_timer *) ct;
+	if (!__mqtt_timer_common_call(mqt))
+		return;
+	mqtt_timer_run_media(mqt->call, mqt->media);
+	log_info_pop();
+}
+static void __mqtt_timer_run_call(struct codec_timer *ct) {
+	struct mqtt_timer *mqt = (struct mqtt_timer *) ct;
+	if (!__mqtt_timer_common_call(mqt))
+		return;
+	mqtt_timer_run_call(mqt->call);
+	log_info_pop();
+}
+static void __mqtt_timer_run_global(struct codec_timer *ct) {
+	struct mqtt_timer *mqt = (struct mqtt_timer *) ct;
+	if (!*mqt->self)
+		return;
+	__codec_mqtt_timer_schedule(mqt);
+	mqtt_timer_run_global();
+}
+static void __mqtt_timer_run_summary(struct codec_timer *ct) {
+	struct mqtt_timer *mqt = (struct mqtt_timer *) ct;
+	if (!*mqt->self)
+		return;
+	__codec_mqtt_timer_schedule(mqt);
+	mqtt_timer_run_summary();
 }
 static void __codec_mqtt_timer_schedule(struct mqtt_timer *mqt) {
 	timeval_add_usec(&mqt->ct.next, rtpe_config.mqtt_publish_interval * 1000);
@@ -1253,7 +1441,16 @@ void mqtt_timer_start(struct mqtt_timer **mqtp, struct call *call, struct call_m
 	mqt->self = mqtp;
 	mqt->media = media;
 	mqt->ct.next = rtpe_now;
-	mqt->ct.func = __mqtt_timer_run;
+
+	if (media)
+		mqt->ct.timer_func = __mqtt_timer_run_media;
+	else if (call)
+		mqt->ct.timer_func = __mqtt_timer_run_call;
+	else {
+		// global or summary
+		mqt->ct.timer_func = mqtt_publish_scope() == MPS_GLOBAL
+			? __mqtt_timer_run_global : __mqtt_timer_run_summary;
+	}
 
 	__codec_mqtt_timer_schedule(mqt);
 }
@@ -1278,7 +1475,9 @@ void mqtt_timer_stop(struct mqtt_timer **mqtp) {
 
 
 // call must be locked in R
-struct codec_handler *codec_handler_get(struct call_media *m, int payload_type, struct call_media *sink) {
+struct codec_handler *codec_handler_get(struct call_media *m, int payload_type, struct call_media *sink,
+		struct sink_handler *sh)
+{
 #ifdef WITH_TRANSCODING
 	struct codec_handler *ret = NULL;
 
@@ -1293,7 +1492,7 @@ struct codec_handler *codec_handler_get(struct call_media *m, int payload_type, 
 out:
 	if (ret)
 		return ret;
-	if (MEDIA_ISSET(m, TRANSCODE))
+	if (sh && sh->attrs.transcoding)
 		return &codec_handler_stub_ssrc;
 #endif
 	return &codec_handler_stub;
@@ -1323,9 +1522,9 @@ void codec_add_raw_packet(struct media_packet *mp, unsigned int clockrate) {
 	g_queue_push_tail(&mp->packets_out, p);
 }
 static bool handler_silence_block(struct codec_handler *h, struct media_packet *mp) {
-	if (mp->call->block_media || mp->media->monologue->block_media)
+	if (mp->call->block_media || mp->media->monologue->block_media || mp->sink.attrs.block_media)
 		return false;
-	if (mp->call->silence_media || mp->media->monologue->silence_media) {
+	if (mp->call->silence_media || mp->media->monologue->silence_media || mp->sink.attrs.silence_media) {
 		if (h->source_pt.codec_def && h->source_pt.codec_def->silence_pattern.len) {
 			if (h->source_pt.codec_def->silence_pattern.len == 1)
 				memset(mp->payload.s, h->source_pt.codec_def->silence_pattern.s[0],
@@ -1344,11 +1543,15 @@ static int handler_func_passthrough(struct codec_handler *h, struct media_packet
 	if (!handler_silence_block(h, mp))
 		return 0;
 
+	uint32_t ts = 0;
 	if (mp->rtp) {
-		codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, &mp->tv);
+		ts = ntohl(mp->rtp->timestamp);
+		codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, &mp->tv);
 		codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
 	}
-	codec_add_raw_packet(mp, h->source_pt.clock_rate);
+
+	__buffer_delay_raw(h->delay_buffer, h, codec_add_raw_packet, mp, h->source_pt.clock_rate);
+
 	return 0;
 }
 
@@ -1386,13 +1589,19 @@ static void __ssrc_unlock_both(struct media_packet *mp) {
 		mutex_unlock(&ssrc_out_p->h.lock);
 }
 
+static void __seq_free(void *p) {
+	packet_sequencer_t *seq = p;
+	packet_sequencer_destroy(seq);
+	g_slice_free1(sizeof(*seq), seq);
+}
+
 static int __handler_func_sequencer(struct media_packet *mp, struct transcode_packet *packet)
 {
 	struct codec_handler *h = packet->handler;
 
 	if (G_UNLIKELY(!h->ssrc_hash)) {
-		if (!packet->func || !h->input_handler->ssrc_hash) {
-			h->func(h, mp);
+		if (!packet->packet_func || !h->input_handler->ssrc_hash) {
+			h->handler_func(h, mp);
 			__transcode_packet_free(packet);
 			return 0;
 		}
@@ -1409,6 +1618,9 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		return 0;
 	}
 
+	// save RTP pointer - we clobber it below XXX this shouldn't be necessary to do
+	struct rtp_header *orig_rtp = mp->rtp;
+
 	packet->p.seq = ntohs(mp->rtp->seq_num);
 	packet->payload = str_dup(&mp->payload);
 	uint32_t packet_ts = ntohl(mp->rtp->timestamp);
@@ -1417,11 +1629,13 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 
 	atomic64_inc(&ssrc_in->packets);
 	atomic64_add(&ssrc_in->octets, mp->payload.len);
+	atomic64_inc(&mp->sfd->local_intf->stats.in.packets);
+	atomic64_add(&mp->sfd->local_intf->stats.in.bytes, mp->payload.len);
 
 	if (packet->bypass_seq) {
 		// bypass sequencer
 		__ssrc_lock_both(mp);
-		int ret = packet->func(ch, ch, packet, mp);
+		int ret = packet->packet_func(ch, ch, packet, mp);
 		if (ret != 1)
 			__transcode_packet_free(packet);
 		__ssrc_unlock_both(mp);
@@ -1436,46 +1650,88 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 
 	__ssrc_lock_both(mp);
 
-	packet_sequencer_init(&ssrc_in_p->sequencer, (GDestroyNotify) __transcode_packet_free);
+	// get sequencer appropriate for our output
+	if (!ssrc_in_p->sequencers)
+		ssrc_in_p->sequencers = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, __seq_free);
+	packet_sequencer_t *seq = g_hash_table_lookup(ssrc_in_p->sequencers, mp->media_out);
+	if (!seq) {
+		seq = g_slice_alloc0(sizeof(*seq));
+		packet_sequencer_init(seq, (GDestroyNotify) __transcode_packet_free);
+		g_hash_table_insert(ssrc_in_p->sequencers, mp->media_out, seq);
+	}
 
-	uint16_t seq_ori = ssrc_in_p->sequencer.seq;
-	int seq_ret = packet_sequencer_insert(&ssrc_in_p->sequencer, &packet->p);
+	uint16_t seq_ori = seq->seq;
+	int seq_ret = packet_sequencer_insert(seq, &packet->p);
 	if (seq_ret < 0) {
 		// dupe
+		int func_ret = 0;
 		if (packet->dup_func)
-			packet->dup_func(ch, input_ch, packet, mp);
+			func_ret = packet->dup_func(ch, input_ch, packet, mp);
 		else
 			ilogs(transcoding, LOG_DEBUG, "Ignoring duplicate RTP packet");
-		__transcode_packet_free(packet);
+		if (func_ret != 1)
+			__transcode_packet_free(packet);
 		ssrc_in_p->duplicates++;
+		atomic64_inc(&mp->sfd->local_intf->stats.s.duplicates);
+		RTPE_STATS_INC(rtp_duplicates);
 		goto out;
 	}
+
+	if (seq_ret == 1)
+		RTPE_STATS_INC(rtp_seq_resets);
+	else if (seq_ret == 2)
+		RTPE_STATS_INC(rtp_reordered);
 
 	// got a new packet, run decoder
 
 	while (1) {
 		int func_ret = 0;
 
-		packet = packet_sequencer_next_packet(&ssrc_in_p->sequencer);
+		packet = packet_sequencer_next_packet(seq);
 		if (G_UNLIKELY(!packet)) {
-			if (!ch || !ch->encoder_format.clockrate || !ch->handler
-					|| !ch->handler->dest_pt.codec_def)
+			if (!ch || !h->dest_pt.clock_rate || !ch->handler
+					|| !h->dest_pt.codec_def)
 				break;
 
-			uint32_t ts_diff = packet_ts - ch->last_ts;
+			uint32_t ts_diff = packet_ts - ch->csch.last_ts;
+
+			// if packet TS is larger than last tracked TS, we can force the next packet if packets were lost and the TS
+			// difference is too large. if packet TS is the same or lower (can happen for supplement codecs) we can wait
+			// for the next packet
+			if (ts_diff == 0 || ts_diff >= 0x80000000)
+				break;
+
 			unsigned long long ts_diff_us =
-				(unsigned long long) ts_diff * 1000000 / ch->encoder_format.clockrate
-				* ch->handler->dest_pt.codec_def->clockrate_mult;
+				(unsigned long long) ts_diff * 1000000 / h->dest_pt.clock_rate;
 			if (ts_diff_us >= 60000)  { // arbitrary value
-				packet = packet_sequencer_force_next_packet(&ssrc_in_p->sequencer);
+				packet = packet_sequencer_force_next_packet(seq);
 				if (!packet)
 					break;
 				ilogs(transcoding, LOG_DEBUG, "Timestamp difference too large (%llu ms) after lost packet, "
 						"forcing next packet", ts_diff_us / 1000);
+				RTPE_STATS_INC(rtp_skips);
 			}
 			else
 				break;
 		}
+
+		if (ch) {
+			uint32_t ts_diff = ch->csch.last_ts - packet->ts;
+			if (ts_diff < 0x80000000) { // ch->last_ts >= packet->ts
+				// multiple consecutive packets with same TS: this could be a compound packet, e.g. a large video frame, or
+				// it could be a supplemental audio codec with static timestamps, in which case we adjust the TS forward
+				// by one frame length. This is needed so that the next real audio packet (with real TS) is not mistakenly
+				// seen as overdue
+				if (h->source_pt.codec_def && h->source_pt.codec_def->supplemental)
+					ch->csch.last_ts += h->source_pt.clock_rate * (ch->ptime ?: 20) / 1000;
+			}
+			else
+				ch->csch.last_ts = packet->ts;
+
+			if (input_ch)
+				input_ch->csch.last_ts = ch->csch.last_ts;
+		}
+
 
 		// new packet might have different handlers
 		h = packet->handler;
@@ -1494,8 +1750,8 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 			goto next;
 		}
 
-		ssrc_in_p->packets_lost = ssrc_in_p->sequencer.lost_count;
-		atomic64_set(&ssrc_in->last_seq, ssrc_in_p->sequencer.ext_seq);
+		ssrc_in_p->packets_lost = seq->lost_count;
+		atomic64_set(&ssrc_in->last_seq, seq->ext_seq);
 
 		ilogs(transcoding, LOG_DEBUG, "Processing RTP packet: seq %u, TS %lu",
 				packet->p.seq, packet->ts);
@@ -1509,7 +1765,7 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		// we might be working with a different packet now
 		mp->rtp = &packet->rtp;
 
-		func_ret = packet->func(ch, input_ch, packet, mp);
+		func_ret = packet->packet_func(ch, input_ch, packet, mp);
 		if (func_ret < 0)
 			ilogs(transcoding, LOG_WARN | LOG_FLAG_LIMIT, "Decoder error while processing RTP packet");
 next:
@@ -1525,11 +1781,13 @@ out_ch:
 	if (ch)
 		obj_put(&ch->h);
 
+	mp->rtp = orig_rtp;
+
 	return 0;
 }
 
-static void __output_rtp(struct media_packet *mp, struct codec_ssrc_handler *ch,
-		struct codec_handler *handler, // normally == ch->handler except for DTMF
+void codec_output_rtp(struct media_packet *mp, struct codec_scheduler *csch,
+		struct codec_handler *handler,
 		char *buf, // malloc'd, room for rtp_header + filled-in payload
 		unsigned int payload_len,
 		unsigned long payload_ts,
@@ -1568,37 +1826,36 @@ static void __output_rtp(struct media_packet *mp, struct codec_ssrc_handler *ch,
 
 	// this packet is dynamically allocated, so we're able to schedule it.
 	// determine scheduled time to send
-	if (ch->first_send.tv_sec && ch->encoder_format.clockrate) {
+	if (csch->first_send.tv_sec && handler->dest_pt.clock_rate) {
 		// scale first_send from first_send_ts to ts
-		p->ttq_entry.when = ch->first_send;
-		uint32_t ts_diff = (uint32_t) ts - (uint32_t) ch->first_send_ts; // allow for wrap-around
+		p->ttq_entry.when = csch->first_send;
+		uint32_t ts_diff = (uint32_t) ts - (uint32_t) csch->first_send_ts; // allow for wrap-around
 		ts_diff += ts_delay;
 		long long ts_diff_us =
-			(unsigned long long) ts_diff * 1000000 / ch->encoder_format.clockrate
-			* ch->handler->dest_pt.codec_def->clockrate_mult;
+			(unsigned long long) ts_diff * 1000000 / handler->dest_pt.clock_rate;
 		timeval_add_usec(&p->ttq_entry.when, ts_diff_us);
 
 		// how far in the future is this?
 		ts_diff_us = timeval_diff(&p->ttq_entry.when, &rtpe_now);
 		if (ts_diff_us > 1000000 || ts_diff_us < -1000000) // more than one second, can't be right
-			ch->first_send.tv_sec = 0; // fix it up below
+			csch->first_send.tv_sec = 0; // fix it up below
 	}
-	if (!ch->first_send.tv_sec) {
-		p->ttq_entry.when = ch->first_send = rtpe_now;
-		ch->first_send_ts = ts;
+	if (!csch->first_send.tv_sec || !p->ttq_entry.when.tv_sec) {
+		p->ttq_entry.when = csch->first_send = rtpe_now;
+		csch->first_send_ts = ts;
 	}
 
 	long long ts_diff_us
 		= timeval_diff(&p->ttq_entry.when, &rtpe_now);
 
-	ch->output_skew = ch->output_skew * 15 / 16 + ts_diff_us / 16;
-	if (ch->output_skew > 50000 && ts_diff_us > 10000) { // arbitrary value, 50 ms, 10 ms shift
+	csch->output_skew = csch->output_skew * 15 / 16 + ts_diff_us / 16;
+	if (csch->output_skew > 50000 && ts_diff_us > 10000) { // arbitrary value, 50 ms, 10 ms shift
 		ilogs(transcoding, LOG_DEBUG, "Steady clock skew of %li.%01li ms detected, shifting send timer back by 10 ms",
-			ch->output_skew / 1000,
-			(ch->output_skew % 1000) / 100);
+			csch->output_skew / 1000,
+			(csch->output_skew % 1000) / 100);
 		timeval_add_usec(&p->ttq_entry.when, -10000);
-		ch->output_skew -= 10000;
-		ch->first_send_ts += ch->encoder_format.clockrate / 100;
+		csch->output_skew -= 10000;
+		csch->first_send_ts += handler->dest_pt.clock_rate / 100;
 		ts_diff_us = timeval_diff(&p->ttq_entry.when, &rtpe_now);
 	}
 	else if (ts_diff_us < 0) {
@@ -1607,8 +1864,8 @@ static void __output_rtp(struct media_packet *mp, struct codec_ssrc_handler *ch,
 			ts_diff_us / 1000,
 			(ts_diff_us % 1000) / 100);
 		timeval_add_usec(&p->ttq_entry.when, ts_diff_us);
-		ch->output_skew += ts_diff_us;
-		ch->first_send_ts -= (long long) ch->encoder_format.clockrate * ts_diff_us / 1000000;
+		csch->output_skew += ts_diff_us;
+		csch->first_send_ts -= (long long) handler->dest_pt.clock_rate * ts_diff_us / 1000000;
 		ts_diff_us = timeval_diff(&p->ttq_entry.when, &rtpe_now); // should be 0 now
 	}
 
@@ -1646,28 +1903,21 @@ static struct codec_ssrc_handler *__output_ssrc_handler(struct codec_ssrc_handle
 	return new_ch;
 }
 
-// forwards DTMF input to DTMF output, plus rescaling duration
-static int packet_dtmf_fwd(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+static int codec_add_dtmf_packet(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 		struct transcode_packet *packet,
+		unsigned long ts_delay,
+		int payload_type,
 		struct media_packet *mp)
 {
-	int payload_type = -1; // take from handler's output config
-	unsigned long ts_delay = 0;
-
+	struct codec_handler *h = ch->handler;
 	struct codec_ssrc_handler *output_ch = NULL;
 
-	// this is actually a DTMF -> PCM handler
 	// grab our underlying PCM transcoder
 	output_ch = __output_ssrc_handler(input_ch, mp);
 	if (G_UNLIKELY(!output_ch->encoder))
 		goto skip;
 
-	// init some vars
-	ch->first_ts = output_ch->first_ts;
-	ch->first_send_ts = output_ch->first_send_ts;
-	ch->output_skew = output_ch->output_skew;
-	ch->first_send = output_ch->first_send;
-
+	ch->csch = output_ch->csch;
 
 	// the correct output TS is the encoder's FIFO PTS at the start of the DTMF
 	// event. however, we must shift the FIFO PTS forward as the DTMF event goes on
@@ -1679,22 +1929,22 @@ static int packet_dtmf_fwd(struct codec_ssrc_handler *ch, struct codec_ssrc_hand
 		ch->last_dtmf_event_ts = 0; // last DTMF event duration
 	}
 
-	unsigned long ts = output_ch->encoder->next_pts / output_ch->encoder->def->clockrate_mult;
+	unsigned long ts = fraction_divl(output_ch->encoder->next_pts, &output_ch->encoder->clockrate_fact);
 	// roll back TS to start of event
 	ts -= ch->last_dtmf_event_ts;
 	// adjust to output RTP TS
-	unsigned long packet_ts = ts + output_ch->first_ts;
+	unsigned long packet_ts = ts + output_ch->csch.first_ts;
 
 	ilogs(transcoding, LOG_DEBUG, "Scaling DTMF packet timestamp and duration: TS %lu -> %lu "
 			"(%u -> %u)",
 			packet->ts, packet_ts,
-			ch->handler->source_pt.clock_rate, ch->handler->dest_pt.clock_rate);
+			h->source_pt.clock_rate, h->dest_pt.clock_rate);
 	packet->ts = packet_ts;
 
 	if (packet->payload->len >= sizeof(struct telephone_event_payload)) {
 		struct telephone_event_payload *dtmf = (void *) packet->payload->s;
 		unsigned int duration = av_rescale(ntohs(dtmf->duration),
-				ch->handler->dest_pt.clock_rate, ch->handler->source_pt.clock_rate);
+				h->dest_pt.clock_rate, h->source_pt.clock_rate);
 		dtmf->duration = htons(duration);
 
 		// we can't directly use the RTP TS to schedule the send, as we have to adjust it
@@ -1704,26 +1954,44 @@ static int packet_dtmf_fwd(struct codec_ssrc_handler *ch, struct codec_ssrc_hand
 		ts_delay = duration - ch->dtmf_first_duration;
 
 		// shift forward our output RTP TS
-		output_ch->encoder->next_pts = (ts + duration) * output_ch->encoder->def->clockrate_mult;
-		output_ch->encoder->packet_pts += (duration - ch->last_dtmf_event_ts) * output_ch->encoder->def->clockrate_mult;
+		output_ch->encoder->next_pts = fraction_multl(ts + duration, &output_ch->encoder->clockrate_fact);
+		output_ch->encoder->packet_pts += fraction_multl(duration - ch->last_dtmf_event_ts, &output_ch->encoder->clockrate_fact);
 		ch->last_dtmf_event_ts = duration;
 	}
-	payload_type = ch->handler->dtmf_payload_type;
+	payload_type = h->dtmf_payload_type;
+	if (payload_type == -1)
+		payload_type = h->real_dtmf_payload_type;
 
 skip:
-	if (output_ch)
-		obj_put(&output_ch->h);
-
+	obj_put(&output_ch->h);
 	char *buf = malloc(packet->payload->len + sizeof(struct rtp_header) + RTP_BUFFER_TAIL_ROOM);
 	memcpy(buf + sizeof(struct rtp_header), packet->payload->s, packet->payload->len);
 	if (packet->bypass_seq) // inject original seq
-		__output_rtp(mp, ch, packet->handler ? : ch->handler, buf, packet->payload->len, packet->ts,
+		codec_output_rtp(mp, &ch->csch, packet->handler ? : h, buf, packet->payload->len, packet->ts,
 				packet->marker, packet->p.seq, -1, payload_type, ts_delay);
 	else // use our own sequencing
-		__output_rtp(mp, ch, packet->handler ? : ch->handler, buf, packet->payload->len, packet->ts,
+		codec_output_rtp(mp, &ch->csch, packet->handler ? : h, buf, packet->payload->len, packet->ts,
 				packet->marker, -1, 0, payload_type, ts_delay);
+	mp->ssrc_out->parent->seq_diff++;
 
 	return 0;
+}
+
+// forwards DTMF input to DTMF output, plus rescaling duration
+// returns 1 if packet has been consumed
+static int packet_dtmf_fwd(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+		struct transcode_packet *packet,
+		struct media_packet *mp)
+{
+	int payload_type = -1; // take from handler's output config
+	unsigned long ts_delay = 0;
+	struct codec_handler *h = ch->handler;
+	struct codec_handler *input_h = input_ch->handler;
+
+	int ret = __buffer_delay_packet(input_h->delay_buffer, ch, input_ch, packet, ts_delay, payload_type,
+			codec_add_dtmf_packet, mp, h->source_pt.clock_rate);
+	__buffer_delay_seq(input_h->delay_buffer, mp, -1);
+	return ret;
 }
 
 // returns the codec handler for the primary payload type - mostly determined by guessing
@@ -1736,7 +2004,7 @@ static struct codec_handler *__input_handler(struct codec_handler *h, struct med
 		if (prim_pt == 255)
 			continue;
 
-		struct codec_handler *sequencer_h = codec_handler_get(mp->media, prim_pt, mp->media_out);
+		struct codec_handler *sequencer_h = codec_handler_get(mp->media, prim_pt, mp->media_out, NULL);
 		if (sequencer_h == h)
 			continue;
 		if (sequencer_h->source_pt.codec_def && sequencer_h->source_pt.codec_def->supplemental)
@@ -1749,33 +2017,44 @@ static struct codec_handler *__input_handler(struct codec_handler *h, struct med
 	return h;
 }
 
+static int packet_dtmf_event(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+		struct transcode_packet *packet, struct media_packet *mp)
+{
+	LOCK(&mp->media->dtmf_lock);
+
+	if (mp->media->dtmf_ts != packet->ts) { // ignore already processed events
+		int ret = dtmf_event_packet(mp, packet->payload, ch->handler->source_pt.clock_rate, packet->ts);
+		if (G_UNLIKELY(ret == -1)) // error
+			return -1;
+		if (ret == 1) {
+			// END event
+			mp->media->dtmf_ts = packet->ts;
+			input_ch->dtmf_start_ts = 0;
+		}
+		else
+			input_ch->dtmf_start_ts = packet->ts ? packet->ts : 1;
+	}
+	return 0;
+}
+
 static int packet_dtmf(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 		struct transcode_packet *packet, struct media_packet *mp)
 {
-	{
-		LOCK(&mp->media->dtmf_lock);
-
-		if (mp->media->dtmf_ts != packet->ts) { // ignore already processed events
-			int ret = dtmf_event_packet(mp, packet->payload, ch->encoder_format.clockrate);
-			if (G_UNLIKELY(ret == -1)) // error
-				return -1;
-			if (ret == 1) {
-				// END event
-				mp->media->dtmf_ts = packet->ts;
-				input_ch->dtmf_start_ts = 0;
-			}
-			else
-				input_ch->dtmf_start_ts = packet->ts ? packet->ts : 1;
-		}
-	}
+	if (packet_dtmf_event(ch, input_ch, packet, mp))
+		return -1;
 
 	int ret = 0;
 
-	if (!mp->call->block_dtmf && !mp->media->monologue->block_dtmf) {
+	enum block_dtmf_mode block_dtmf = dtmf_get_block_mode(mp->call, mp->media->monologue);
+
+	if (block_dtmf == BLOCK_DTMF_DROP)
+		{ }
+	else {
+		// pass through
 		if (__buffer_dtx(input_ch->dtx_buffer, ch, input_ch, packet, mp, packet_dtmf_fwd))
 			ret = 1; // consumed
 		else
-			packet_dtmf_fwd(ch, input_ch, packet, mp);
+			ret = packet_dtmf_fwd(ch, input_ch, packet, mp);
 	}
 
 	return ret;
@@ -1784,13 +2063,19 @@ static int packet_dtmf_dup(struct codec_ssrc_handler *ch, struct codec_ssrc_hand
 		struct transcode_packet *packet,
 		struct media_packet *mp)
 {
-	if (!mp->call->block_dtmf && !mp->media->monologue->block_dtmf)
-		packet_dtmf_fwd(ch, input_ch, packet, mp);
-	return 0;
+	enum block_dtmf_mode block_dtmf = dtmf_get_block_mode(mp->call, mp->media->monologue);
+
+	int ret = 0;
+
+	if (block_dtmf == BLOCK_DTMF_DROP)
+		{ }
+	else // pass through
+		ret = packet_dtmf_fwd(ch, input_ch, packet, mp);
+	return ret;
 }
 
 static int __handler_func_supplemental(struct codec_handler *h, struct media_packet *mp,
-		int (*func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *,
+		int (*packet_func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *,
 			struct transcode_packet *, struct media_packet *),
 		int (*dup_func)(struct codec_ssrc_handler *, struct codec_ssrc_handler *,
 			struct transcode_packet *, struct media_packet *))
@@ -1817,7 +2102,7 @@ static int __handler_func_supplemental(struct codec_handler *h, struct media_pac
 	h->output_handler = sequencer_h;
 
 	struct transcode_packet *packet = g_slice_alloc0(sizeof(*packet));
-	packet->func = func;
+	packet->packet_func = packet_func;
 	packet->dup_func = dup_func;
 	packet->handler = h;
 	packet->rtp = *mp->rtp;
@@ -1853,6 +2138,25 @@ void codec_packet_free(void *pp) {
 		p->free_func(p->s.s);
 	ssrc_ctx_put(&p->ssrc_out);
 	g_slice_free1(sizeof(*p), p);
+}
+bool codec_packet_copy(struct codec_packet *p) {
+	char *buf = malloc(p->s.len + RTP_BUFFER_TAIL_ROOM);
+	if (!buf)
+		return false;
+	memcpy(buf, p->s.s, p->s.len);
+	p->s.s = buf;
+	p->free_func = free;
+	return true;
+}
+struct codec_packet *codec_packet_dup(struct codec_packet *p) {
+	struct codec_packet *dup = g_slice_alloc0(sizeof(*p));
+	*dup = *p;
+	codec_packet_copy(dup);
+	if (dup->ssrc_out)
+		ssrc_ctx_hold(dup->ssrc_out);
+	if (dup->rtp)
+		dup->rtp = (void *) dup->s.s;
+	return dup;
 }
 
 
@@ -1897,7 +2201,7 @@ struct rtp_payload_type *codec_make_payload_type(const str *codec_str, enum medi
 void codec_init_payload_type(struct rtp_payload_type *pt, enum media_type type) {
 #ifdef WITH_TRANSCODING
 	ensure_codec_def_type(pt, type);
-	const codec_def_t *def = pt->codec_def;
+	codec_def_t *def = pt->codec_def;
 
 	if (def) {
 		if (!pt->clock_rate)
@@ -1908,6 +2212,8 @@ void codec_init_payload_type(struct rtp_payload_type *pt, enum media_type type) 
 			pt->ptime = def->default_ptime;
 		if (!pt->format_parameters.s && def->default_fmtp)
 			str_init(&pt->format_parameters, (char *) def->default_fmtp);
+
+		codec_parse_fmtp(def, &pt->format, &pt->format_parameters, NULL);
 
 		if (def->init)
 			def->init(pt);
@@ -1972,18 +2278,21 @@ static int handler_func_passthrough_ssrc(struct codec_handler *h, struct media_p
 	if (!handler_silence_block(h, mp))
 		return 0;
 
+	uint32_t ts = 0;
 	if (mp->rtp) {
-		codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, &mp->tv);
+		ts = ntohl(mp->rtp->timestamp);
+		codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, &mp->tv);
 		codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
 	}
 
 	// substitute out SSRC etc
-	mp->rtp->ssrc = htonl(mp->ssrc_in->ssrc_map_out);
+	mp->rtp->ssrc = htonl(mp->ssrc_out->parent->h.ssrc);
 	mp->rtp->seq_num = htons(ntohs(mp->rtp->seq_num) + mp->ssrc_out->parent->seq_diff);
 
 	// keep track of other stats here?
 
-	codec_add_raw_packet(mp, h->source_pt.clock_rate);
+	__buffer_delay_raw(h->delay_buffer, h, codec_add_raw_packet, mp, h->source_pt.clock_rate);
+
 	return 0;
 }
 
@@ -2010,11 +2319,19 @@ static void __dtmf_dsp_callback(void *ptr, int code, int level, int delay) {
 }
 
 void codec_add_dtmf_event(struct codec_ssrc_handler *ch, int code, int level, uint64_t ts) {
-	struct dtmf_event *ev = g_slice_alloc(sizeof(*ev));
-	*ev = (struct dtmf_event) { .code = code, .volume = level, .ts = ts };
+	struct dtmf_event new_ev = { .code = code, .volume = level, .ts = ts };
 	ilogs(transcoding, LOG_DEBUG, "DTMF event state change: code %i, volume %i, TS %lu",
-			ev->code, ev->volume, (unsigned long) ts);
-	g_queue_push_tail(&ch->dtmf_events, ev);
+			new_ev.code, new_ev.volume, (unsigned long) ts);
+	dtmf_dsp_event(&new_ev, &ch->dtmf_state, ch->handler->media, ch->handler->source_pt.clock_rate,
+			ts + ch->csch.first_ts);
+
+	// add to queue if we're doing PCM -> DTMF event conversion
+	// this does not capture events when doing DTMF delay (dtmf_payload_type == -1)
+	if (ch->handler->dtmf_payload_type != -1) {
+		struct dtmf_event *ev = g_slice_alloc(sizeof(*ev));
+		*ev = new_ev;
+		g_queue_push_tail(&ch->dtmf_events, ev);
+	}
 }
 
 uint64_t codec_last_dtmf_event(struct codec_ssrc_handler *ch) {
@@ -2050,36 +2367,183 @@ static int codec_decoder_event(enum codec_event event, void *ptr, void *data) {
 	switch (event) {
 		case CE_AMR_CMR_RECV:
 			// ignore locking and races for this
-			media->u.amr.cmr.cmr_in = GPOINTER_TO_UINT(ptr);
-			media->u.amr.cmr.cmr_in_ts = rtpe_now;
+			media->encoder_callback.amr.cmr_in = GPOINTER_TO_UINT(ptr);
+			media->encoder_callback.amr.cmr_in_ts = rtpe_now;
 			break;
 		case CE_AMR_SEND_CMR:
 			// ignore locking and races for this
-			media->u.amr.cmr.cmr_out = GPOINTER_TO_UINT(ptr);
-			media->u.amr.cmr.cmr_out_ts = rtpe_now;
+			media->encoder_callback.amr.cmr_out = GPOINTER_TO_UINT(ptr);
+			media->encoder_callback.amr.cmr_out_ts = rtpe_now;
+			break;
+		case CE_EVS_CMR_RECV:
+			// ignore locking and races for this
+			media->encoder_callback.evs.cmr_in = GPOINTER_TO_UINT(ptr);
+			media->encoder_callback.evs.cmr_in_ts = rtpe_now;
+			break;
 		default:
 			break;
 	}
 	return 0;
 }
 
+// must be locked
+static void __delay_buffer_schedule(struct delay_buffer *dbuf) {
+	if (dbuf->ct.next.tv_sec) // already scheduled?
+		return;
+
+	struct delay_frame *dframe = g_queue_peek_tail(&dbuf->frames);
+	if (!dframe)
+		return;
+
+	struct timeval to_run = dframe->mp.tv;
+	timeval_add_usec(&to_run, dbuf->delay * 1000);
+	dbuf->ct.next = to_run;
+	timerthread_obj_schedule_abs(&dbuf->ct.tt_obj, &dbuf->ct.next);
+}
+
+static bool __buffer_delay_do_direct(struct delay_buffer *dbuf) {
+	if (!dbuf)
+		return true;
+	LOCK(&dbuf->lock);
+	if (dbuf->delay == 0 && dbuf->frames.length == 0)
+		return true;
+	return false;
+}
+
+static int delay_frame_cmp(const void *A, const void *B, void *ptr) {
+	const struct delay_frame *a = A, *b = B;
+	return -1 * timeval_cmp(&a->mp.tv, &b->mp.tv);
+}
+
+// consumes frame
+// `frame` can be NULL (discarded/lost packet)
+static void __buffer_delay_frame(struct delay_buffer *dbuf, struct codec_ssrc_handler *ch,
+		encoder_input_func_t input_func, AVFrame *frame, struct media_packet *mp, uint32_t ts)
+{
+	if (__buffer_delay_do_direct(dbuf)) {
+		// input now
+		if (frame) {
+			input_func(ch->encoder, frame, ch->handler->packet_encoded, ch, mp);
+			av_frame_free(&frame);
+		}
+		return;
+	}
+
+	struct delay_frame *dframe = g_slice_alloc0(sizeof(*dframe));
+	dframe->frame = frame;
+	dframe->encoder_func = input_func;
+	dframe->ts = ts;
+	dframe->ch = obj_get(&ch->h);
+	dframe->handler = ch->handler;
+	media_packet_copy(&dframe->mp, mp);
+
+	LOCK(&dbuf->lock);
+	g_queue_insert_sorted(&dbuf->frames, dframe, delay_frame_cmp, NULL);
+
+	__delay_buffer_schedule(dbuf);
+
+}
+
+static void __buffer_delay_raw(struct delay_buffer *dbuf, struct codec_handler *handler,
+		raw_input_func_t input_func, struct media_packet *mp, unsigned int clockrate)
+{
+	if (__buffer_delay_do_direct(dbuf)) {
+		// direct passthrough
+		input_func(mp, clockrate);
+		return;
+	}
+
+	struct delay_frame *dframe = g_slice_alloc0(sizeof(*dframe));
+	dframe->raw_func = input_func;
+	dframe->clockrate = clockrate;
+	dframe->handler = handler;
+	media_packet_copy(&dframe->mp, mp);
+
+	// also copy packet payload
+	dframe->mp.raw = mp->raw;
+	dframe->mp.raw.s = g_malloc(mp->raw.len + RTP_BUFFER_TAIL_ROOM);
+	memcpy(dframe->mp.raw.s, mp->raw.s, mp->raw.len);
+
+	LOCK(&dbuf->lock);
+	g_queue_insert_sorted(&dbuf->frames, dframe, delay_frame_cmp, NULL);
+
+	__delay_buffer_schedule(dbuf);
+}
+
+// returns 1 if packet has been consumed
+static int __buffer_delay_packet(struct delay_buffer *dbuf,
+		struct codec_ssrc_handler *ch,
+		struct codec_ssrc_handler *input_ch,
+		struct transcode_packet *packet,
+		unsigned long ts_delay,
+		int payload_type,
+		packet_input_func_t packet_func, struct media_packet *mp, unsigned int clockrate)
+{
+	if (__buffer_delay_do_direct(dbuf)) {
+		// direct passthrough
+		packet_func(ch, input_ch, packet, ts_delay, payload_type, mp);
+		return 0;
+	}
+
+	struct delay_frame *dframe = g_slice_alloc0(sizeof(*dframe));
+	dframe->packet_func = packet_func;
+	dframe->clockrate = clockrate;
+	dframe->ch = ch ? obj_get(&ch->h) : NULL;
+	dframe->input_ch = input_ch ? obj_get(&input_ch->h) : NULL;
+	dframe->ts_delay = ts_delay;
+	dframe->payload_type = payload_type;
+	dframe->packet = packet;
+	dframe->ts = packet->ts;
+	dframe->handler = ch->handler;
+	media_packet_copy(&dframe->mp, mp);
+
+	LOCK(&dbuf->lock);
+	g_queue_insert_sorted(&dbuf->frames, dframe, delay_frame_cmp, NULL);
+
+	__delay_buffer_schedule(dbuf);
+
+	return 1;
+}
+
+static void __buffer_delay_seq(struct delay_buffer *dbuf, struct media_packet *mp, int seq_adj) {
+	if (!mp->ssrc_out)
+		return;
+
+	if (__buffer_delay_do_direct(dbuf)) {
+		mp->ssrc_out->parent->seq_diff += seq_adj;
+		return;
+	}
+
+	LOCK(&dbuf->lock);
+
+	// peg the adjustment to the most recent frame if any
+	struct delay_frame *dframe = g_queue_peek_head(&dbuf->frames);
+	if (!dframe) {
+		mp->ssrc_out->parent->seq_diff += seq_adj;
+		return;
+	}
+
+	dframe->seq_adj += seq_adj;
+}
+
 // consumes `packet` if buffered (returns 1)
+// `packet` can be NULL (discarded packet for seq tracking)
 static int __buffer_dtx(struct dtx_buffer *dtxb, struct codec_ssrc_handler *decoder_handler,
 		struct codec_ssrc_handler *input_handler,
 		struct transcode_packet *packet, struct media_packet *mp,
-		int (*func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
+		int (*dtx_func)(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 			struct transcode_packet *packet,
 			struct media_packet *mp))
 {
 	if (!dtxb || !mp->sfd || !mp->ssrc_in || !mp->ssrc_out)
 		return 0;
 
-	unsigned long ts = packet->ts;
+	unsigned long ts = packet ? packet->ts : 0;
 
 	// allocate packet object
 	struct dtx_packet *dtxp = g_slice_alloc0(sizeof(*dtxp));
 	dtxp->packet = packet;
-	dtxp->func = func;
+	dtxp->dtx_func = dtx_func;
 	if (decoder_handler)
 		dtxp->decoder_handler = obj_get(&decoder_handler->h);
 	if (input_handler)
@@ -2104,14 +2568,51 @@ static int __buffer_dtx(struct dtx_buffer *dtxb, struct codec_ssrc_handler *deco
 		timerthread_obj_schedule_abs(&dtxb->ct.tt_obj, &dtxb->ct.next);
 	}
 
-	// packet now consumed
+	// packet now consumed if there was one
+	int ret = packet ? 1 : 0;
 	packet = NULL;
 
 	mutex_unlock(&dtxb->lock);
 
-	return 1;
+	return ret;
 }
 
+static void delay_frame_free(struct delay_frame *dframe) {
+	av_frame_free(&dframe->frame);
+	g_free(dframe->mp.raw.s);
+	media_packet_release(&dframe->mp);
+	if (dframe->ch)
+		obj_put(&dframe->ch->h);
+	if (dframe->input_ch)
+		obj_put(&dframe->input_ch->h);
+	if (dframe->packet)
+		__transcode_packet_free(dframe->packet);
+	g_slice_free1(sizeof(*dframe), dframe);
+}
+static void delay_frame_send(struct delay_frame *dframe) {
+	// XXX this should be unified with other instances of the same code
+	struct sink_handler *sh = &dframe->mp.sink;
+	struct packet_stream *sink = sh->sink;
+
+	if (!sink)
+		media_socket_dequeue(&dframe->mp, NULL); // just free
+	else {
+		if (sh->handler && media_packet_encrypt(sh->handler->out->rtp_crypt, sink, &dframe->mp))
+			ilogs(transcoding, LOG_ERR | LOG_FLAG_LIMIT, "Error encrypting buffered RTP media");
+
+		mutex_lock(&sink->out_lock);
+		if (media_socket_dequeue(&dframe->mp, sink))
+			ilogs(transcoding, LOG_ERR | LOG_FLAG_LIMIT,
+					"Error sending buffered media to RTP sink");
+		mutex_unlock(&sink->out_lock);
+	}
+}
+static void delay_frame_flush(struct delay_buffer *dbuf, struct delay_frame *dframe) {
+	// call is locked in W here
+	__delay_frame_process(dbuf, dframe);
+	delay_frame_send(dframe);
+	delay_frame_free(dframe);
+}
 static void dtx_packet_free(struct dtx_packet *dtxp) {
 	if (dtxp->packet)
 		__transcode_packet_free(dtxp->packet);
@@ -2122,10 +2623,241 @@ static void dtx_packet_free(struct dtx_packet *dtxp) {
 		obj_put(&dtxp->input_handler->h);
 	g_slice_free1(sizeof(*dtxp), dtxp);
 }
+static void delay_buffer_stop(struct delay_buffer **pcmbp) {
+	codec_timer_stop((struct codec_timer **) pcmbp);
+}
 static void dtx_buffer_stop(struct dtx_buffer **dtxbp) {
 	codec_timer_stop((struct codec_timer **) dtxbp);
 }
-static bool __dtx_drift_shift(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, unsigned long ts,
+
+
+static void delay_frame_manipulate(struct delay_frame *dframe) {
+	struct call_media *media = dframe->mp.media;
+	if (!media)
+		return;
+
+	AVFrame *frame = dframe->frame;
+
+	struct call_monologue *ml = media->monologue;
+	enum block_dtmf_mode mode = dtmf_get_block_mode(dframe->mp.call, ml);
+
+	if (mode == BLOCK_DTMF_OFF && media->monologue->dtmf_delay == 0)
+		return;
+
+	mutex_lock(&media->dtmf_lock);
+	struct dtmf_event *dtmf_recv = is_in_dtmf_event(&media->dtmf_recv, dframe->ts, frame->sample_rate,
+			media->buffer_delay, media->buffer_delay);
+	struct dtmf_event *dtmf_send = is_in_dtmf_event(&media->dtmf_send, dframe->ts, frame->sample_rate,
+			0, 0);
+	mutex_unlock(&media->dtmf_lock);
+
+	if (mode == BLOCK_DTMF_OFF) {
+		if (!dtmf_send) {
+			mode = BLOCK_DTMF_SILENCE;
+
+			if (dframe->ch->handler->real_dtmf_payload_type != -1) {
+				// add end event to queue
+				if (dframe->ch->dtmf_event.code) {
+					struct dtmf_event *ev = g_slice_alloc0(sizeof(*ev));
+					uint64_t ts = dframe->ch->encoder ? dframe->ch->encoder->next_pts
+						: dframe->ts;
+					*ev = (struct dtmf_event) { .code = 0, .volume = 0, .ts = ts };
+					g_queue_push_tail(&dframe->ch->dtmf_events, ev);
+				}
+			}
+
+			if (!dtmf_recv)
+				return;
+		}
+		else
+			mode = dtmf_send->block_dtmf;
+	}
+	else if (!dtmf_recv)
+		return;
+
+	// XXX this should be used for DTMF injection instead of a separate codec handler
+
+	switch (mode) {
+		case BLOCK_DTMF_OFF:
+			// DTMF delay mode: play original DTMF
+			// `dtmf_send` is valid ONLY HERE
+			if (dframe->ch->handler->real_dtmf_payload_type != -1) {
+				// add event to handler queue so the packet can be translated
+				// to DTMF event packet.
+				memset(frame->extended_data[0], 0, frame->linesize[0]);
+				// XXX quite some redundant operations here: first the incoming
+				// DTMF event is decoded to audio, which is then later (maybe) replaced
+				// by silence. when the delayed DTMF is reproduced, the frame samples
+				// are first filled with silence, and then replaced
+				// by the DTMF event packet in packet_encoded_rtp().
+				if (dframe->ch->dtmf_event.code != dtmf_send->code) {
+					// XXX this should be switched to proper state tracking instead
+					// of using start/stop events
+					struct dtmf_event *ev = g_slice_alloc0(sizeof(*ev));
+					uint64_t ts = dframe->ch->encoder ? dframe->ch->encoder->next_pts
+						: dframe->ts;
+					*ev = (struct dtmf_event) { .code = dtmf_send->code,
+						.volume = -1 * dtmf_send->volume,
+						.ts = ts };
+					g_queue_push_tail(&dframe->ch->dtmf_events, ev);
+				}
+			}
+			else {
+				// fill with DTMF PCM
+				frame_fill_dtmf_samples(frame->format, frame->extended_data[0], dframe->ts,
+						frame->nb_samples, dtmf_code_from_char(dtmf_send->code),
+						dtmf_send->volume, frame->sample_rate,
+						GET_CHANNELS(frame));
+			}
+			break;
+		case BLOCK_DTMF_SILENCE:
+			memset(frame->extended_data[0], 0, frame->linesize[0]);
+			break;
+		case BLOCK_DTMF_TONE:;
+			unsigned int freq = 0;
+			if (ml->tone_freqs && ml->tone_freqs->len)
+				freq = g_array_index(ml->tone_freqs, unsigned int,
+						dtmf_recv->index % ml->tone_freqs->len);
+			frame_fill_tone_samples(frame->format, frame->extended_data[0], dframe->ts,
+					frame->nb_samples, freq ?: 400,
+					ml->tone_vol ? : 10, frame->sample_rate, GET_CHANNELS(frame));
+			break;
+		case BLOCK_DTMF_ZERO:
+		case BLOCK_DTMF_DTMF:
+			// if we have DTMF output, use silence, otherwise use a DTMF zero
+			if (dframe->ch->handler->dtmf_payload_type != -1)
+				memset(frame->extended_data[0], 0, frame->linesize[0]);
+			else
+				frame_fill_dtmf_samples(frame->format, frame->extended_data[0],
+						dframe->ts,
+						frame->nb_samples, dtmf_code_from_char(ml->dtmf_digit),
+						ml->tone_vol ? : 10, frame->sample_rate,
+						GET_CHANNELS(frame));
+			break;
+		case BLOCK_DTMF_RANDOM:
+			frame_fill_dtmf_samples(frame->format, frame->extended_data[0], dframe->ts,
+					frame->nb_samples, dtmf_recv->rand_code - '0',
+					10, frame->sample_rate,
+					GET_CHANNELS(frame));
+			break;
+		default:
+			break;
+	}
+}
+static void delay_packet_manipulate(struct delay_frame *dframe) {
+	struct call_media *media = dframe->mp.media;
+	if (!media)
+		return;
+	if (!dframe->handler)
+		return;
+
+	struct media_packet *mp = &dframe->mp;
+
+	if (is_in_dtmf_event(&media->dtmf_recv, dframe->ts, dframe->clockrate, media->buffer_delay,
+				media->buffer_delay))
+	{
+		// is this a DTMF event packet?
+		if (!dframe->handler->source_pt.codec_def || !dframe->handler->source_pt.codec_def->dtmf)
+			return;
+
+		struct call_monologue *ml = media->monologue;
+		enum block_dtmf_mode mode = dtmf_get_block_mode(dframe->mp.call, ml);
+
+		// this can be a "raw" or "packet" - get the appropriate payload
+		str *payload = &mp->raw;
+		if (dframe->packet)
+			payload = dframe->packet->payload;
+
+		struct telephone_event_payload *dtmf = (void *) payload->s;
+		if (payload->len < sizeof(*dtmf))
+			return;
+
+		switch (mode) {
+			case BLOCK_DTMF_ZERO:
+			case BLOCK_DTMF_DTMF:
+				dtmf->event = dtmf_code_from_char(ml->dtmf_digit);
+				break;
+			default:
+				break;
+		}
+	}
+}
+static void __delay_frame_process(struct delay_buffer *dbuf, struct delay_frame *dframe) {
+	struct codec_ssrc_handler *csh = dframe->ch;
+
+	if (csh && csh->handler && csh->encoder && dframe->encoder_func) {
+		delay_frame_manipulate(dframe);
+		dframe->encoder_func(csh->encoder, dframe->frame, csh->handler->packet_encoded,
+				csh, &dframe->mp);
+	}
+	else if (dframe->raw_func) {
+		delay_packet_manipulate(dframe);
+		dframe->raw_func(&dframe->mp, dframe->clockrate);
+	}
+	else if (dframe->packet_func && dframe->packet) {
+		delay_packet_manipulate(dframe);
+		dframe->packet_func(csh, dframe->input_ch, dframe->packet, dframe->ts_delay,
+				dframe->payload_type, &dframe->mp);
+	}
+
+	if (dframe->seq_adj)
+		dframe->mp.ssrc_out->parent->seq_diff += dframe->seq_adj;
+}
+static void __delay_send_later(struct codec_timer *ct) {
+	struct delay_buffer *dbuf = (void *) ct;
+
+	struct call *call = NULL;
+	struct delay_frame *dframe = NULL;
+
+	{
+		// short-term lock - copy out references to all relevant objects
+		LOCK(&dbuf->lock);
+
+		call = dbuf->call;
+		if (call)
+			obj_get(call);
+
+		dframe = g_queue_pop_tail(&dbuf->frames);
+	}
+
+	if (!call) // do nothing
+		goto out;
+
+	// we can now do a top-down lock
+	rwlock_lock_r(&call->master_lock);
+	log_info_call(call);
+
+	if (!dframe)
+		goto out;
+
+	__ssrc_lock_both(&dframe->mp);
+
+	__delay_frame_process(dbuf, dframe);
+
+	__ssrc_unlock_both(&dframe->mp);
+
+	delay_frame_send(dframe);
+
+	{
+		// schedule next run
+		LOCK(&dbuf->lock);
+		dbuf->ct.next.tv_sec = 0;
+		__delay_buffer_schedule(dbuf);
+	}
+
+out:
+	// release all references
+	if (call) {
+		rwlock_unlock_r(&call->master_lock);
+		obj_put(call);
+		log_info_pop();
+	}
+	if (dframe)
+		delay_frame_free(dframe);
+}
+
+
+static bool __dtx_drift_shift(struct dtx_buffer *dtxb, unsigned long ts,
 		long tv_diff, long ts_diff,
 		struct codec_ssrc_handler *ch)
 {
@@ -2157,9 +2889,9 @@ static bool __dtx_drift_shift(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, 
 	else if (dtxb->packets.length >= rtpe_config.dtx_buffer) {
 		// inspect TS is most recent packet
 		struct dtx_packet *dtxp_last = g_queue_peek_tail(&dtxb->packets);
-		ts_diff = dtxp_last->packet->ts - ts;
+		ts_diff = dtxp_last->packet ? dtxp_last->packet->ts - ts : 0;
 		long long ts_diff_us = (long long) ts_diff * 1000000 / dtxb->clockrate;
-		if (ts_diff_us >= rtpe_config.dtx_lag * 1000) {
+		if (ts_diff_us >= (long long) rtpe_config.dtx_lag * 1000) {
 			// overflow
 			ilogs(dtx, LOG_DEBUG, "DTX timer queue overflowing (%i packets in queue, "
 					"%lli ms delay), speeding up DTX timer by %i ms",
@@ -2170,7 +2902,7 @@ static bool __dtx_drift_shift(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, 
 
 	return discard;
 }
-static bool __dtx_drift_drop(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, unsigned long ts,
+static bool __dtx_drift_drop(struct dtx_buffer *dtxb, unsigned long ts,
 		long tv_diff, long ts_diff,
 		struct codec_ssrc_handler *ch)
 {
@@ -2193,9 +2925,9 @@ static bool __dtx_drift_drop(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, u
 	else if (dtxb->packets.length >= rtpe_config.dtx_buffer) {
 		// inspect TS is most recent packet
 		struct dtx_packet *dtxp_last = g_queue_peek_tail(&dtxb->packets);
-		ts_diff = dtxp_last->packet->ts - ts;
+		ts_diff = dtxp_last->packet ? dtxp_last->packet->ts - ts : 0;
 		long long ts_diff_us = (long long) ts_diff * 1000000 / dtxb->clockrate;
-		if (ts_diff_us >= rtpe_config.dtx_lag * 1000) {
+		if (ts_diff_us >= (long long) rtpe_config.dtx_lag * 1000) {
 			// overflow
 			ilogs(dtx, LOG_DEBUG, "DTX timer queue overflowing (%i packets in queue, "
 					"%lli ms delay), discarding packet",
@@ -2206,15 +2938,13 @@ static bool __dtx_drift_drop(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, u
 
 	return discard;
 }
-static bool __dtx_handle_drift(struct dtx_buffer *dtxb, struct dtx_packet *dtxp, unsigned long ts,
+static bool __dtx_handle_drift(struct dtx_buffer *dtxb, unsigned long ts,
 		long tv_diff, long ts_diff,
 		struct codec_ssrc_handler *ch)
 {
-	if (!dtxp)
-		return false;
 	if (rtpe_config.dtx_shift)
-		return __dtx_drift_shift(dtxb, dtxp, ts, tv_diff, ts_diff, ch);
-	return __dtx_drift_drop(dtxb, dtxp, ts, tv_diff, ts_diff, ch);
+		return __dtx_drift_shift(dtxb, ts, tv_diff, ts_diff, ch);
+	return __dtx_drift_drop(dtxb, ts, tv_diff, ts_diff, ch);
 }
 static void __dtx_send_later(struct codec_timer *ct) {
 	struct dtx_buffer *dtxb = (void *) ct;
@@ -2241,7 +2971,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 		dtxp = g_queue_peek_head(&dtxb->packets);
 		if (dtxp) {
 			// inspect head packet and check TS, see if it's ready to be decoded
-			ts = dtxp->packet->ts;
+			ts = dtxp->packet ? dtxp->packet->ts : dtxb->head_ts;
 			ts_diff = ts - dtxb->head_ts;
 			long long ts_diff_us = (long long) ts_diff * 1000000 / dtxb->clockrate;
 
@@ -2272,10 +3002,13 @@ static void __dtx_send_later(struct codec_timer *ct) {
 			media_packet_copy(&dtxb->last_mp, &dtxp->mp);
 			media_packet_copy(&mp_copy, &dtxp->mp);
 			if (dtxb->head_ts)
-				ts_diff = dtxp->packet->ts - dtxb->head_ts;
+				ts_diff = dtxp->packet ? dtxp->packet->ts - dtxb->head_ts : 0;
 			else
 				ts_diff = dtxb->tspp; // first packet
-			ts = dtxb->head_ts = dtxp->packet->ts;
+			if (dtxp->packet)
+				ts = dtxb->head_ts = dtxp->packet->ts;
+			else
+				ts = dtxb->head_ts;
 			tv_diff = timeval_diff(&rtpe_now, &mp_copy.tv);
 		}
 		else {
@@ -2296,10 +3029,49 @@ static void __dtx_send_later(struct codec_timer *ct) {
 		input_ch = (dtxp && dtxp->input_handler) ? obj_get(&dtxp->input_handler->h) : NULL;
 		call = dtxb->call ? obj_get(dtxb->call) : NULL;
 
-		if (!call || !ch || !ps || !ps->ssrc_in[0]
-				|| dtxb->ssrc != ps->ssrc_in[0]->parent->h.ssrc
-				|| dtxb->ct.next.tv_sec == 0) {
-			// shut down or SSRC change
+		// check but DTX buffer shutdown conditions
+		bool shutdown = false;
+		if (!call)
+			shutdown = true;
+		else if (!ch)
+			shutdown = true;
+		else if (!ps)
+			shutdown = true;
+		else if (!ps->ssrc_in[0])
+			shutdown = true;
+		else if (dtxb->ssrc != ps->ssrc_in[0]->parent->h.ssrc)
+			shutdown = true;
+		else if (dtxb->ct.next.tv_sec == 0)
+			shutdown = true;
+		else {
+			shutdown = true; // default if no most used PTs are known
+
+			for (int i = 0; i < ps->ssrc_in[0]->tracker.most_len; i++) {
+				unsigned char most_pt = ps->ssrc_in[0]->tracker.most[i];
+				shutdown = false;
+				// we are good if the most used PT is
+				// either us
+				if (ch->handler->source_pt.payload_type == most_pt)
+					break;
+				// or our input PT (which is the audio PT if we are supplemental)
+				if (ch->handler->input_handler && ch->handler->input_handler->source_pt.payload_type == most_pt)
+					break;
+
+				// looks like codec change, but...
+				shutdown = true;
+
+				// another possibility is that the most used PT is actually a supplemental type. check this,
+				// and if true move on to the next most used PT.
+				struct rtp_payload_type *pt = g_hash_table_lookup(ps->media->codecs.codecs, GUINT_TO_POINTER(most_pt));
+				if (pt && pt->codec_def && pt->codec_def->supplemental)
+					continue;
+
+				// all other cases: codec change
+				break;
+			}
+		}
+
+		if (shutdown) {
 			ilogs(dtx, LOG_DEBUG, "DTX buffer for %lx has been shut down", (unsigned long) dtxb->ssrc);
 			dtxb->ct.next.tv_sec = 0;
 			dtxb->head_ts = 0;
@@ -2310,7 +3082,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 		if (!dtxp) // we need to do DTX
 			break;
 
-		bool discard = __dtx_handle_drift(dtxb, dtxp, ts, tv_diff, ts_diff, ch);
+		bool discard = __dtx_handle_drift(dtxb, ts, tv_diff, ts_diff, ch);
 
 		if (!discard)
 			break;
@@ -2346,6 +3118,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 	}
 
 	int ptime = dtxb->ptime;
+	time_t dtxb_start = dtxb->start;
 
 	mutex_unlock(&dtxb->lock);
 
@@ -2357,7 +3130,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 				"%i packets left in queue", ts, p_left);
 
 		mp_copy.ptime = -1;
-		ret = dtxp->func(ch, input_ch, dtxp->packet, &mp_copy);
+		ret = dtxp->dtx_func(ch, input_ch, dtxp->packet, &mp_copy);
 		if (!ret) {
 			if (mp_copy.ptime > 0)
 				ptime = mp_copy.ptime;
@@ -2367,7 +3140,7 @@ static void __dtx_send_later(struct codec_timer *ct) {
 					"Decoder error while processing buffered RTP packet");
 	}
 	else {
-		unsigned int diff = rtpe_now.tv_sec - dtxb->start;
+		int diff = rtpe_now.tv_sec - dtxb_start;
 
 		if (rtpe_config.max_dtx <= 0 || diff < rtpe_config.max_dtx) {
 			ilogs(dtx, LOG_DEBUG, "RTP media for TS %lu missing, triggering DTX", ts);
@@ -2426,8 +3199,10 @@ static void __dtx_send_later(struct codec_timer *ct) {
 	rwlock_unlock_r(&call->master_lock);
 
 out:
-	if (call)
+	if (call) {
 		obj_put(call);
+		log_info_pop();
+	}
 	if (ch)
 		obj_put(&ch->h);
 	if (input_ch)
@@ -2435,7 +3210,6 @@ out:
 	if (dtxp)
 		dtx_packet_free(dtxp);
 	media_packet_release(&mp_copy);
-	log_info_clear();
 }
 static void __dtx_shutdown(struct dtx_buffer *dtxb) {
 	if (dtxb->csh)
@@ -2446,26 +3220,49 @@ static void __dtx_shutdown(struct dtx_buffer *dtxb) {
 	dtxb->call = NULL;
 	g_queue_clear_full(&dtxb->packets, (GDestroyNotify) dtx_packet_free);
 }
+static void __delay_buffer_shutdown(struct delay_buffer *dbuf, bool flush) {
+	if (flush) {
+		while (dbuf->frames.length) {
+			struct delay_frame *dframe = g_queue_pop_tail(&dbuf->frames);
+			delay_frame_flush(dbuf, dframe);
+		}
+	}
+	else
+		g_queue_clear_full(&dbuf->frames, (GDestroyNotify) delay_frame_free);
+	if (dbuf->call)
+		obj_put(dbuf->call);
+	dbuf->call = NULL;
+}
 static void __dtx_free(void *p) {
 	struct dtx_buffer *dtxb = p;
 	__dtx_shutdown(dtxb);
 	media_packet_release(&dtxb->last_mp);
 	mutex_destroy(&dtxb->lock);
 }
+static void __delay_buffer_free(void *p) {
+	struct delay_buffer *dbuf = p;
+	__delay_buffer_shutdown(dbuf, false);
+	mutex_destroy(&dbuf->lock);
+}
 static void __dtx_setup(struct codec_ssrc_handler *ch) {
-	if (!decoder_has_dtx(ch->decoder) || ch->dtx_buffer)
+	if (!decoder_has_dtx(ch->decoder))
 		return;
 
 	if (!rtpe_config.dtx_delay)
 		return;
 
-	struct dtx_buffer *dtx =
-		ch->dtx_buffer = obj_alloc0("dtx_buffer", sizeof(*dtx), __dtx_free);
-	dtx->ct.tt_obj.tt = &codec_timers_thread;
-	dtx->ct.func = __dtx_send_later;
-	dtx->csh = obj_get(&ch->h);
-	dtx->call = obj_get(ch->handler->media->call);
-	mutex_init(&dtx->lock);
+	struct dtx_buffer *dtx = ch->dtx_buffer;
+	if (!dtx) {
+		dtx = ch->dtx_buffer = obj_alloc0("dtx_buffer", sizeof(*dtx), __dtx_free);
+		dtx->ct.tt_obj.tt = &codec_timers_thread;
+		dtx->ct.timer_func = __dtx_send_later;
+		mutex_init(&dtx->lock);
+	}
+
+	if (!dtx->csh)
+		dtx->csh = obj_get(&ch->h);
+	if (!dtx->call)
+		dtx->call = obj_get(ch->handler->media->call);
 	dtx->ptime = ch->ptime;
 	if (dtx->ptime <= 0)
 		dtx->ptime = ch->handler->source_pt.codec_def->default_ptime;
@@ -2476,7 +3273,38 @@ static void __dtx_setup(struct codec_ssrc_handler *ch) {
 	dtx->clockrate = ch->handler->source_pt.clock_rate;
 	dtx->tspp = dtx->ptime * dtx->clockrate / 1000;
 }
-static void __ssrc_handler_stop(void *p, void *dummy) {
+static void __dtx_buffer_restart(void *p, void *arg) {
+	struct codec_ssrc_handler *ch = p;
+	__dtx_setup(ch);
+}
+static void __dtx_restart(struct codec_handler *h) {
+	ssrc_hash_foreach(h->ssrc_hash, __dtx_buffer_restart, NULL);
+}
+static void __delay_buffer_setup(struct delay_buffer **dbufp,
+		struct codec_handler *h, struct call *call, unsigned int delay)
+{
+	if (!dbufp)
+		return;
+
+	struct delay_buffer *dbuf = *dbufp;
+
+	if (!dbuf) {
+		if (!delay)
+			return;
+		dbuf = obj_alloc0("delay_buffer", sizeof(*dbuf), __delay_buffer_free);
+		dbuf->ct.tt_obj.tt = &codec_timers_thread;
+		dbuf->ct.timer_func = __delay_send_later;
+		dbuf->handler = h;
+		mutex_init(&dbuf->lock);
+	}
+
+	if (!dbuf->call)
+		dbuf->call = obj_get(call);
+	dbuf->delay = delay;
+
+	*dbufp = dbuf;
+}
+static void __ssrc_handler_stop(void *p, void *arg) {
 	struct codec_ssrc_handler *ch = p;
 	if (ch->dtx_buffer) {
 		mutex_lock(&ch->dtx_buffer->lock);
@@ -2489,7 +3317,15 @@ static void __ssrc_handler_stop(void *p, void *dummy) {
 void codec_handlers_stop(GQueue *q) {
 	for (GList *l = q->head; l; l = l->next) {
 		struct codec_handler *h = l->data;
-		ssrc_hash_foreach(h->ssrc_hash, __ssrc_handler_stop, NULL);
+
+		if (h->delay_buffer) {
+			mutex_lock(&h->delay_buffer->lock);
+			__delay_buffer_shutdown(h->delay_buffer, true);
+			mutex_unlock(&h->delay_buffer->lock);
+
+			delay_buffer_stop(&h->delay_buffer);
+		}
+		ssrc_hash_foreach(h->ssrc_hash, __ssrc_handler_stop, (void *) true);
 	}
 }
 
@@ -2606,8 +3442,13 @@ static struct ssrc_entry *__ssrc_handler_transcode_new(void *p) {
 	ch->sample_buffer = g_string_new("");
 	ch->bitrate = h->dest_pt.bitrate ? : h->dest_pt.codec_def->default_bitrate;
 
+	format_t dec_format = {
+		.clockrate = h->source_pt.clock_rate,
+		.channels = h->source_pt.channels,
+		.format = -1,
+	};
 	format_t enc_format = {
-		.clockrate = h->dest_pt.clock_rate * h->dest_pt.codec_def->clockrate_mult,
+		.clockrate = h->dest_pt.clock_rate,
 		.channels = h->dest_pt.channels,
 		.format = -1,
 	};
@@ -2616,8 +3457,9 @@ static struct ssrc_entry *__ssrc_handler_transcode_new(void *p) {
 		goto err;
 	if (encoder_config_fmtp(ch->encoder, h->dest_pt.codec_def,
 				ch->bitrate,
-				ch->ptime,
-				&enc_format, &ch->encoder_format, &h->dest_pt.format_parameters,
+				ch->ptime, &dec_format,
+				&enc_format, &ch->encoder_format, &h->dest_pt.format,
+				&h->dest_pt.format_parameters,
 				&h->dest_pt.codec_opts))
 		goto err;
 
@@ -2633,7 +3475,8 @@ static struct ssrc_entry *__ssrc_handler_transcode_new(void *p) {
 
 	ch->decoder = decoder_new_fmtp(h->source_pt.codec_def, h->source_pt.clock_rate, h->source_pt.channels,
 			h->source_pt.ptime,
-			&ch->encoder_format, &h->source_pt.format_parameters, &h->source_pt.codec_opts);
+			&ch->encoder_format, &h->source_pt.format,
+			&h->source_pt.format_parameters, &h->source_pt.codec_opts);
 	if (!ch->decoder)
 		goto err;
 	if (rtpe_config.dtx_cn_params.len) {
@@ -2693,17 +3536,14 @@ static void __free_ssrc_handler(void *chp) {
 	dtx_buffer_stop(&ch->dtx_buffer);
 }
 
-static int packet_encoded_rtp(encoder_t *enc, void *u1, void *u2) {
-	struct codec_ssrc_handler *ch = u1;
-	struct media_packet *mp = u2;
 
-	ilogs(transcoding, LOG_DEBUG, "RTP media successfully encoded: TS %llu, len %i",
-			(unsigned long long) enc->avpkt->pts, enc->avpkt->size);
-
-	// run this through our packetizer
+void packet_encoded_packetize(encoder_t *enc, struct codec_ssrc_handler *ch, struct media_packet *mp,
+		void (*fn)(encoder_t *, struct codec_ssrc_handler *, struct media_packet *, str *,
+			char *, unsigned int))
+{
 	AVPacket *in_pkt = enc->avpkt;
 
-	while (1) {
+	while (true) {
 		// figure out how big of a buffer we need
 		unsigned int payload_len = MAX(MAX(enc->avpkt->size, ch->bytes_per_packet),
 				sizeof(struct telephone_event_payload));
@@ -2728,44 +3568,7 @@ static int packet_encoded_rtp(encoder_t *enc, void *u1, void *u2) {
 
 		ilogs(transcoding, LOG_DEBUG, "Received packet of %zu bytes from packetizer", inout.len);
 
-		// check special payloads
-
-		unsigned int repeats = 0;
-		int payload_type = -1;
-		int dtmf_pt = ch->handler->dtmf_payload_type;
-		int is_dtmf = 0;
-
-		if (dtmf_pt != -1)
-			is_dtmf = dtmf_event_payload(&inout, (uint64_t *) &enc->avpkt->pts, enc->avpkt->duration,
-					&ch->dtmf_event, &ch->dtmf_events);
-		if (is_dtmf) {
-			payload_type = dtmf_pt;
-			if (is_dtmf == 1)
-				ch->rtp_mark = 1; // DTMF start event
-			else if (is_dtmf == 3)
-				repeats = 2; // DTMF end event
-		}
-		else {
-			if (is_silence_event(&inout, &ch->silence_events, enc->avpkt->pts, enc->avpkt->duration))
-				payload_type = ch->handler->cn_payload_type;
-		}
-
-		// ready to send
-
-		do {
-			char *send_buf = buf;
-			if (repeats > 0) {
-				// need to duplicate the payload as __output_rtp consumes it
-				send_buf = malloc(pkt_len);
-				memcpy(send_buf, buf, pkt_len);
-			}
-			__output_rtp(mp, ch, ch->handler, send_buf, inout.len, ch->first_ts
-					+ enc->avpkt->pts / enc->def->clockrate_mult,
-					ch->rtp_mark ? 1 : 0, -1, 0,
-					payload_type, 0);
-			mp->ssrc_out->parent->seq_diff++;
-			ch->rtp_mark = 0;
-		} while (repeats--);
+		fn(enc, ch, mp, &inout, buf, pkt_len);
 
 		if (ret == 0) {
 			// no more to go
@@ -2775,14 +3578,76 @@ static int packet_encoded_rtp(encoder_t *enc, void *u1, void *u2) {
 		// loop around and get more
 		in_pkt = NULL;
 	}
+}
+
+
+static void packet_encoded_tx(encoder_t *enc, struct codec_ssrc_handler *ch, struct media_packet *mp,
+		str *inout, char *buf, unsigned int pkt_len);
+
+static int packet_encoded_rtp(encoder_t *enc, void *u1, void *u2) {
+	struct codec_ssrc_handler *ch = u1;
+	struct media_packet *mp = u2;
+
+	ilogs(transcoding, LOG_DEBUG, "RTP media successfully encoded: TS %llu, len %i",
+			(unsigned long long) enc->avpkt->pts, enc->avpkt->size);
+
+	// run this through our packetizer
+	packet_encoded_packetize(enc, ch, mp, packet_encoded_tx);
 
 	return 0;
 }
 
+static void packet_encoded_tx(encoder_t *enc, struct codec_ssrc_handler *ch, struct media_packet *mp,
+		str *inout, char *buf, unsigned int pkt_len)
+{
+	// check special payloads
+
+	unsigned int repeats = 0;
+	int payload_type = -1;
+	int dtmf_pt = ch->handler->dtmf_payload_type;
+	if (dtmf_pt == -1)
+		dtmf_pt = ch->handler->real_dtmf_payload_type;
+	int is_dtmf = 0;
+
+	if (dtmf_pt != -1)
+		is_dtmf = dtmf_event_payload(inout, (uint64_t *) &enc->avpkt->pts, enc->avpkt->duration,
+				&ch->dtmf_event, &ch->dtmf_events);
+	if (is_dtmf) {
+		payload_type = dtmf_pt;
+		if (is_dtmf == 1)
+			ch->rtp_mark = 1; // DTMF start event
+		else if (is_dtmf == 3)
+			repeats = 2; // DTMF end event
+	}
+	else {
+		if (is_silence_event(inout, &ch->silence_events, enc->avpkt->pts, enc->avpkt->duration))
+			payload_type = ch->handler->cn_payload_type;
+	}
+
+	// ready to send
+
+	do {
+		char *send_buf = buf;
+		if (repeats > 0) {
+			// need to duplicate the payload as codec_output_rtp consumes it
+			send_buf = malloc(pkt_len);
+			memcpy(send_buf, buf, pkt_len);
+		}
+		codec_output_rtp(mp, &ch->csch, ch->handler, send_buf, inout->len, ch->csch.first_ts
+				+ fraction_divl(enc->avpkt->pts, &enc->clockrate_fact),
+				ch->rtp_mark ? 1 : 0, -1, 0,
+				payload_type, 0);
+		mp->ssrc_out->parent->seq_diff++;
+		ch->rtp_mark = 0;
+	} while (repeats--);
+}
+
+
+
 static void __dtmf_detect(struct codec_ssrc_handler *ch, AVFrame *frame) {
 	if (!ch->dtmf_dsp)
 		return;
-	if (ch->handler->dtmf_payload_type == -1 || !ch->handler->pcm_dtmf_detect) {
+	if (!ch->handler->pcm_dtmf_detect) {
 		ch->dtmf_event.code = 0;
 		return;
 	}
@@ -2822,8 +3687,7 @@ static void __dtmf_detect(struct codec_ssrc_handler *ch, AVFrame *frame) {
 }
 
 static int packet_decoded_common(decoder_t *decoder, AVFrame *frame, void *u1, void *u2,
-		int (*input_func)(encoder_t *enc, AVFrame *frame,
-			int (*callback)(encoder_t *, void *u1, void *u2), void *u1, void *u2))
+		encoder_input_func_t input_func)
 {
 	struct codec_ssrc_handler *ch = u1;
 	struct media_packet *mp = u2;
@@ -2835,8 +3699,14 @@ static int packet_decoded_common(decoder_t *decoder, AVFrame *frame, void *u1, v
 	struct codec_ssrc_handler *new_ch = __output_ssrc_handler(ch, mp);
 	if (new_ch != ch) {
 		// copy some essential parameters
-		if (!new_ch->first_ts)
-			new_ch->first_ts = ch->first_ts;
+		if (!new_ch->csch.first_ts)
+			new_ch->csch.first_ts = ch->csch.first_ts;
+
+		if (decoder->def->supplemental) {
+			// supp codecs return bogus timestamps. Adjust the frame's TS to be in
+			// line with the primary decoder
+			frame->pts -= new_ch->csch.first_ts;
+		}
 
 		ch = new_ch;
 	}
@@ -2871,9 +3741,12 @@ static int packet_decoded_common(decoder_t *decoder, AVFrame *frame, void *u1, v
 
 	// locking deliberately ignored
 	if (mp->media_out)
-		ch->encoder->codec_options.amr.cmr = mp->media_out->u.amr.cmr;
+		ch->encoder->callback = mp->media_out->encoder_callback;
 
-	input_func(ch->encoder, frame, h->packet_encoded, ch, mp);
+	uint32_t ts = frame->pts + ch->csch.first_ts;
+	__buffer_delay_frame(h->input_handler ? h->input_handler->delay_buffer : h->delay_buffer,
+			ch, input_func, frame, mp, ts);
+	frame = NULL; // consumed
 
 discard:
 	av_frame_free(&frame);
@@ -2892,10 +3765,12 @@ static int packet_decoded_direct(decoder_t *decoder, AVFrame *frame, void *u1, v
 static int __rtp_decode(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
 		struct transcode_packet *packet, struct media_packet *mp)
 {
-	int ret = decoder_input_data_ptime(ch->decoder, packet->payload, packet->ts, &mp->ptime,
-			ch->handler->packet_decoded,
-			ch, mp);
-	mp->ssrc_out->parent->seq_diff--;
+	int ret = 0;
+	if (packet)
+		ret = decoder_input_data_ptime(ch->decoder, packet->payload, packet->ts, &mp->ptime,
+				ch->handler->packet_decoded,
+				ch, mp);
+	__buffer_delay_seq(input_ch->handler->delay_buffer, mp, -1);
 	return ret;
 }
 static int packet_decode(struct codec_ssrc_handler *ch, struct codec_ssrc_handler *input_ch,
@@ -2903,21 +3778,22 @@ static int packet_decode(struct codec_ssrc_handler *ch, struct codec_ssrc_handle
 {
 	int ret = 0;
 
-	if (!ch->first_ts)
-		ch->first_ts = packet->ts;
-	ch->last_ts = packet->ts;
+	if (!ch->csch.first_ts)
+		ch->csch.first_ts = packet->ts;
 
-	if (input_ch->dtmf_start_ts && !rtpe_config.dtmf_no_suppress) {
-		if ((packet->ts > input_ch->dtmf_start_ts && packet->ts - input_ch->dtmf_start_ts > 80000) ||
-				(packet->ts < input_ch->dtmf_start_ts && input_ch->dtmf_start_ts - packet->ts > 80000)) {
-			ilogs(transcoding, LOG_DEBUG, "Resetting decoder DTMF state due to TS discrepancy");
-			input_ch->dtmf_start_ts = 0;
-		}
-		else {
-			ilogs(transcoding, LOG_DEBUG, "Decoder is in DTMF state, discaring codec packet");
-			if (mp->ssrc_out)
-				mp->ssrc_out->parent->seq_diff--;
+	if (ch->decoder->def->dtmf) {
+		if (packet_dtmf_event(ch, input_ch, packet, mp))
 			goto out;
+	}
+	else {
+		if (input_ch->dtmf_start_ts && !rtpe_config.dtmf_no_suppress) {
+			if ((packet->ts > input_ch->dtmf_start_ts && packet->ts - input_ch->dtmf_start_ts > 80000) ||
+					(packet->ts < input_ch->dtmf_start_ts && input_ch->dtmf_start_ts - packet->ts > 80000)) {
+				ilogs(transcoding, LOG_DEBUG, "Resetting decoder DTMF state due to TS discrepancy");
+				input_ch->dtmf_start_ts = 0;
+			}
+			else
+				packet = NULL;
 		}
 	}
 
@@ -2931,6 +3807,15 @@ static int packet_decode(struct codec_ssrc_handler *ch, struct codec_ssrc_handle
 
 out:
 	return ret;
+}
+
+#else
+
+// dummy/stub
+static void __buffer_delay_raw(struct delay_buffer *dbuf, struct codec_handler *handler,
+		raw_input_func_t input_func, struct media_packet *mp, unsigned int clockrate)
+{
+	input_func(mp, clockrate);
 }
 
 #endif
@@ -2973,7 +3858,9 @@ void codec_calc_jitter(struct ssrc_ctx *ssrc, unsigned long ts, unsigned int clo
 	sec->transit = transit;
 	if (d < 0)
 		d = -d;
-	sec->jitter += d - ((sec->jitter + 8) >> 4);
+	// ignore implausibly large values
+	if (d < 100000)
+		sec->jitter += d - ((sec->jitter + 8) >> 4);
 	mutex_unlock(&sec->h.lock);
 }
 static void codec_calc_lost(struct ssrc_ctx *ssrc, uint16_t seq) {
@@ -3078,15 +3965,9 @@ static int handler_func_transcode(struct codec_handler *h, struct media_packet *
 	}
 
 	struct transcode_packet *packet = g_slice_alloc0(sizeof(*packet));
-	packet->func = packet_decode;
+	packet->packet_func = packet_decode;
 	packet->rtp = *mp->rtp;
 	packet->handler = h;
-
-	if (h->source_pt.codec_def->dtmf && h->dest_pt.codec_def->dtmf) {
-		// DTMF scaler
-		packet->func = packet_dtmf;
-		packet->dup_func = packet_dtmf_dup;
-	}
 
 	int ret = __handler_func_sequencer(mp, packet);
 
@@ -3112,20 +3993,27 @@ static int handler_func_inject_dtmf(struct codec_handler *h, struct media_packet
 	return 0;
 }
 
+#endif
 
 
 
 
 
-// special return value `(void *) 0x1` to signal type mismatch
 static struct rtp_payload_type *codec_make_payload_type_sup(const str *codec_str, struct call_media *media) {
-	struct rtp_payload_type *ret = codec_make_payload_type(codec_str, media->type_id);
+	struct rtp_payload_type *ret = codec_make_payload_type(codec_str, media ? media->type_id : MT_UNKNOWN);
 	if (!ret)
-		return NULL;
+		goto err2;
 
-	if (!ret->codec_def || (media->type_id && ret->codec_def->media_type != media->type_id)) {
+#ifndef WITH_TRANSCODING
+
+	return ret;
+
+#else
+
+	// check for type mismatch and don't warn if it is
+	if (!ret->codec_def || (media && media->type_id && ret->codec_def->media_type != media->type_id)) {
 		payload_type_free(ret);
-		return (void *) 0x1;
+		return NULL;
 	}
 	// we must support both encoding and decoding
 	if (!ret->codec_def->support_decoding)
@@ -3140,23 +4028,24 @@ static struct rtp_payload_type *codec_make_payload_type_sup(const str *codec_str
 
 err:
 	payload_type_free(ret);
+
+#endif
+
+err2:
+	ilogs(codec, LOG_WARN, "Codec '" STR_FORMAT "' requested for transcoding is not supported",
+			STR_FMT(codec_str));
 	return NULL;
 
 }
 
 
-static struct rtp_payload_type *codec_add_payload_type(const str *codec, struct call_media *media,
+#ifdef WITH_TRANSCODING
+
+static struct rtp_payload_type *codec_add_payload_type_pt(struct rtp_payload_type *pt, struct call_media *media,
 		struct call_media *other_media, struct codec_store *extra_cs)
 {
-	struct rtp_payload_type *pt = codec_make_payload_type_sup(codec, media);
-	if (!pt) {
-		ilogs(codec, LOG_WARN, "Codec '" STR_FORMAT "' requested for transcoding is not supported",
-				STR_FMT(codec));
+	if (!pt)
 		return NULL;
-	}
-	if (pt == (void *) 0x1)
-		return NULL;
-
 	pt->payload_type = __unused_pt_number(media, other_media, extra_cs, pt);
 	if (pt->payload_type < 0) {
 		ilogs(codec, LOG_WARN, "Ran out of RTP payload type numbers while adding codec '"
@@ -3168,6 +4057,13 @@ static struct rtp_payload_type *codec_add_payload_type(const str *codec, struct 
 
 	return pt;
 }
+static struct rtp_payload_type *codec_add_payload_type(const str *codec, struct call_media *media,
+		struct call_media *other_media, struct codec_store *extra_cs)
+{
+	struct rtp_payload_type *pt = codec_make_payload_type_sup(codec, media);
+	return codec_add_payload_type_pt(pt, media, other_media, extra_cs);
+}
+
 
 
 #endif
@@ -3190,6 +4086,11 @@ void payload_type_clear(struct rtp_payload_type *p) {
 void payload_type_free(struct rtp_payload_type *p) {
 	payload_type_clear(p);
 	g_slice_free1(sizeof(*p), p);
+}
+void payload_type_destroy(struct rtp_payload_type **p) {
+	if (*p)
+		payload_type_free(*p);
+	*p = NULL;
 }
 
 
@@ -3259,7 +4160,7 @@ static int __codec_options_set1(struct call *call, struct rtp_payload_type *pt, 
 		return 0;
 	}
 	// match - apply options
-	if (!pt->bitrate)
+	if (pt_parsed->bitrate)
 		pt->bitrate = pt_parsed->bitrate;
 	if (!pt->codec_opts.len && pt_parsed->codec_opts.len) {
 		str_free_dup(&pt->codec_opts);
@@ -3308,15 +4209,15 @@ static void codec_touched(struct codec_store *cs, struct rtp_payload_type *pt) {
 	g_hash_table_replace(cs->tracker->touched, GUINT_TO_POINTER(pt->clock_rate), (void *) 0x1);
 #endif
 }
-static int is_codec_touched(struct codec_store *cs, struct rtp_payload_type *pt) {
+static bool is_codec_touched(struct codec_store *cs, struct rtp_payload_type *pt) {
 #ifdef WITH_TRANSCODING
 	if (!cs || !cs->tracker || !cs->tracker->touched)
-		return 0;
+		return false;
 	if (cs->tracker->all_touched)
-		return 1;
-	return g_hash_table_lookup(cs->tracker->touched, GINT_TO_POINTER(pt->clock_rate)) ? 1 : 0;
+		return true;
+	return g_hash_table_lookup(cs->tracker->touched, GINT_TO_POINTER(pt->clock_rate)) ? true : false;
 #else
-	return 0;
+	return false;
 #endif
 }
 #ifdef WITH_TRANSCODING
@@ -3452,6 +4353,54 @@ static void codec_store_move(struct codec_store *dst, struct codec_store *src) {
 	codec_store_init(src, dst->media);
 }
 
+// `out_compat` must be initialised already, or NULL
+// either `codec` or `pt_parsed` must be given (or both)
+static void codec_store_find_matching_codecs(GQueue *out_compat, struct rtp_payload_type **out_exact,
+		struct codec_store *cs, const str *codec,
+		struct rtp_payload_type *pt_parsed)
+{
+	AUTO_CLEANUP_NULL(struct rtp_payload_type *pt_store, payload_type_destroy);
+	struct rtp_payload_type *pt = NULL;
+
+	if (pt_parsed)
+		pt = pt_parsed;
+	else {
+		// parse out the codec params if any are given, otherwise just go with the name
+		if (str_chr(codec, '/'))
+			pt = pt_store = codec_make_payload_type_sup(codec, cs->media);
+	}
+
+	GQueue *pts = g_hash_table_lookup(cs->codec_names, codec);
+	if (pt) {
+		if (!pts)
+			pts = g_hash_table_lookup(cs->codec_names, &pt->encoding_with_params);
+		if (!pts)
+			pts = g_hash_table_lookup(cs->codec_names, &pt->encoding);
+	}
+	if (!pts)
+		return; // no matches
+	// see if given format parameters match
+	for (GList *k = pts->head; k; k = k->next) {
+		struct rtp_payload_type *pt2 = g_hash_table_lookup(cs->codecs, k->data);
+		if (!pt2)
+			continue;
+		ensure_codec_def(pt2, cs->media);
+		int match;
+		if (pt)
+			match = rtp_payload_type_fmt_eq(pt, pt2);
+		else
+			match = (str_cmp_str(codec, &pt2->encoding) == 0) ? 0 : -1;
+		if (match == 0) {
+			if (out_exact && !*out_exact)
+				*out_exact = pt2;
+			if (out_compat)
+				g_queue_push_head(out_compat, pt2);
+		}
+		else if (out_compat && match == 1)
+			g_queue_push_tail(out_compat, pt2);
+	}
+}
+
 static void codec_store_add_raw_link(struct codec_store *cs, struct rtp_payload_type *pt, GList *link) {
 	// cs->media may be NULL
 	ensure_codec_def(pt, cs->media);
@@ -3482,28 +4431,33 @@ void codec_store_add_raw(struct codec_store *cs, struct rtp_payload_type *pt) {
 	codec_store_add_raw_link(cs, pt, NULL);
 }
 
-static void codec_store_add_link(struct codec_store *cs, struct rtp_payload_type *pt, GList *link) {
+static struct rtp_payload_type *codec_store_add_link(struct codec_store *cs,
+		struct rtp_payload_type *pt, GList *link)
+{
 	if (!cs->media)
-		return;
+		return NULL;
 
 	ensure_codec_def(pt, cs->media);
 	if (proto_is_not_rtp(cs->media->protocol))
-		return;
+		return NULL;
 
 	struct rtp_payload_type *copy = rtp_payload_type_dup(pt);
 	codec_store_add_raw_link(cs, copy, link);
+	return copy;
 }
 
 // appends to the end, but before supplemental codecs
-static void codec_store_add_order(struct codec_store *cs, struct rtp_payload_type *pt) {
-	codec_store_add_link(cs, pt, cs->supp_link);
+static struct rtp_payload_type *codec_store_add_order(struct codec_store *cs, struct rtp_payload_type *pt) {
+	return codec_store_add_link(cs, pt, cs->supp_link);
 }
 // always add to end
 static void codec_store_add_end(struct codec_store *cs, struct rtp_payload_type *pt) {
 	codec_store_add_link(cs, pt, NULL);
 }
 
-void codec_store_populate_reuse(struct codec_store *dst, struct codec_store *src, GHashTable *codec_set) {
+void codec_store_populate_reuse(struct codec_store *dst, struct codec_store *src, GHashTable *codec_set,
+		bool answer_only)
+{
 	// start fresh
 	struct call_media *media = dst->media;
 	struct call *call = media ? media->call : NULL;
@@ -3512,13 +4466,23 @@ void codec_store_populate_reuse(struct codec_store *dst, struct codec_store *src
 		struct rtp_payload_type *pt = l->data;
 		struct rtp_payload_type *orig_pt = g_hash_table_lookup(dst->codecs,
 				GINT_TO_POINTER(pt->payload_type));
-		ilogs(codec, LOG_DEBUG, "Adding codec " STR_FORMAT " (%i)",
-				STR_FMT(&pt->encoding_with_params),
-				pt->payload_type);
-				
-		if (!orig_pt) {
-			__codec_options_set(call, pt, codec_set);
-			codec_store_add_end(dst, pt);
+
+		if (orig_pt)
+			ilogs(codec, LOG_DEBUG, "Retaining codec " STR_FORMAT " (%i)",
+					STR_FMT(&pt->encoding_with_params),
+					pt->payload_type);
+		else {
+			if (!answer_only) {
+				ilogs(codec, LOG_DEBUG, "Adding codec " STR_FORMAT " (%i) to end of list",
+						STR_FMT(&pt->encoding_with_params),
+						pt->payload_type);
+				__codec_options_set(call, pt, codec_set);
+				codec_store_add_end(dst, pt);
+			}
+			else
+				ilogs(codec, LOG_DEBUG, "Not adding stray answer codec " STR_FORMAT " (%i)",
+						STR_FMT(&pt->encoding_with_params),
+						pt->payload_type);
 		}
 	}
 	if(dst->codec_prefs.head){
@@ -3535,7 +4499,19 @@ void codec_store_populate_reuse(struct codec_store *dst, struct codec_store *src
 	}
 }
 
-void codec_store_populate(struct codec_store *dst, struct codec_store *src, GHashTable *codec_set) {
+void codec_store_check_empty(struct codec_store *dst, struct codec_store *src) {
+	if (dst->codec_prefs.length)
+		return;
+
+	ilog(LOG_WARN, "Usage error: List of codecs empty. Restoring original list of codecs. "
+			"Results may be unexpected.");
+
+	codec_store_populate(dst, src, NULL, false);
+}
+
+void codec_store_populate(struct codec_store *dst, struct codec_store *src, GHashTable *codec_set,
+		bool answer_only)
+{
 	// start fresh
 	struct codec_store orig_dst;
 	codec_store_move(&orig_dst, dst);
@@ -3547,6 +4523,12 @@ void codec_store_populate(struct codec_store *dst, struct codec_store *src, GHas
 		struct rtp_payload_type *pt = l->data;
 		struct rtp_payload_type *orig_pt = g_hash_table_lookup(orig_dst.codecs,
 				GINT_TO_POINTER(pt->payload_type));
+		if (answer_only && !orig_pt) {
+			ilogs(codec, LOG_DEBUG, "Not adding stray answer codec " STR_FORMAT " (%i)",
+					STR_FMT(&pt->encoding_with_params),
+					pt->payload_type);
+			continue;
+		}
 		ilogs(codec, LOG_DEBUG, "Adding codec " STR_FORMAT " (%i)",
 				STR_FMT(&pt->encoding_with_params),
 				pt->payload_type);
@@ -3559,6 +4541,8 @@ void codec_store_populate(struct codec_store *dst, struct codec_store *src, GHas
 			str_free_dup(&pt->codec_opts);
 			pt->codec_opts = orig_pt->codec_opts;
 			orig_pt->codec_opts = STR_NULL;
+			if (pt->for_transcoding)
+				codec_touched(dst, pt);
 		}
 		__codec_options_set(call, pt, codec_set);
 		codec_store_add_end(dst, pt);
@@ -3671,64 +4655,51 @@ void codec_store_accept(struct codec_store *cs, GQueue *accept, struct codec_sto
 	// mark codecs as `for transcoding`
 	for (GList *l = accept->head; l; l = l->next) {
 		str *codec = l->data;
-		GQueue *pts;
-		int pts_is_full_list = 0; // bit of a hack
-		if (!str_cmp(codec, "all") || !str_cmp(codec, "full")) {
+		AUTO_CLEANUP(GQueue pts_matched, g_queue_clear) = G_QUEUE_INIT;
+
+		GQueue *pts = &pts_matched;
+		if (!str_cmp(codec, "all") || !str_cmp(codec, "full"))
 			pts = &cs->codec_prefs;
-			pts_is_full_list = 1;
-		}
 		else
-			pts = g_hash_table_lookup(cs->codec_names, codec);
-		if (!pts || !pts->length) {
-			pts_is_full_list = 0;
-			pts = NULL;
+			codec_store_find_matching_codecs(&pts_matched, NULL, cs, codec, NULL);
+
+		if (!pts->length) {
+			pts = &pts_matched;
 			// special case: strip=all, consume=X
 			if (orig)
-				pts = g_hash_table_lookup(orig->codec_names, codec);
-			if (pts && pts->length) {
-				// re-add from orig, then mark as accepted below
-				// XXX duplicate code
-				for (GList *k = pts->head; k; k = k->next) {
-					int pt_num = GPOINTER_TO_INT(k->data);
-					struct rtp_payload_type *orig_pt = g_hash_table_lookup(orig->codecs,
-							GINT_TO_POINTER(pt_num));
-					if (!orig_pt) {
-						ilogs(codec, LOG_DEBUG, "PT %i missing for accepting " STR_FORMAT,
-								pt_num,
-								STR_FMT(codec));
-						continue;
-					}
-					if (g_hash_table_lookup(cs->codecs, GINT_TO_POINTER(pt_num))) {
-						ilogs(codec, LOG_DEBUG, "PT %i (" STR_FORMAT ") already preset",
-								pt_num,
-								STR_FMT(codec));
-						continue;
-					}
-					ilogs(codec, LOG_DEBUG, "Re-adding stripped codec " STR_FORMAT " (%i)",
-							STR_FMT(&orig_pt->encoding_with_params), orig_pt->payload_type);
-					codec_touched(cs, orig_pt);
-					codec_store_add_order(cs, orig_pt);
-				}
-				pts = g_hash_table_lookup(cs->codec_names, codec);
-				if (!pts)
-					continue;
-				// drop down below
-			}
-			else {
+				codec_store_find_matching_codecs(&pts_matched, NULL, orig, codec, NULL);
+			if (!pts->length) {
 				ilogs(codec, LOG_DEBUG, "Codec " STR_FORMAT
 						" not present for accepting",
 						STR_FMT(codec));
 				continue;
 			}
+			// re-add from orig, then mark as accepted below
+			GQueue pt_readded = G_QUEUE_INIT;
+			// XXX duplicate code
+			for (GList *k = pts->head; k; k = k->next) {
+				struct rtp_payload_type *orig_pt = k->data;
+				if (g_hash_table_lookup(cs->codecs, GINT_TO_POINTER(orig_pt->payload_type))) {
+					ilogs(codec, LOG_DEBUG, "PT %i (" STR_FORMAT ") already preset",
+							orig_pt->payload_type,
+							STR_FMT(codec));
+					continue;
+				}
+				ilogs(codec, LOG_DEBUG, "Re-adding stripped codec " STR_FORMAT " (%i)",
+						STR_FMT(&orig_pt->encoding_with_params), orig_pt->payload_type);
+				codec_touched(cs, orig_pt);
+				struct rtp_payload_type *added = codec_store_add_order(cs, orig_pt);
+				if (added)
+					g_queue_push_tail(&pt_readded, added);
+			}
+			g_queue_clear(&pts_matched);
+			pts_matched = pt_readded;
+			if (!pts_matched.length)
+				continue;
 		}
 		for (GList *k = pts->head; k; k = k->next) {
-			int pt_num;
-			if (!pts_is_full_list)
-				pt_num = GPOINTER_TO_INT(k->data);
-			else {
-				struct rtp_payload_type *fpt = k->data;
-				pt_num = fpt->payload_type;
-			}
+			struct rtp_payload_type *fpt = k->data;
+			int pt_num = fpt->payload_type;
 			struct rtp_payload_type *pt = g_hash_table_lookup(cs->codecs,
 					GINT_TO_POINTER(pt_num));
 			if (!pt) {
@@ -3836,11 +4807,17 @@ void codec_store_transcode(struct codec_store *cs, GQueue *offer, struct codec_s
 	// special case of codec_store_offer(): synthesise codecs that were not already present
 	for (GList *l = offer->head; l; l = l->next) {
 		str *codec = l->data;
-		GQueue *pts = g_hash_table_lookup(cs->codec_names, codec);
-		if (pts && pts->length) {
+		// parse out given codec string
+		AUTO_CLEANUP(struct rtp_payload_type *pt, payload_type_destroy)
+			= codec_make_payload_type_sup(codec, cs->media);
+
+		// find matching existing PT if one exists
+		struct rtp_payload_type *pt_match = NULL;
+		codec_store_find_matching_codecs(NULL, &pt_match, cs, codec, pt);
+		if (pt_match) {
 			ilogs(codec, LOG_DEBUG, "Codec " STR_FORMAT
 					" already present (%i)",
-					STR_FMT(codec), GPOINTER_TO_INT(pts->head->data));
+					STR_FMT(codec), pt_match->payload_type);
 			continue;
 		}
 		GQueue *orig_list = g_hash_table_lookup(orig->codec_names, codec);
@@ -3849,7 +4826,7 @@ void codec_store_transcode(struct codec_store *cs, GQueue *offer, struct codec_s
 					" for transcoding",
 					STR_FMT(codec));
 			// create new payload type
-			struct rtp_payload_type *pt = codec_add_payload_type(codec, cs->media, NULL, orig);
+			pt = codec_add_payload_type_pt(pt, cs->media, NULL, orig);
 			if (!pt)
 				continue;
 			pt->for_transcoding = 1;
@@ -3859,6 +4836,7 @@ void codec_store_transcode(struct codec_store *cs, GQueue *offer, struct codec_s
 					STR_FMT(&pt->encoding_with_params), pt->payload_type);
 			codec_touched(cs, pt);
 			codec_store_add_raw_order(cs, pt);
+			pt = NULL;
 			continue;
 		}
 		// XXX duplicate code
@@ -3899,8 +4877,8 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 	// synthetic answer for T.38:
 	if (dst_media->type_id == MT_AUDIO && src_media->type_id == MT_IMAGE && dst->codec_prefs.length == 0) {
 		if (dst_media->t38_gateway && dst_media->t38_gateway->pcm_player
-				&& dst_media->t38_gateway->pcm_player->handler) {
-			codec_store_add_order(dst, &dst_media->t38_gateway->pcm_player->handler->dest_pt);
+				&& dst_media->t38_gateway->pcm_player->coder.handler) {
+			codec_store_add_order(dst, &dst_media->t38_gateway->pcm_player->coder.handler->dest_pt);
 			goto out;
 		}
 	}
@@ -3912,12 +4890,17 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 
 	// populate dst via output PTs from src's codec handlers
 	for (GList *l = src->codec_prefs.head; l; l = l->next) {
-		int add_codec = 1;
+		bool add_codec = true;
 		if (flags && flags->single_codec && num_codecs >= 1)
-			add_codec = 0;
+			add_codec = false;
 
 		struct rtp_payload_type *pt = l->data;
-		struct codec_handler *h = codec_handler_get(src_media, pt->payload_type, dst_media);
+		struct codec_handler *h = codec_handler_get(src_media, pt->payload_type, dst_media, NULL);
+
+		bool is_supp = false;
+		if (pt->codec_def && pt->codec_def->supplemental)
+			is_supp = true;
+
 		if (!h || h->dest_pt.payload_type == -1) {
 			// passthrough or missing
 			if (pt->for_transcoding)
@@ -3931,8 +4914,9 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 							" (%i) is passthrough",
 							STR_FMT(&pt->encoding_with_params),
 							pt->payload_type);
+					if (!is_supp)
+						num_codecs++;
 					codec_store_add_end(dst, pt);
-					num_codecs++;
 				}
 				else
 					ilogs(codec, LOG_DEBUG, "Skipping passthrough codec " STR_FORMAT
@@ -3944,9 +4928,7 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 		}
 
 		// supp codecs are handled in-line with their main media codecs
-		int is_supp = 0;
-		if (pt->codec_def && pt->codec_def->supplemental) {
-			is_supp = 1;
+		if (is_supp) {
 			if (pt->for_transcoding)
 				continue;
 			if (is_codec_touched(dst, pt))
@@ -3978,7 +4960,8 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 				codec_store_add_end(dst, pt);
 			else
 				codec_store_add_end(dst, &h->dest_pt);
-			num_codecs++;
+			if (!is_supp)
+				num_codecs++;
 		}
 
 		// handle associated supplemental codecs
@@ -3989,10 +4972,13 @@ void codec_store_answer(struct codec_store *dst, struct codec_store *src, struct
 			else
 				g_queue_push_tail(&supp_codecs, rtp_payload_type_dup(pt));
 		}
-		if (h->dtmf_payload_type != -1) {
-			pt = g_hash_table_lookup(orig_dst.codecs, GINT_TO_POINTER(h->dtmf_payload_type));
+		int dtmf_payload_type = h->dtmf_payload_type;
+		if (dtmf_payload_type == -1)
+			dtmf_payload_type = h->real_dtmf_payload_type;
+		if (dtmf_payload_type != -1) {
+			pt = g_hash_table_lookup(orig_dst.codecs, GINT_TO_POINTER(dtmf_payload_type));
 			if (!pt)
-				ilogs(codec, LOG_DEBUG, "DTMF payload type %i is missing", h->dtmf_payload_type);
+				ilogs(codec, LOG_DEBUG, "DTMF payload type %i is missing", dtmf_payload_type);
 			else
 				g_queue_push_tail(&supp_codecs, rtp_payload_type_dup(pt));
 		}
@@ -4054,7 +5040,7 @@ bool codec_store_is_full_answer(const struct codec_store *src, const struct code
 		const struct rtp_payload_type *src_pt = l->data;
 		const struct rtp_payload_type *dst_pt = g_hash_table_lookup(dst->codecs,
 				GINT_TO_POINTER(src_pt->payload_type));
-		if (!dst_pt || rtp_payload_type_cmp(src_pt, dst_pt)) {
+		if (!dst_pt || !rtp_payload_type_eq_compat(src_pt, dst_pt)) {
 			ilogs(codec, LOG_DEBUG, "Source codec " STR_FORMAT " is not present in the answer",
 					STR_FMT(&src_pt->encoding_with_params));
 			return false;
@@ -4063,9 +5049,35 @@ bool codec_store_is_full_answer(const struct codec_store *src, const struct code
 	return true;
 }
 
+
+
+static void __codec_timer_callback_free(void *p) {
+	struct timer_callback *cb = p;
+	if (cb->call)
+		obj_put(cb->call);
+}
+static void __codec_timer_callback_fire(struct codec_timer *ct) {
+	struct timer_callback *cb = (void *) ct;
+	log_info_call(cb->call);
+	cb->timer_callback_func(cb->call, cb->ptr);
+	codec_timer_stop(&ct);
+	log_info_pop();
+}
+void codec_timer_callback(struct call *c, void (*func)(struct call *, void *), void *p, uint64_t delay) {
+	struct timer_callback *cb = obj_alloc0("codec_timer_callback", sizeof(*cb), __codec_timer_callback_free);
+	cb->ct.tt_obj.tt = &codec_timers_thread;
+	cb->call = obj_get(c);
+	cb->timer_callback_func = func;
+	cb->ptr = p;
+	cb->ct.timer_func = __codec_timer_callback_fire;
+	cb->ct.next = rtpe_now;
+	timeval_add_usec(&cb->ct.next, delay);
+	timerthread_obj_schedule_abs(&cb->ct.tt_obj, &cb->ct.next);
+}
+
 static void codec_timers_run(void *p) {
 	struct codec_timer *ct = p;
-	ct->func(ct);
+	ct->timer_func(ct);
 }
 
 void codecs_init(void) {

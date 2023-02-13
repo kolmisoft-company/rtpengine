@@ -161,50 +161,6 @@ INLINE void g_queue_append(GQueue *dst, const GQueue *src) {
 }
 
 
-/* GTREE */
-
-int g_tree_find_first_cmp(void *, void *, void *);
-int g_tree_find_all_cmp(void *, void *, void *);
-INLINE void *g_tree_find_first(GTree *t, GEqualFunc f, void *data) {
-	void *p[3];
-	p[0] = data;
-	p[1] = f;
-	p[2] = NULL;
-	g_tree_foreach(t, g_tree_find_first_cmp, p);
-	return p[2];
-}
-INLINE void g_tree_find_all(GQueue *out, GTree *t, GEqualFunc f, void *data) {
-	void *p[3];
-	p[0] = data;
-	p[1] = f;
-	p[2] = out;
-	g_tree_foreach(t, g_tree_find_all_cmp, p);
-}
-INLINE void g_tree_get_values(GQueue *out, GTree *t) {
-	g_tree_find_all(out, t, NULL, NULL);
-}
-INLINE void g_tree_find_remove_all(GQueue *out, GTree *t) {
-	GList *l;
-	g_queue_init(out);
-	g_tree_find_all(out, t, NULL, NULL);
-	for (l = out->head; l; l = l->next)
-		g_tree_remove(t, l->data);
-}
-INLINE void g_tree_insert_coll(GTree *t, gpointer key, gpointer val, void (*cb)(gpointer, gpointer)) {
-	gpointer old = g_tree_lookup(t, key);
-	if (old)
-		cb(old, val);
-	g_tree_insert(t, key, val);
-}
-INLINE void g_tree_add_all(GTree *t, GQueue *q, void (*cb)(gpointer, gpointer)) {
-	GList *l;
-	for (l = q->head; l; l = l->next)
-		g_tree_insert_coll(t, l->data, l->data, cb);
-	g_queue_clear(q);
-}
-
-
-
 /* GHASHTABLE */
 
 INLINE GQueue *g_hash_table_lookup_queue_new(GHashTable *ht, void *key, GDestroyNotify free_func) {
@@ -343,11 +299,21 @@ struct thread_waker {
 
 void thread_waker_add(struct thread_waker *);
 void thread_waker_del(struct thread_waker *);
-void threads_join_all(bool);
+void threads_join_all(bool cancel);
 void thread_create_detach_prio(void (*)(void *), void *, const char *, int, const char *);
 INLINE void thread_create_detach(void (*f)(void *), void *a, const char *name) {
 	thread_create_detach_prio(f, a, NULL, 0, name);
 }
+
+#ifndef ASAN_BUILD
+#define thread_cancel_enable() pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL)
+#define thread_cancel_disable() pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL)
+#define thread_sleep_time 10000 /* ms */
+#else
+#define thread_cancel_enable() ((void)0)
+#define thread_cancel_disable() ((void)0)
+#define thread_sleep_time 100 /* ms */
+#endif
 
 
 
@@ -557,7 +523,64 @@ INLINE void atomic64_local_copy_zero(atomic64 *dst, atomic64 *src) {
 		} while (1); \
 	} while (0)
 
+INLINE void atomic64_calc_rate_from_diff(long long run_diff_us, uint64_t diff, atomic64 *rate_var) {
+	atomic64_set(rate_var, run_diff_us ? diff * 1000000LL / run_diff_us : 0);
+}
+INLINE void atomic64_calc_rate(const atomic64 *ax_var, long long run_diff_us,
+		atomic64 *intv_var, atomic64 *rate_var)
+{
+	uint64_t ax = atomic64_get(ax_var);
+	uint64_t old_intv = atomic64_get(intv_var);
+	atomic64_set(intv_var, ax);
+	atomic64_calc_rate_from_diff(run_diff_us, ax - old_intv, rate_var);
+}
+INLINE void atomic64_calc_diff(const atomic64 *ax_var, atomic64 *intv_var, atomic64 *diff_var) {
+	uint64_t ax = atomic64_get(ax_var);
+	uint64_t old_intv = atomic64_get(intv_var);
+	atomic64_set(intv_var, ax);
+	atomic64_set(diff_var, ax - old_intv);
+}
+INLINE void atomic64_mina(atomic64 *min, atomic64 *inp) {
+	atomic64_min(min, atomic64_get(inp));
+}
+INLINE void atomic64_maxa(atomic64 *max, atomic64 *inp) {
+	atomic64_max(max, atomic64_get(inp));
+}
+INLINE double atomic64_div(const atomic64 *n, const atomic64 *d) {
+	int64_t dd = atomic64_get(d);
+	if (!dd)
+		return 0.;
+	return (double) atomic64_get(n) / (double) dd;
+}
 
+
+
+/*** STATS HELPERS ***/
+
+#define STAT_MIN_MAX_RESET_ZERO(x, mm, loc) \
+	atomic64_set(&loc->min.x, atomic64_get_set(&mm->min.x, 0)); \
+	atomic64_set(&loc->max.x, atomic64_get_set(&mm->max.x, 0));
+
+#define STAT_MIN_MAX(x, loc, mm, cur) \
+	atomic64_set(&loc->min.x, atomic64_get_set(&mm->min.x, atomic64_get(&cur->x))); \
+	atomic64_set(&loc->max.x, atomic64_get_set(&mm->max.x, atomic64_get(&cur->x)));
+
+#define STAT_MIN_MAX_AVG(x, mm, loc, run_diff_us, counter_diff) \
+	atomic64_set(&loc->min.x, atomic64_get_set(&mm->min.x, 0)); \
+	atomic64_set(&loc->max.x, atomic64_get_set(&mm->max.x, 0)); \
+	atomic64_set(&loc->avg.x, run_diff_us ? atomic64_get(&counter_diff->x) * 1000000LL / run_diff_us : 0);
+
+#define STAT_SAMPLED_CALC_DIFF(x, stats, intv, diff) \
+	atomic64_calc_diff(&stats->sums.x, &intv->sums.x, &diff->sums.x); \
+	atomic64_calc_diff(&stats->sums_squared.x, &intv->sums_squared.x, &diff->sums_squared.x); \
+	atomic64_calc_diff(&stats->counts.x, &intv->counts.x, &diff->counts.x);
+
+#define STAT_SAMPLED_AVG_STDDEV(x, loc, diff) { \
+	double __mean = atomic64_div(&diff->sums.x, &diff->counts.x); \
+	atomic64_set(&loc->avg.x, __mean); \
+	atomic64_set(&loc->stddev.x, sqrt(fabs(atomic64_div(&diff->sums_squared.x, &diff->counts.x) \
+					- __mean * __mean))); \
+	}
 
 
 

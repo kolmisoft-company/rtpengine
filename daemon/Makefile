@@ -31,20 +31,18 @@ CFLAGS+=	$(shell pkg-config --cflags libavutil)
 CFLAGS+=	$(shell pkg-config --cflags libswresample)
 CFLAGS+=	$(shell pkg-config --cflags libavfilter)
 CFLAGS+=	$(shell pkg-config --cflags spandsp)
+CFLAGS+=	$(shell pkg-config --cflags opus)
 CFLAGS+=	-DWITH_TRANSCODING
 CFLAGS+=        $(shell mysql_config --cflags)
 else
 CFLAGS+=	-DWITHOUT_CODECLIB
 endif
 
-CFLAGS+=	-DRE_PLUGIN_DIR="\"/usr/lib/rtpengine\""
-
 ### compile time options:
 #CFLAGS+=	-DSRTCP_KEY_DERIVATION_RFC_COMPLIANCE
-#CFLAGS+=	-DTERMINATE_SDP_AT_BLANK_LINE
 #CFLAGS+=	-DSTRICT_SDES_KEY_LIFETIME
 
-LDLIBS=		-lm
+LDLIBS=		-lm -ldl
 LDLIBS+=	$(shell pkg-config --libs glib-2.0)
 LDLIBS+=	$(shell pkg-config --libs gthread-2.0)
 LDLIBS+=	$(shell pkg-config --libs zlib)
@@ -69,6 +67,7 @@ LDLIBS+=	$(shell pkg-config --libs libavutil)
 LDLIBS+=	$(shell pkg-config --libs libswresample)
 LDLIBS+=	$(shell pkg-config --libs libavfilter)
 LDLIBS+=	$(shell pkg-config --libs spandsp)
+LDLIBS+=	$(shell pkg-config --libs opus)
 LDLIBS+=        $(shell mysql_config --libs)
 endif
 
@@ -86,7 +85,7 @@ SRCS=		main.c kernel.c poller.c aux.c control_tcp.c call.c control_udp.c redis.c
 		mqtt.c janus.strhash.c
 LIBSRCS=	loglib.c auxlib.c rtplib.c str.c socket.c streambuf.c ssllib.c dtmflib.c
 ifeq ($(with_transcoding),yes)
-LIBSRCS+=	codeclib.c resample.c
+LIBSRCS+=	codeclib.strhash.c resample.c
 endif
 OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o)
 
@@ -94,3 +93,7 @@ PODS=		rtpengine.pod
 MANS=		$(PODS:.pod=.8)
 
 include ../lib/common.Makefile
+
+install: $(TARGET) $(MANS)
+	install -m 0755 -D $(TARGET) $(DESTDIR)/usr/bin/$(TARGET)
+	install -m 0644 -D $(TARGET).8 $(DESTDIR)/usr/share/man/man8/$(TARGET).8

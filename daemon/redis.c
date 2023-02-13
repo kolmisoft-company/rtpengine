@@ -76,10 +76,48 @@ static int redisCommandNR(redisContext *r, const char *fmt, ...)
 
 #define REDIS_FMT(x) (int) (x)->len, (x)->str
 
+// To protect against a restore race condition: Keyspace notifications are set up
+// before existing calls are restored (restore_thread). Therefore the following
+// scenario is possible:
+// NOTIF THREAD:   receives SET, creates call
+// RESTORE THREAD: executes KEYS *
+// NOTIF THREAD:   receives another SET:
+// NOTIF THREAD:      does call_destroy(), which:
+//                       adds ports to late-release list
+// RESTORE THREAD: comes across call ID, does GET
+// RESTORE THREAD: creates new call
+// RESTORE THREAD: wants to allocate ports, but they're still in use
+// NOTIF THREAD:   now does release_closed_sockets()
+static mutex_t redis_ports_release_lock = MUTEX_STATIC_INIT;
+static cond_t redis_ports_release_cond = COND_STATIC_INIT;
+static int redis_ports_release_balance = 0; // negative = releasers, positive = allocators
+
 static int redis_check_conn(struct redis *r);
 static void json_restore_call(struct redis *r, const str *id, bool foreign);
 static int redis_connect(struct redis *r, int wait);
 static int json_build_ssrc(struct call_monologue *ml, JsonReader *root_reader);
+
+
+// mutually exclusive multi-A multi-B lock
+// careful with deadlocks against redis->lock
+static void redis_ports_release_push(bool inc) {
+	LOCK(&redis_ports_release_lock);
+	if (inc) {
+		while (redis_ports_release_balance < 0)
+			cond_wait(&redis_ports_release_cond, &redis_ports_release_lock);
+	}
+	else {
+		while (redis_ports_release_balance > 0)
+			cond_wait(&redis_ports_release_cond, &redis_ports_release_lock);
+	}
+	redis_ports_release_balance += (inc ? 1 : -1);
+}
+static void redis_ports_release_pop(bool inc) {
+	LOCK(&redis_ports_release_lock);
+	redis_ports_release_balance -= (inc ? 1 : -1);
+	if (redis_ports_release_balance == 0)
+		cond_broadcast(&redis_ports_release_cond);
+}
 
 static void redis_pipe(struct redis *r, const char *fmt, ...) {
 	va_list ap;
@@ -375,7 +413,11 @@ void on_redis_notification(redisAsyncContext *actx, void *reply, void *privdata)
 			rwlock_unlock_w(&c->master_lock);
 			if (IS_FOREIGN_CALL(c)) {
 				c->redis_hosted_db = rtpe_redis_write->db; // don't delete from foreign DB
+				// redis_notify->lock is held
+				redis_ports_release_push(true);
 				call_destroy(c);
+				release_closed_sockets();
+				redis_ports_release_pop(true);
 			}
 			else {
 				rlog(LOG_WARN, "Redis-Notifier: Ignoring SET received for OWN call: " STR_FORMAT "\n", STR_FMT(&callid));
@@ -403,17 +445,20 @@ void on_redis_notification(redisAsyncContext *actx, void *reply, void *privdata)
 			rlog(LOG_WARN, "Redis-Notifier: Ignoring DEL received for an OWN call: " STR_FORMAT "\n", STR_FMT(&callid));
 			goto err;
 		}
+		// redis_notify->lock is held
+		redis_ports_release_push(true);
 		call_destroy(c);
+		release_closed_sockets();
+		redis_ports_release_pop(true);
 	}
 
 err:
-	if (c) {
-		// because of call_get(..)
+	if (c) // because of call_get(..)
 		obj_put(c);
-		log_info_clear();
-	}
 
 	mutex_unlock(&r->lock);
+	release_closed_sockets();
+	log_info_reset();
 }
 
 void redis_delete_async_context_connect(const redisAsyncContext *redis_delete_async_context, int status) {
@@ -845,6 +890,9 @@ err:
 	return NULL;
 }
 
+struct redis *redis_dup(const struct redis *r, int db) {
+	return redis_new(&r->endpoint, db >= 0 ? db : r->db, r->auth, r->role, r->no_redis_required);
+}
 
 void redis_close(struct redis *r) {
 	if (!r)
@@ -975,7 +1023,7 @@ static int json_get_hash(struct redis_hash *out,
 	static unsigned int MAXKEYLENGTH = 512;
 	char key_concatted[MAXKEYLENGTH];
 	int rc=0;
-	AUTO_CLEANUP_GVBUF(orig_members);
+	__attribute__((unused)) AUTO_CLEANUP_GVBUF(orig_members);
 
 	if (id == -1) {
 		rc = snprintf(key_concatted, MAXKEYLENGTH, "%s",key);
@@ -1192,7 +1240,7 @@ static int rbl_cb_simple(str *s, GQueue *q, struct redis_list *list, void *ptr) 
 	return 0;
 }
 
-static int json_build_list(GQueue *q, struct call *c, const char *key, const str *callid,
+static int json_build_list(GQueue *q, struct call *c, const char *key,
 		unsigned int idx, struct redis_list *list, JsonReader *root_reader)
 {
 	return json_build_list_cb(q, c, key, idx, list, rbl_cb_simple, NULL, root_reader);
@@ -1311,12 +1359,14 @@ static int redis_sfds(struct call *c, struct redis_list *sfds) {
 	unsigned int loc_uid;
 	struct stream_fd *sfd;
 	socket_t *sock;
-	int port;
+	int port, fd;
 	const char *err;
 
 	for (i = 0; i < sfds->len; i++) {
 		rh = &sfds->rh[i];
 
+		if (redis_hash_get_int(&fd, rh, "fd"))
+			fd = 0;
 		err = "'localport' key not present";
 		if (redis_hash_get_int(&port, rh, "localport"))
 			goto err;
@@ -1343,14 +1393,20 @@ static int redis_sfds(struct call *c, struct redis_list *sfds) {
 		if (!loc)
 			goto err;
 
-		err = "failed to open ports";
-		if (__get_consecutive_ports(&q, 1, port, loc->spec, &c->callid))
-			goto err;
-		err = "no port returned";
-		sock = g_queue_pop_head(&q);
-		if (!sock)
-			goto err;
-		set_tos(sock, c->tos);
+		if (fd != -1) {
+			err = "failed to open ports";
+			if (__get_consecutive_ports(&q, 1, port, loc->spec, &c->callid))
+				goto err;
+			err = "no port returned";
+			sock = g_queue_pop_head(&q);
+			if (!sock)
+				goto err;
+			set_tos(sock, c->tos);
+		}
+		else {
+			sock = g_slice_alloc(sizeof(*sock));
+			dummy_socket(sock, &loc->spec->local_address.addr);
+		}
 		sfd = stream_fd_new(sock, c, loc);
 
 		if (redis_hash_get_sdes_params1(&sfd->crypto.params, rh, "") == -1)
@@ -1386,7 +1442,7 @@ static int redis_streams(struct call *c, struct redis_list *streams) {
 			return -1;
 		if (redis_hash_get_endpoint(&ps->advertised_endpoint, rh, "advertised_endpoint"))
 			return -1;
-		if (redis_hash_get_stats(&ps->stats, rh, "stats"))
+		if (redis_hash_get_stats(&ps->stats_in, rh, "stats"))
 			return -1;
 		if (redis_hash_get_sdes_params1(&ps->crypto.params, rh, "") == -1)
 			return -1;
@@ -1420,11 +1476,13 @@ static int redis_tags(struct call *c, struct redis_list *tags, JsonReader *root_
 			__monologue_viabranch(ml, &s);
 		if (!redis_hash_get_str(&s, rh, "label"))
 			call_str_cpy(c, &ml->label, &s);
+		if (!redis_hash_get_str(&s, rh, "metadata"))
+			update_metadata_monologue(ml, &s);
 		redis_hash_get_time_t(&ml->deleted, rh, "deleted");
 		if (!redis_hash_get_int(&ii, rh, "block_dtmf"))
-			ml->block_dtmf = ii ? 1 : 0;
+			ml->block_dtmf = ii;
 		if (!redis_hash_get_int(&ii, rh, "block_media"))
-			ml->block_media = ii ? 1 : 0;
+			ml->block_media = ii ? true : false;
 
 		if (redis_hash_get_str(&s, rh, "logical_intf")
 				|| !(ml->logical_intf = get_logical_interface(&s, NULL, 0)))
@@ -1570,6 +1628,45 @@ static int redis_link_sfds(struct redis_list *sfds, struct redis_list *streams) 
 	return 0;
 }
 
+static int rbl_subs_cb(str *s, GQueue *q, struct redis_list *list, void *ptr) {
+	str token;
+
+	if (str_token_sep(&token, s, '/'))
+		return -1;
+
+	unsigned int idx = str_to_i(&token, 0);
+
+	unsigned int media_offset = 0;
+	bool offer_answer = false;
+	bool rtcp_only = false;
+	bool egress = false;
+
+	if (!str_token_sep(&token, s, '/')) {
+		media_offset = str_to_i(&token, 0);
+		if (!str_token_sep(&token, s, '/')) {
+			offer_answer = str_to_i(&token, 0) ? true : false;
+			if (!str_token_sep(&token, s, '/')) {
+				rtcp_only = str_to_i(&token, 0) ? true : false;
+				if (!str_token_sep(&token, s, '/'))
+					egress = str_to_i(&token, 0) ? true : false;
+			}
+		}
+	}
+
+	struct call_monologue *ml = ptr;
+	struct call_monologue *other_ml = redis_list_get_idx_ptr(list, idx);
+	if (!other_ml)
+		return -1;
+
+	__add_subscription(ml, other_ml, media_offset, &(struct sink_attrs) {
+			.offer_answer = offer_answer,
+			.rtcp_only = rtcp_only,
+			.egress = egress,
+		});
+
+	return 0;
+}
+
 static int json_link_tags(struct call *c, struct redis_list *tags, struct redis_list *medias, JsonReader *root_reader)
 {
 	unsigned int i;
@@ -1580,58 +1677,69 @@ static int json_link_tags(struct call *c, struct redis_list *tags, struct redis_
 	for (i = 0; i < tags->len; i++) {
 		ml = tags->ptrs[i];
 
-		if (json_build_list(&q, c, "subscriptions-oa", &c->callid, i, tags, root_reader))
-			return -1;
-		for (l = q.head; l; l = l->next) {
-			other_ml = l->data;
-			if (!other_ml)
-			    return -1;
-			__add_subscription(ml, other_ml, true, 0);
+		if (!json_build_list_cb(NULL, c, "subscriptions", i, tags, rbl_subs_cb, ml, root_reader)) {
+			// new format, ok
+			;
 		}
-		g_queue_clear(&q);
+		else if (!json_build_list(&q, c, "subscriptions-oa", i, tags, root_reader)) {
+			// legacy format
+			for (l = q.head; l; l = l->next) {
+				other_ml = l->data;
+				if (!other_ml)
+					return -1;
+				__add_subscription(ml, other_ml, 0,
+						&(struct sink_attrs) { .offer_answer = true });
+			}
+			g_queue_clear(&q);
 
-		if (json_build_list(&q, c, "subscriptions-noa", &c->callid, i, tags, root_reader))
-			return -1;
-		for (l = q.head; l; l = l->next) {
-			other_ml = l->data;
-			if (!other_ml)
-			    return -1;
-			__add_subscription(ml, other_ml, false, 0); // XXX fix indexing
+			if (json_build_list(&q, c, "subscriptions-noa", i, tags, root_reader))
+				return -1;
+			for (l = q.head; l; l = l->next) {
+				other_ml = l->data;
+				if (!other_ml)
+					return -1;
+				__add_subscription(ml, other_ml, 0, NULL);
+			}
+			g_queue_clear(&q);
 		}
-		g_queue_clear(&q);
 
 		// backwards compatibility
 		if (!ml->subscriptions.length) {
 			other_ml = redis_list_get_ptr(tags, &tags->rh[i], "active");
 			if (other_ml)
-				__add_subscription(ml, other_ml, true, 0);
+				__add_subscription(ml, other_ml, 0,
+						&(struct sink_attrs) { .offer_answer = true });
 		}
 
-		if (json_build_list(&q, c, "other_tags", &c->callid, i, tags, root_reader))
+		if (json_build_list(&q, c, "associated_tags", i, tags, root_reader))
 			return -1;
 		for (l = q.head; l; l = l->next) {
 			other_ml = l->data;
 			if (!other_ml)
 			    return -1;
-			g_hash_table_insert(ml->other_tags, &other_ml->tag, other_ml);
+			g_hash_table_insert(ml->associated_tags, other_ml, other_ml);
 		}
 		g_queue_clear(&q);
 
-		if (json_build_list(&q, c, "branches", &c->callid, i, tags, root_reader))
-			return -1;
-		for (l = q.head; l; l = l->next) {
-			other_ml = l->data;
-			if (!other_ml)
-			    return -1;
-			g_hash_table_insert(ml->branches, &other_ml->viabranch, other_ml);
-		}
-		g_queue_clear(&q);
-
-		if (json_build_list(&ml->medias, c, "medias", &c->callid, i, medias, root_reader))
+		if (json_build_list(&ml->medias, c, "medias", i, medias, root_reader))
 			return -1;
 	}
 
 	return 0;
+}
+
+static struct call_subscription *__find_subscriber(struct call_monologue *ml, struct packet_stream *sink) {
+	if (!ml || !sink || !sink->media)
+		return NULL;
+	struct call_monologue *find_ml = sink->media->monologue;
+
+	for (GList *l = ml->subscribers.head; l; l = l->next) {
+		struct call_subscription *cs = l->data;
+		struct call_monologue *sub_ml = cs->monologue;
+		if (find_ml == sub_ml)
+			return cs;
+	}
+	return NULL;
 }
 
 static int json_link_streams(struct call *c, struct redis_list *streams,
@@ -1644,21 +1752,26 @@ static int json_link_streams(struct call *c, struct redis_list *streams,
 
 	for (i = 0; i < streams->len; i++) {
 		ps = streams->ptrs[i];
+		struct call_monologue *ps_ml = ps->media ? ps->media->monologue : NULL;
 
 		ps->media = redis_list_get_ptr(medias, &streams->rh[i], "media");
 		ps->selected_sfd = redis_list_get_ptr(sfds, &streams->rh[i], "sfd");
 		ps->rtcp_sibling = redis_list_get_ptr(streams, &streams->rh[i], "rtcp_sibling");
 
-		if (json_build_list(&ps->sfds, c, "stream_sfds", &c->callid, i, sfds, root_reader))
+		if (json_build_list(&ps->sfds, c, "stream_sfds", i, sfds, root_reader))
 			return -1;
 
-		if (json_build_list(&q, c, "rtp_sinks", &c->callid, i, streams, root_reader))
+		if (json_build_list(&q, c, "rtp_sinks", i, streams, root_reader))
 			return -1;
 		for (l = q.head; l; l = l->next) {
 			struct packet_stream *sink = l->data;
 			if (!sink)
 				return -1;
-			__add_sink_handler(&ps->rtp_sinks, sink);
+			struct call_subscription *cs = __find_subscriber(ps_ml, sink);
+			if (cs && cs->attrs.egress)
+				continue;
+			struct sink_attrs attrs = { .rtcp_only = (cs && cs->attrs.rtcp_only) ? 1 : 0 };
+			__add_sink_handler(&ps->rtp_sinks, sink, &attrs);
 		}
 		g_queue_clear(&q);
 
@@ -1666,16 +1779,16 @@ static int json_link_streams(struct call *c, struct redis_list *streams,
 		if (!ps->rtp_sinks.length) {
 			struct packet_stream *sink = redis_list_get_ptr(streams, &streams->rh[i], "rtp_sink");
 			if (sink)
-				__add_sink_handler(&ps->rtp_sinks, sink);
+				__add_sink_handler(&ps->rtp_sinks, sink, NULL);
 		}
 
-		if (json_build_list(&q, c, "rtcp_sinks", &c->callid, i, streams, root_reader))
+		if (json_build_list(&q, c, "rtcp_sinks", i, streams, root_reader))
 			return -1;
 		for (l = q.head; l; l = l->next) {
 			struct packet_stream *sink = l->data;
 			if (!sink)
 				return -1;
-			__add_sink_handler(&ps->rtcp_sinks, sink);
+			__add_sink_handler(&ps->rtcp_sinks, sink, NULL);
 		}
 		g_queue_clear(&q);
 
@@ -1683,7 +1796,7 @@ static int json_link_streams(struct call *c, struct redis_list *streams,
 		if (!ps->rtcp_sinks.length) {
 			struct packet_stream *sink = redis_list_get_ptr(streams, &streams->rh[i], "rtcp_sink");
 			if (sink)
-				__add_sink_handler(&ps->rtcp_sinks, sink);
+				__add_sink_handler(&ps->rtcp_sinks, sink, NULL);
 		}
 
 		if (ps->media)
@@ -1707,9 +1820,9 @@ static int json_link_medias(struct call *c, struct redis_list *medias,
 		med->monologue = redis_list_get_ptr(tags, &medias->rh[i], "tag");
 		if (!med->monologue)
 			return -1;
-		if (json_build_list(&med->streams, c, "streams", &c->callid, i, streams, root_reader))
+		if (json_build_list(&med->streams, c, "streams", i, streams, root_reader))
 			return -1;
-		if (json_build_list(&med->endpoint_maps, c, "maps", &c->callid, i, maps, root_reader))
+		if (json_build_list(&med->endpoint_maps, c, "maps", i, maps, root_reader))
 			return -1;
 
 		if (med->media_id.s)
@@ -1827,6 +1940,9 @@ static void json_restore_call(struct redis *r, const str *callid, bool foreign) 
 	rr_jsonStr = redis_get(r, REDIS_REPLY_STRING, "GET " PB, STR(callid));
 	mutex_unlock(&r->lock);
 
+	bool must_release_pop = true;
+	redis_ports_release_push(false);
+
 	err = "could not retrieve JSON data from redis";
 	if (!rr_jsonStr)
 		goto err1;
@@ -1839,6 +1955,7 @@ static void json_restore_call(struct redis *r, const str *callid, bool foreign) 
 	err = "could not read JSON data";
 	if (!root_reader)
 		goto err1;
+
 
 	c = call_get_or_create(callid, foreign, false);
 	err = "failed to create call struct";
@@ -1883,6 +2000,7 @@ static void json_restore_call(struct redis *r, const str *callid, bool foreign) 
 	err = "missing 'created' timestamp";
 	if (redis_hash_get_timeval(&c->created, &call, "created"))
 		goto err8;
+	redis_hash_get_timeval(&c->destroyed, &call, "destroyed");
 	c->last_signal = last_signal;
 	if (redis_hash_get_int(&i, &call, "tos"))
 		c->tos = 184;
@@ -1895,9 +2013,9 @@ static void json_restore_call(struct redis *r, const str *callid, bool foreign) 
 	if (!redis_hash_get_str(&id, &call, "created_from_addr"))
 		sockaddr_parse_any_str(&c->created_from_addr, &id);
 	if (!redis_hash_get_int(&i, &call, "block_dtmf"))
-		c->block_dtmf = i ? 1 : 0;
+		c->block_dtmf = i;
 	if (!redis_hash_get_int(&i, &call, "block_media"))
-		c->block_media = i ? 1 : 0;
+		c->block_media = i ? true : false;
 
 	err = "missing 'redis_hosted_db' value";
 	if (redis_hash_get_unsigned((unsigned int *) &c->redis_hosted_db, &call, "redis_hosted_db"))
@@ -1939,7 +2057,8 @@ static void json_restore_call(struct redis *r, const str *callid, bool foreign) 
 	if (!redis_hash_get_str(&s, &call, "recording_meta_prefix")) {
 		// coverity[check_return : FALSE]
 		redis_hash_get_str(&meta, &call, "recording_metadata");
-		recording_start(c, s.s, &meta, NULL);
+		update_metadata_call(c, &meta);
+		recording_start(c, s.s, NULL);
 	}
 
 	err = NULL;
@@ -1976,8 +2095,12 @@ err1:
 					STR_FMT_M(callid),
 					err);
 		mutex_unlock(&r->lock);
-		if (c) 
+		if (c)
 			call_destroy(c);
+		release_closed_sockets();
+		if (must_release_pop) // avoid deadlock with redis_notify->lock below
+			redis_ports_release_pop(false);
+		must_release_pop = false;
 
 		mutex_lock(&rtpe_redis_write->lock);
 		redisCommandNR(rtpe_redis_write->ctx, "DEL " PB, STR(callid));
@@ -1991,7 +2114,10 @@ err1:
 	}
 	if (c)
 		obj_put(c);
-	log_info_clear();
+	release_closed_sockets();
+	if (must_release_pop)
+		redis_ports_release_pop(false);
+	log_info_reset();
 }
 
 struct thread_ctx {
@@ -2019,6 +2145,7 @@ static void restore_thread(void *call_p, void *ctx_p) {
 	mutex_lock(&ctx->r_m);
 	g_queue_push_tail(&ctx->r_q, r);
 	mutex_unlock(&ctx->r_m);
+	release_closed_sockets();
 }
 
 int redis_restore(struct redis *r, bool foreign, int db) {
@@ -2060,12 +2187,15 @@ int redis_restore(struct redis *r, bool foreign, int db) {
 		goto err;
 	}
 
+	if (calls->elements == 0)
+		goto out;
+
 	mutex_init(&ctx.r_m);
 	g_queue_init(&ctx.r_q);
 	ctx.foreign = foreign;
 	for (i = 0; i < rtpe_config.redis_num_threads; i++)
 		g_queue_push_tail(&ctx.r_q,
-				redis_new(&r->endpoint, db, r->auth, r->role, r->no_redis_required));
+				redis_dup(r, db));
 	gtp = g_thread_pool_new(restore_thread, &ctx, rtpe_config.redis_num_threads, TRUE, NULL);
 
 	for (i = 0; i < calls->elements; i++) {
@@ -2082,6 +2212,8 @@ int redis_restore(struct redis *r, bool foreign, int db) {
 	g_thread_pool_free(gtp, FALSE, TRUE);
 	while ((r = g_queue_pop_head(&ctx.r_q)))
 		redis_close(r);
+
+out:
 	ret = 0;
 
 	freeReplyObject(calls);
@@ -2201,6 +2333,7 @@ char* redis_encode_json(struct call *c) {
 
 		{
 			JSON_SET_SIMPLE("created","%lli", timeval_us(&c->created));
+			JSON_SET_SIMPLE("destroyed","%lli", timeval_us(&c->destroyed));
 			JSON_SET_SIMPLE("last_signal","%ld",(long int) c->last_signal);
 			JSON_SET_SIMPLE("tos","%u",(int) c->tos);
 			JSON_SET_SIMPLE("deleted","%ld",(long int) c->deleted);
@@ -2214,8 +2347,8 @@ char* redis_encode_json(struct call *c) {
 			JSON_SET_SIMPLE_CSTR("created_from_addr",sockaddr_print_buf(&c->created_from_addr));
 			JSON_SET_SIMPLE("redis_hosted_db","%u",c->redis_hosted_db);
 			JSON_SET_SIMPLE_STR("recording_metadata",&c->metadata);
-			JSON_SET_SIMPLE("block_dtmf","%i",c->block_dtmf ? 1 : 0);
-			JSON_SET_SIMPLE("block_media","%i",c->block_media ? 1 : 0);
+			JSON_SET_SIMPLE("block_dtmf","%i", c->block_dtmf);
+			JSON_SET_SIMPLE("block_media","%i",c->block_media);
 
 			if ((rec = c->recording)) {
 				JSON_SET_SIMPLE_CSTR("recording_meta_prefix",rec->meta_prefix);
@@ -2235,6 +2368,7 @@ char* redis_encode_json(struct call *c) {
 			{
 				JSON_SET_SIMPLE_CSTR("pref_family",sfd->local_intf->logical->preferred_family->rfc_name);
 				JSON_SET_SIMPLE("localport","%u",sfd->socket.local.port);
+				JSON_SET_SIMPLE("fd", "%i", sfd->socket.fd);
 				JSON_SET_SIMPLE_STR("logical_intf",&sfd->local_intf->logical->name);
 				JSON_SET_SIMPLE("local_intf_uid","%u",sfd->local_intf->unique_id);
 				JSON_SET_SIMPLE("stream","%u",sfd->stream->unique_id);
@@ -2266,9 +2400,9 @@ char* redis_encode_json(struct call *c) {
 				JSON_SET_SIMPLE("component","%u",ps->component);
 				JSON_SET_SIMPLE_CSTR("endpoint",endpoint_print_buf(&ps->endpoint));
 				JSON_SET_SIMPLE_CSTR("advertised_endpoint",endpoint_print_buf(&ps->advertised_endpoint));
-				JSON_SET_SIMPLE("stats-packets","%" PRIu64, atomic64_get(&ps->stats.packets));
-				JSON_SET_SIMPLE("stats-bytes","%" PRIu64, atomic64_get(&ps->stats.bytes));
-				JSON_SET_SIMPLE("stats-errors","%" PRIu64, atomic64_get(&ps->stats.errors));
+				JSON_SET_SIMPLE("stats-packets","%" PRIu64, atomic64_get(&ps->stats_in.packets));
+				JSON_SET_SIMPLE("stats-bytes","%" PRIu64, atomic64_get(&ps->stats_in.bytes));
+				JSON_SET_SIMPLE("stats-errors","%" PRIu64, atomic64_get(&ps->stats_in.errors));
 
 				json_update_crypto_params(builder, "", &ps->crypto.params);
 			}
@@ -2334,8 +2468,8 @@ char* redis_encode_json(struct call *c) {
 
 				JSON_SET_SIMPLE("created","%llu",(long long unsigned) ml->created);
 				JSON_SET_SIMPLE("deleted","%llu",(long long unsigned) ml->deleted);
-				JSON_SET_SIMPLE("block_dtmf","%i",ml->block_dtmf ? 1 : 0);
-				JSON_SET_SIMPLE("block_media","%i",ml->block_media ? 1 : 0);
+				JSON_SET_SIMPLE("block_dtmf","%i", ml->block_dtmf);
+				JSON_SET_SIMPLE("block_media","%i",ml->block_media);
 				if (ml->logical_intf)
 					JSON_SET_SIMPLE_STR("logical_intf", &ml->logical_intf->name);
 
@@ -2345,6 +2479,8 @@ char* redis_encode_json(struct call *c) {
 					JSON_SET_SIMPLE_STR("via-branch",&ml->viabranch);
 				if (ml->label.s)
 					JSON_SET_SIMPLE_STR("label",&ml->label);
+				if (ml->metadata.s)
+					JSON_SET_SIMPLE_STR("metadata", &ml->metadata);
 			}
 			json_builder_end_object (builder);
 
@@ -2356,20 +2492,8 @@ char* redis_encode_json(struct call *c) {
 			ml = l->data;
 			// -- we do it again here since the jsonbuilder is linear straight forward
 			// XXX these should all go into the above loop
-			k = g_hash_table_get_values(ml->other_tags);
-			snprintf(tmp, sizeof(tmp), "other_tags-%u", ml->unique_id);
-			json_builder_set_member_name(builder, tmp);
-			json_builder_begin_array (builder);
-			for (m = k; m; m = m->next) {
-				ml2 = m->data;
-				JSON_ADD_STRING("%u",ml2->unique_id);
-			}
-			json_builder_end_array (builder);
-
-			g_list_free(k);
-
-			k = g_hash_table_get_values(ml->branches);
-			snprintf(tmp, sizeof(tmp), "branches-%u", ml->unique_id);
+			k = g_hash_table_get_values(ml->associated_tags);
+			snprintf(tmp, sizeof(tmp), "associated_tags-%u", ml->unique_id);
 			json_builder_set_member_name(builder, tmp);
 			json_builder_begin_array (builder);
 			for (m = k; m; m = m->next) {
@@ -2416,25 +2540,17 @@ char* redis_encode_json(struct call *c) {
 			g_list_free(k);
 			rwlock_unlock_r(&ml->ssrc_hash->lock);
 
-			snprintf(tmp, sizeof(tmp), "subscriptions-oa-%u", ml->unique_id);
+			snprintf(tmp, sizeof(tmp), "subscriptions-%u", ml->unique_id);
 			json_builder_set_member_name(builder, tmp);
 			json_builder_begin_array(builder);
 			for (k = ml->subscriptions.head; k; k = k->next) {
 				struct call_subscription *cs = k->data;
-				if (!cs->offer_answer)
-					continue;
-				JSON_ADD_STRING("%u", cs->monologue->unique_id);
-			}
-			json_builder_end_array(builder);
-
-			snprintf(tmp, sizeof(tmp), "subscriptions-noa-%u", ml->unique_id);
-			json_builder_set_member_name(builder, tmp);
-			json_builder_begin_array(builder);
-			for (k = ml->subscriptions.head; k; k = k->next) {
-				struct call_subscription *cs = k->data;
-				if (cs->offer_answer)
-					continue;
-				JSON_ADD_STRING("%u", cs->monologue->unique_id);
+				JSON_ADD_STRING("%u/%u/%u/%u/%u",
+						cs->monologue->unique_id,
+						cs->media_offset,
+						cs->attrs.offer_answer,
+						cs->attrs.rtcp_only,
+						cs->attrs.egress);
 			}
 			json_builder_end_array(builder);
 		}

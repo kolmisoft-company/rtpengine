@@ -260,7 +260,8 @@ static int websocket_dequeue(struct websocket_conn *wc) {
 
 	int ret = 0;
 	if (is_http)
-		ret = lws_http_transaction_completed(wsi); // may destroy `wc`
+		if (lws_http_transaction_completed(wsi) == 1) // may destroy `wc`
+			ret = -1;
 
 	return ret;
 }
@@ -281,6 +282,24 @@ static const char *websocket_do_http_response(struct websocket_conn *wc, int sta
 	if (content_length >= 0)
 		if (lws_add_http_header_content_length(wc->wsi, content_length, &p, end))
 			return "Failed to add HTTP headers to response";
+
+	if (lws_add_http_header_by_name(wc->wsi,
+				(unsigned char *) "Access-Control-Allow-Origin:",
+				(unsigned char *) "*", 1, &p, end))
+		return "Failed to add CORS header";
+	if (lws_add_http_header_by_name(wc->wsi,
+				(unsigned char *) "Access-Control-Max-Age:",
+				(unsigned char *) "86400", 5, &p, end))
+		return "Failed to add CORS header";
+	if (lws_add_http_header_by_name(wc->wsi,
+				(unsigned char *) "Access-Control-Allow-Methods:",
+				(unsigned char *) "GET, POST", 9, &p, end))
+		return "Failed to add CORS header";
+	if (lws_add_http_header_by_name(wc->wsi,
+				(unsigned char *) "Access-Control-Allow-Headers:",
+				(unsigned char *) "Content-Type", 12, &p, end))
+		return "Failed to add CORS header";
+
 	if (lws_finalize_http_header(wc->wsi, &p, end))
 		return "Failed to write HTTP headers";
 
@@ -319,7 +338,7 @@ static const char *websocket_http_ping(struct websocket_message *wm) {
 static const char *websocket_http_metrics(struct websocket_message *wm) {
 	ilogs(http, LOG_DEBUG, "Respoding to GET /metrics");
 
-	AUTO_CLEANUP_INIT(GQueue *metrics, statistics_free_metrics, statistics_gather_metrics());
+	AUTO_CLEANUP_INIT(GQueue *metrics, statistics_free_metrics, statistics_gather_metrics(NULL));
 	AUTO_CLEANUP_INIT(GString *outp, __g_string_free, g_string_new(""));
 	AUTO_CLEANUP_INIT(GHashTable *metric_types, __g_hash_table_destroy,
 			g_hash_table_new(g_str_hash, g_str_equal));
@@ -472,7 +491,7 @@ static int websocket_http_get(struct websocket_conn *wc) {
 	const char *uri = wm->uri;
 	websocket_message_func_t handler = NULL;
 
-	ilogs(http, LOG_INFO, "HTTP GET from %s: '%s'", endpoint_print_buf(&wc->endpoint), wm->uri);
+	ilogs(http, LOG_INFO, "HTTP GET from %s: '%s'", endpoint_print_buf(&wc->endpoint), uri);
 	wm->method = M_GET;
 
 	if (!strcmp(uri, "/ping"))
@@ -481,6 +500,8 @@ static int websocket_http_get(struct websocket_conn *wc) {
 		handler = websocket_http_cli;
 	else if (!strcmp(uri, "/metrics"))
 		handler = websocket_http_metrics;
+	else if (!strncmp(uri, "/admin/", 7))
+		handler = websocket_janus_get;
 
 	if (!handler) {
 		ilogs(http, LOG_WARN, "Unhandled HTTP GET URI: '%s'", uri);
@@ -528,6 +549,24 @@ static int websocket_http_post(struct websocket_conn *wc) {
 }
 
 
+static const char *websocket_http_options_generic(struct websocket_message *wm) {
+	ilogs(http, LOG_DEBUG, "Respoding to OPTIONS");
+	return websocket_http_complete(wm->wc, 200, NULL, 0, NULL);
+}
+
+
+static int websocket_http_options(struct websocket_conn *wc) {
+	struct websocket_message *wm = wc->wm;
+
+	ilogs(http, LOG_INFO, "HTTP OPTIONS from %s: '%s'", endpoint_print_buf(&wc->endpoint), wm->uri);
+	wm->method = M_OPTIONS;
+
+	websocket_message_push(wc, websocket_http_options_generic);
+
+	return 0;
+}
+
+
 static int websocket_http_body(struct websocket_conn *wc, const char *body, size_t len) {
 	struct websocket_message *wm = wc->wm;
 	const char *uri = wm->uri;
@@ -550,6 +589,10 @@ static int websocket_http_body(struct websocket_conn *wc, const char *body, size
 		handler = websocket_http_ng;
 	else if (!strcmp(uri, "/admin") && wm->method == M_POST && wm->content_type == CT_JSON)
 		handler = websocket_janus_process;
+	else if (!strcmp(uri, "/janus") && wm->method == M_POST && wm->content_type == CT_JSON)
+		handler = websocket_janus_process;
+	else if (!strncmp(uri, "/janus/", 7) && wm->method == M_POST && wm->content_type == CT_JSON)
+		handler = websocket_janus_post;
 
 	if (!handler) {
 		ilogs(http, LOG_WARN, "Unhandled HTTP POST URI: '%s'", wm->uri);
@@ -619,12 +662,6 @@ static int websocket_conn_init(struct lws *wsi, void *p) {
 		return -1;
 
 	memset(wc, 0, sizeof(*wc));
-	wc->wsi = wsi;
-	mutex_init(&wc->lock);
-	cond_init(&wc->cond);
-	g_queue_init(&wc->messages);
-	g_queue_push_tail(&wc->output_q, websocket_output_new());
-	wc->janus_sessions = g_hash_table_new(g_direct_hash, g_direct_equal);
 
 	struct sockaddr_storage sa = {0,};
 	socklen_t sl = sizeof(sa);
@@ -645,22 +682,20 @@ static int websocket_conn_init(struct lws *wsi, void *p) {
 	int fd = lws_get_socket_fd(wsi);
 #endif
 
-	memset(wc, 0, sizeof(*wc));
-
 	if (getpeername(fd, (struct sockaddr *) &sa, &sl)) {
 		ilogs(http, LOG_ERR, "Failed to get remote address of HTTP/WS connection (fd %i): %s",
 				fd, strerror(errno));
 		return -1;
-	} else {
-		endpoint_parse_sockaddr_storage(&wc->endpoint, &sa);
 	}
 
+	endpoint_parse_sockaddr_storage(&wc->endpoint, &sa);
 	wc->wsi = wsi;
 	mutex_init(&wc->lock);
 	cond_init(&wc->cond);
 	g_queue_init(&wc->messages);
 	g_queue_push_tail(&wc->output_q, websocket_output_new());
 	wc->wm = websocket_message_new(wc);
+	wc->janus_sessions = g_hash_table_new(g_direct_hash, g_direct_equal);
 
 	return 0;
 }
@@ -687,6 +722,8 @@ static int websocket_do_http(struct lws *wsi, struct websocket_conn *wc, const c
 		return websocket_http_get(wc);
 	if (lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI))
 		return websocket_http_post(wc);
+	if (lws_hdr_total_length(wsi, WSI_TOKEN_OPTIONS_URI))
+		return websocket_http_options(wc);
 
 	ilogs(http, LOG_INFO, "Ignoring HTTP request to %s with unsupported method", uri);
 	return 0;
@@ -757,6 +794,8 @@ static int websocket_http(struct lws *wsi, enum lws_callback_reasons reason, voi
 			break;
 	}
 
+	release_closed_sockets();
+
 	return 0;
 }
 
@@ -825,6 +864,8 @@ static int websocket_protocol(struct lws *wsi, enum lws_callback_reasons reason,
 			ilogs(http, LOG_DEBUG, "Unhandled websocket protocol '%s' callback %i", name, reason);
 			break;
 	}
+
+	release_closed_sockets();
 
 	return 0;
 }
@@ -907,11 +948,32 @@ static void websocket_cleanup(void) {
 
 	while (websocket_vhost_configs.length) {
 		struct lws_context_creation_info *vhost = g_queue_pop_head(&websocket_vhost_configs);
-		free((void *) vhost->iface);
-		free(vhost);
+		g_free((void *) vhost->iface);
+		g_slice_free1(sizeof(*vhost), vhost);
 	}
 }
 
+
+static void addr_any_v6_consolidate(endpoint_t eps[2], bool have_lws_ipv6) {
+	// Don't try to double bind on ADDR_ANY. If we find ADDR_ANY, bind to the
+	// v6 port and omit the v4 binding (and let libwebsockets handle the 4/6
+	// translation) unless we find ourselves without v6 support.
+
+	if (!eps[1].port)
+		return;
+	if (!have_lws_ipv6)
+		return;
+	if (eps[0].address.family->af == AF_INET6)
+		return;
+	if (!is_addr_unspecified(&eps[0].address))
+		return;
+
+	// The only case that needs handling: ADDR_ANY requested, v6 support is
+	// available, and v6 binding is given second.
+
+	eps[0] = eps[1];
+	eps[1].port = 0;
+}
 
 int websocket_init(void) {
 	assert(websocket_context == NULL);
@@ -919,6 +981,10 @@ int websocket_init(void) {
 	if ((!rtpe_config.http_ifs || !*rtpe_config.http_ifs) &&
 			(!rtpe_config.https_ifs || !*rtpe_config.https_ifs))
 		return 0;
+
+	struct sockaddr_storage sa;
+	int ret = lws_interface_to_sa(1, "::1", (void *) &sa, sizeof(sa));
+	bool have_lws_ipv6 = (ret == 0);
 
 	const char *err = NULL;
 
@@ -939,24 +1005,43 @@ int websocket_init(void) {
 	for (char **ifp = rtpe_config.http_ifs; ifp && *ifp; ifp++) {
 		char *ifa = *ifp;
 		ilogs(http, LOG_DEBUG, "Starting HTTP/WS '%s'", ifa);
-		endpoint_t ep;
+		endpoint_t eps[2];
 		err = "Failed to parse address/port";
-		if (endpoint_parse_any_getaddrinfo(&ep, ifa))
+		if (endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
 			goto err;
+		addr_any_v6_consolidate(eps, have_lws_ipv6);
 
-		struct lws_context_creation_info *vhost = malloc(sizeof(*vhost));
-		g_queue_push_tail(&websocket_vhost_configs, vhost);
+		bool success = false;
+		bool ipv6_fail = false;
+		for (int i = 0; i < G_N_ELEMENTS(eps); i++) {
+			endpoint_t *ep = &eps[i];
+			if (!ep->port)
+				continue;
+			if (ep->address.family->af == AF_INET6 && !have_lws_ipv6) {
+				ipv6_fail = true;
+				continue;
+			}
+			struct lws_context_creation_info *vhost = g_slice_alloc(sizeof(*vhost));
+			g_queue_push_tail(&websocket_vhost_configs, vhost);
 
-		*vhost = (struct lws_context_creation_info) {
-			.port = ep.port,
-			.iface = strdup(sockaddr_print_buf(&ep.address)),
-			.protocols = websocket_protocols,
-		};
-		vhost->vhost_name = vhost->iface;
-		if (ep.address.family->af == AF_INET)
-			vhost->options |= LWS_SERVER_OPTION_DISABLE_IPV6;
-		err = "LWS failed to create vhost";
-		if (!lws_create_vhost(websocket_context, vhost))
+			*vhost = (struct lws_context_creation_info) {
+				.port = ep->port,
+				.iface = g_strdup(sockaddr_print_buf(&ep->address)),
+				.protocols = websocket_protocols,
+			};
+			vhost->vhost_name = vhost->iface;
+			if (ep->address.family->af == AF_INET)
+				vhost->options |= LWS_SERVER_OPTION_DISABLE_IPV6;
+			err = "LWS failed to create vhost";
+			if (!lws_create_vhost(websocket_context, vhost))
+				goto err;
+			success = true;
+		}
+		err = "Failed to create any LWS vhost from given config";
+		if (ipv6_fail)
+			err = "Failed to create any LWS vhost from given config. Hint: LWS IPv6 support is not "
+				"available and config lists at least one IPv6 vhost";
+		if (!success)
 			goto err;
 	}
 
@@ -967,28 +1052,47 @@ int websocket_init(void) {
 
 		char *ifa = *ifp;
 		ilogs(http, LOG_DEBUG, "Starting HTTPS/WSS '%s'", ifa);
-		endpoint_t ep;
+		endpoint_t eps[2];
 		err = "Failed to parse address/port";
-		if (endpoint_parse_any_getaddrinfo(&ep, ifa))
+		if (endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
 			goto err;
+		addr_any_v6_consolidate(eps, have_lws_ipv6);
 
-		struct lws_context_creation_info *vhost = malloc(sizeof(*vhost));
-		g_queue_push_tail(&websocket_vhost_configs, vhost);
+		bool success = false;
+		bool ipv6_fail = false;
+		for (int i = 0; i < G_N_ELEMENTS(eps); i++) {
+			endpoint_t *ep = &eps[i];
+			if (!ep->port)
+				continue;
+			if (ep->address.family->af == AF_INET6 && !have_lws_ipv6) {
+				ipv6_fail = true;
+				continue;
+			}
+			struct lws_context_creation_info *vhost = g_slice_alloc(sizeof(*vhost));
+			g_queue_push_tail(&websocket_vhost_configs, vhost);
 
-		*vhost = (struct lws_context_creation_info) {
-			.port = ep.port,
-			.iface = strdup(sockaddr_print_buf(&ep.address)),
-			.protocols = websocket_protocols,
-			.ssl_cert_filepath = rtpe_config.https_cert,
-			.ssl_private_key_filepath = rtpe_config.https_key ? : rtpe_config.https_cert,
-			.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT,
-			// XXX cipher list, key password
-		};
-		vhost->vhost_name = vhost->iface;
-		if (ep.address.family->af == AF_INET)
-			vhost->options |= LWS_SERVER_OPTION_DISABLE_IPV6;
-		err = "LWS failed to create vhost";
-		if (!lws_create_vhost(websocket_context, vhost))
+			*vhost = (struct lws_context_creation_info) {
+				.port = ep->port,
+				.iface = g_strdup(sockaddr_print_buf(&ep->address)),
+				.protocols = websocket_protocols,
+				.ssl_cert_filepath = rtpe_config.https_cert,
+				.ssl_private_key_filepath = rtpe_config.https_key ? : rtpe_config.https_cert,
+				.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT,
+				// XXX cipher list, key password
+			};
+			vhost->vhost_name = vhost->iface;
+			if (ep->address.family->af == AF_INET)
+				vhost->options |= LWS_SERVER_OPTION_DISABLE_IPV6;
+			err = "LWS failed to create vhost";
+			if (!lws_create_vhost(websocket_context, vhost))
+				goto err;
+			success = true;
+		}
+		err = "Failed to create any LWS vhost from given config";
+		if (ipv6_fail)
+			err = "Failed to create any LWS vhost from given config. Hint: LWS IPv6 support is not "
+				"available and config lists at least one IPv6 vhost";
+		if (!success)
 			goto err;
 	}
 
@@ -1016,4 +1120,9 @@ void websocket_start(void) {
 	if (!websocket_context)
 		return;
 	thread_create_detach_prio(websocket_loop, NULL, rtpe_config.scheduling, rtpe_config.priority, "websocket");
+}
+void websocket_stop(void) {
+	if (!websocket_context)
+		return;
+	lws_cancel_service(websocket_context);
 }

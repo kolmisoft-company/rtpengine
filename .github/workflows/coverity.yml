@@ -20,12 +20,23 @@ jobs:
       COVERITY_SCAN_NOTIFICATION_EMAIL: development@sipwise.com
     steps:
       - name: Checkout source
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
+
+      - name: Update APT cache
+        run: |
+          sudo apt-get update
 
       - name: Get build dependencies
         run: |
-          sudo apt-get install -qq -y --no-install-recommends git ca-certificates curl
-          sudo apt-get build-dep -qq -y -Ppkg.ngcp-rtpengine.nobcg729 .
+          echo "Generating Debian source for usage on Ubuntu/focal / ubuntu-20.04"
+          cd pkg/deb/
+          ./generator.sh
+          ./backports/focal
+          rm -rf debian
+          mv focal debian
+          echo "Installing Debian packages"
+          sudo apt-get install -q -y --no-install-recommends git ca-certificates curl
+          sudo apt-get build-dep -q -y -Ppkg.ngcp-rtpengine.nobcg729 .
 
       - name: Get coverity scan
         run: |

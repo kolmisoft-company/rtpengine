@@ -21,6 +21,7 @@ struct websocket_message {
 		M_WEBSOCKET,
 		M_GET,
 		M_POST,
+		M_OPTIONS,
 	} method;
 	enum {
 		CT_UNKNOWN = 0,
@@ -35,6 +36,7 @@ struct websocket_message {
 
 int websocket_init(void);
 void websocket_start(void);
+void websocket_stop(void);
 
 // appends to output buffer without triggering a response
 void websocket_queue_raw(struct websocket_conn *wc, const char *msg, size_t len);

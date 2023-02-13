@@ -15,7 +15,9 @@ cp -ra backports debian
 
 # rules
 echo "- Remove ngcp- prefix"
-find debian -maxdepth 1 -type f -exec sed -i -e 's/ngcp-rtpengine/rtpengine/g' {} \;
+find debian -maxdepth 1 -type f -exec \
+  sed -i -e 's/ngcp-rtpengine/rtpengine/g' \
+  -e 's/ngcp\\-rtpengine/rtpengine/g' {} \;
 
 ## remove same file on links
 while read -r file; do
@@ -30,6 +32,9 @@ done < <(find debian -name '*links')
 echo "- Remove NGCP packages from Suggests"
 sed -i -e '/ngcp-system-tools/d' debian/control
 
+echo "- Set package-specific homepage"
+sed -i -e 's,^Homepage:.*,Homepage: https://rtpengine.com/,' debian/control
+
 echo "- Add Conflicts with NGCP packages"
 while read -r line ; do
   sed -i "/${line}$/ a Conflicts: ngcp-${line#Package: }" debian/control
@@ -41,7 +46,11 @@ while read -r file; do
   mv "${file}" "${file_new}"
 done < <(find debian -maxdepth 1 -type f -name 'ngcp-rtpengine*')
 
-echo "- Remove empty Suggests"
-wrap-and-sort
-sed -i -e '/Suggests:$/d' debian/control
-wrap-and-sort -sat
+if ! command -v wrap-and-sort &>/dev/null ; then
+  echo "WARN: wrap-and-sort (Debian package devscripts) not available."
+else
+  echo "- Remove empty Suggests"
+  wrap-and-sort
+  sed -i -e '/Suggests:$/d' debian/control
+  wrap-and-sort -sat
+fi

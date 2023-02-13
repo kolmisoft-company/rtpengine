@@ -113,6 +113,8 @@ enum {
 #define SHARED_FLAG_ICE_LITE_PEER		0x00000800
 #define SHARED_FLAG_UNIDIRECTIONAL		0x00001000
 #define SHARED_FLAG_RTCP_FB			0x00002000
+#define SHARED_FLAG_LEGACY_OSRTP		0x00004000
+#define SHARED_FLAG_LEGACY_OSRTP_REV		0x00008000
 
 /* struct stream_params */
 #define SP_FLAG_NO_RTCP				0x00010000
@@ -130,6 +132,8 @@ enum {
 #define SP_FLAG_TRICKLE_ICE			SHARED_FLAG_TRICKLE_ICE
 #define SP_FLAG_ICE_LITE_PEER			SHARED_FLAG_ICE_LITE_PEER
 #define SP_FLAG_RTCP_FB				SHARED_FLAG_RTCP_FB
+#define SP_FLAG_LEGACY_OSRTP			SHARED_FLAG_LEGACY_OSRTP
+#define SP_FLAG_LEGACY_OSRTP_REV		SHARED_FLAG_LEGACY_OSRTP_REV
 
 /* struct packet_stream */
 #define PS_FLAG_RTP				0x00010000
@@ -183,6 +187,9 @@ enum {
 #define MEDIA_FLAG_RTCP_GEN			0x08000000
 #define MEDIA_FLAG_ECHO				0x10000000
 #define MEDIA_FLAG_BLACKHOLE			0x20000000
+#define MEDIA_FLAG_REORDER_FORCED		0x40000000
+#define MEDIA_FLAG_LEGACY_OSRTP			SHARED_FLAG_LEGACY_OSRTP
+#define MEDIA_FLAG_LEGACY_OSRTP_REV		SHARED_FLAG_LEGACY_OSRTP_REV
 
 /* access macros */
 #define SP_ISSET(p, f)		bf_isset(&(p)->sp_flags, SP_FLAG_ ## f)
@@ -198,6 +205,23 @@ enum {
 #define MEDIA_ARESET2(p, f, g)	bf_areset(&(p)->media_flags, MEDIA_FLAG_ ## f | MEDIA_FLAG_ ## g)
 #define MEDIA_SET(p, f)		bf_set(&(p)->media_flags, MEDIA_FLAG_ ## f)
 #define MEDIA_CLEAR(p, f)	bf_clear(&(p)->media_flags, MEDIA_FLAG_ ## f)
+
+enum block_dtmf_mode {
+	BLOCK_DTMF_OFF = 0,
+	BLOCK_DTMF_DROP = 1,
+
+	BLOCK_DTMF___REPLACE_START = 2,
+	BLOCK_DTMF___PCM_REPLACE_START = 2,
+	// block modes that replace any DTMF with PCM
+	BLOCK_DTMF_SILENCE = 2,
+	BLOCK_DTMF_TONE = 3,
+	BLOCK_DTMF_RANDOM = 4,
+	BLOCK_DTMF___PCM_REPLACE_END = 4,
+	// block modes that replace DTMF events with other DTMF events if possible
+	BLOCK_DTMF_ZERO = 5,
+	BLOCK_DTMF_DTMF = 6,
+	BLOCK_DTMF___REPLACE_END = 6,
+};
 
 
 
@@ -273,6 +297,7 @@ struct stream_params {
 	int			ptime;
 	str			media_id;
 	struct t38_options	t38_options;
+	str			tls_id;
 };
 
 struct endpoint_map {
@@ -291,12 +316,27 @@ struct loop_protector {
 
 
 
+/**
+ * The packet_stream itself can be marked as:
+ * - SRTP endpoint
+ * - ICE endpoint
+ * - send/receive-only
+ * 
+ * This is done through the various bit flags.
+ */
 struct packet_stream {
-	mutex_t			in_lock,
-				out_lock;
 	/* Both locks valid only with call->master_lock held in R.
 	 * Preempted by call->master_lock held in W.
-	 * If both in/out are to be locked, in_lock must be locked first. */
+	 * If both in/out are to be locked, in_lock must be locked first.
+	 * 
+	 * The in_lock protects fields relevant to packet reception on that stream,
+	 * meanwhile the out_lock protects fields relevant to packet egress.
+	 * 
+	 * This allows packet handling on multiple ports and streams belonging
+	 * to the same call to happen at the same time.
+	 */
+	mutex_t			in_lock,
+				out_lock;
 
 	struct call_media	*media;		/* RO */
 	struct call		*call;		/* RO */
@@ -306,28 +346,33 @@ struct packet_stream {
 
 	GQueue			sfds;		/* LOCK: call->master_lock */
 	struct stream_fd *	selected_sfd;
+	endpoint_t		last_local_endpoint;
 	struct dtls_connection	ice_dtls;	/* LOCK: in_lock */
-	GQueue			rtp_sinks;	// LOCK: call->master_lock, in_lock for streamhandler
-	GQueue			rtcp_sinks;	// LOCK: call->master_lock, in_lock for streamhandler
+	GQueue			rtp_sinks;	/* LOCK: call->master_lock, in_lock for streamhandler */
+	GQueue			rtcp_sinks;	/* LOCK: call->master_lock, in_lock for streamhandler */
 	struct packet_stream	*rtcp_sibling;	/* LOCK: call->master_lock */
+	GQueue			rtp_mirrors;	/* LOCK: call->master_lock, in_lock for streamhandler */
 	struct endpoint		endpoint;	/* LOCK: out_lock */
-	struct endpoint		detected_endpoints[4];	/* LOCK: out_lock */
-	struct timeval		ep_detect_signal; /* LOCK: out_lock */
-	struct endpoint		advertised_endpoint; /* RO */
-	struct endpoint		learned_endpoint; /* LOCK: out_lock */
-	struct crypto_context	crypto;		/* OUT direction, LOCK: out_lock */
+	struct endpoint		detected_endpoints[4];		/* LOCK: out_lock */
+	struct timeval		ep_detect_signal;		/* LOCK: out_lock */
+	struct endpoint		advertised_endpoint;		/* RO */
+	struct endpoint		learned_endpoint;		/* LOCK: out_lock */
+	struct crypto_context	crypto;				/* OUT direction, LOCK: out_lock */
 	struct ssrc_ctx		*ssrc_in[RTPE_NUM_SSRC_TRACKING],	/* LOCK: in_lock */
 				*ssrc_out[RTPE_NUM_SSRC_TRACKING];	/* LOCK: out_lock */
-	unsigned int		ssrc_in_idx,	// LOCK: in_lock
-				ssrc_out_idx;	// LOCK: out_lock
-	struct send_timer	*send_timer;	/* RO */
-	struct jitter_buffer	*jb;		/* RO */
+	unsigned int		ssrc_in_idx,				/* LOCK: in_lock */
+				ssrc_out_idx;				/* LOCK: out_lock */
+	struct send_timer	*send_timer;				/* RO */
+	struct jitter_buffer	*jb;					/* RO */
+	time_t kernel_time;
 
-	struct stream_stats	stats;
-	struct stream_stats	kernel_stats;
+	struct stream_stats	stats_in;
+	struct stream_stats	stats_out;
+	struct stream_stats	kernel_stats_in;
+	struct stream_stats	kernel_stats_out;
 	unsigned char		in_tos_tclass;
 	atomic64		last_packet;
-	GHashTable		*rtp_stats;	/* LOCK: call->master_lock */
+	GHashTable		*rtp_stats;				/* LOCK: call->master_lock */
 	struct rtp_stats	*rtp_stats_cache;
 	unsigned int		stats_flags;
 	enum endpoint_learning		el_flags;
@@ -339,19 +384,24 @@ struct packet_stream {
 	unsigned int		lp_count;
 #endif
 
-	X509			*dtls_cert;	/* LOCK: in_lock */
+	X509			*dtls_cert;				/* LOCK: in_lock */
 
 	/* in_lock must be held for SETTING these: */
 	volatile unsigned int	ps_flags;
 };
 
-/* protected by call->master_lock, except the RO elements */
+/**
+ * Protected by call->master_lock, except the RO elements.
+ * 
+ * call_media is not reference-counted and is completely owned by the call object.
+ * Therefore call_media is released when the call is destroyed.
+ */
 struct call_media {
-	struct call_monologue	*monologue;	/* RO */
-	struct call		*call;		/* RO */
+	struct call_monologue	*monologue;			/* RO */
+	struct call		*call;				/* RO */
 
-	unsigned int		index;		/* RO */
-	unsigned int		unique_id;	/* RO */
+	unsigned int		index;				/* RO */
+	unsigned int		unique_id;			/* RO */
 	str			type;
 	enum media_type		type_id;
 	str			protocol_str;
@@ -365,71 +415,92 @@ struct call_media {
 	str			media_id;
 	str			label;
 	GQueue			sdes_in, sdes_out;
-	struct dtls_fingerprint fingerprint; /* as received */
-	const struct dtls_hash_func *fp_hash_func; // outgoing
+	struct dtls_fingerprint fingerprint;			/* as received */
+	const struct dtls_hash_func *fp_hash_func;		/* outgoing */
+	str			tls_id;
 
-	GQueue			streams; /* normally RTP + RTCP */
+	GQueue			streams;			/* normally RTP + RTCP */
 	GQueue			endpoint_maps;
 
 	struct codec_store	codecs;
-	GQueue			sdp_attributes; // str_sprintf()
-	GHashTable		*codec_handlers; // int payload type -> struct codec_handler
-						// XXX combine this with 'codecs' hash table?
-	GQueue			codec_handlers_store; // storage for struct codec_handler
+	GQueue			sdp_attributes;			/* str_sprintf() */
+	GHashTable		*codec_handlers;		/* int payload type -> struct codec_handler
+														XXX combine this with 'codecs' hash table? */
+	GQueue			codec_handlers_store;		/* storage for struct codec_handler */
 	struct codec_handler	*codec_handler_cache;
 	struct rtcp_handler	*rtcp_handler;
-	struct rtcp_timer	*rtcp_timer;	// master lock for scheduling purposes
-	struct mqtt_timer	*mqtt_timer;	// master lock for scheduling purposes
+	struct rtcp_timer	*rtcp_timer;			/* master lock for scheduling purposes */
+	struct mqtt_timer	*mqtt_timer;			/* master lock for scheduling purposes */
 	//struct codec_handler	*dtmf_injector;
 	struct t38_gateway	*t38_gateway;
 	struct codec_handler	*t38_handler;
 
+	unsigned int		buffer_delay;
+
 	mutex_t			dtmf_lock;
-	unsigned long		dtmf_ts; // TS of last processed end event
+	unsigned long		dtmf_ts;			/* TS of last processed end event */
+	unsigned int		dtmf_count;
+	// lists are append-only
+	GQueue			dtmf_recv;
+	GQueue			dtmf_send;
 
 #ifdef WITH_TRANSCODING
-	union {
-		struct {
-			struct amr_cmr cmr;
-		} amr;
-	} u;
+	encoder_callback_t	encoder_callback;
 #endif
 
-	int			ptime; // either from SDP or overridden
+	int			ptime;				/* either from SDP or overridden */
 
 	volatile unsigned int	media_flags;
 };
 
-// link between subscribers and subscriptions
+/** 
+ * Link between subscribers and subscriptions.
+ * 
+ * Contain flags and attributes, which can be used
+ * to mark a subscription (for example, as an egress subscription).
+ * 
+ * During signalling events, the list of subscriptions for each call_monologue
+ * is used to create the list of rtp_sink and rtcp_sink given in each packet_stream.
+ * 
+ * Each entry in these lists is a sink_handler object, which again contains flags and attributes.
+ * Flags from a call_subscription are copied into the sink_handler.
+ */
 struct call_subscription {
 	struct call_monologue	*monologue;
 	GList			*link; // link into the corresponding opposite list
 	unsigned int		media_offset; // 0 if media indexes match up
-	unsigned int		offer_answer:1; // bidirectional, exclusive
+	struct sink_attrs	attrs;
 };
 
-/* half a dialogue */
-/* protected by call->master_lock, except the RO elements */
+/**
+ * Half a dialogue.
+ * Protected by call->master_lock, except the RO elements.
+ * 
+ * call_monologue (call participant) contains a list of subscribers
+ * and subscriptions, which are other call_monologue's.
+ * 
+ * These lists are mutual.
+ * A regular A/B call has two call_monologue objects with each subscribed to the other.
+ */
 struct call_monologue {
-	struct call		*call;		/* RO */
-	unsigned int		unique_id;	/* RO */
+	struct call		*call;			/* RO */
+	unsigned int		unique_id;		/* RO */
 
 	str			tag;
 	str			viabranch;
 	enum tag_type		tagtype;
 	str			label;
-	time_t			created;	/* RO */
+	time_t			created;		/* RO */
 	time_t			deleted;
-	struct timeval		started; /* for CDR */
-	struct timeval		terminated; /* for CDR */
+	struct timeval		started;		/* for CDR */
+	struct timeval		terminated;		/* for CDR */
 	enum termination_reason	term_reason;
 	const struct logical_intf *logical_intf;
-	GHashTable		*other_tags;
-	GHashTable		*branches;
-	GQueue			subscriptions; // who am I subscribed to (sources)
-	GHashTable		*subscriptions_ht; // for quick lookup
-	GQueue			subscribers; // who is subscribed to me (sinks)
-	GHashTable		*subscribers_ht; // for quick lookup
+	GHashTable 		*associated_tags;
+	GQueue			subscriptions;		/* who am I subscribed to (sources) */
+	GHashTable		*subscriptions_ht;	/* for quick lookup */
+	GQueue			subscribers;		/* who is subscribed to me (sinks) */
+	GHashTable		*subscribers_ht;	/* for quick lookup */
 	GQueue			medias;
 	GHashTable		*media_ids;
 	struct media_player	*player;
@@ -442,12 +513,29 @@ struct call_monologue {
 	char			*sdp_username;
 	char			*sdp_session_name;
 	struct ssrc_hash	*ssrc_hash;
+	str			metadata;
+	struct janus_session	*janus_session;
 
-	unsigned int		block_dtmf:1;
-	unsigned int		block_media:1;
-	unsigned int		silence_media:1;
+	// DTMF blocking/replacement stuff:
+	enum block_dtmf_mode	block_dtmf;
+	GArray			*tone_freqs;
+	unsigned int		tone_vol;
+	char			dtmf_digit;
+	str			dtmf_trigger;
+	unsigned int		dtmf_trigger_match;
+	enum block_dtmf_mode	block_dtmf_trigger;
+	str			dtmf_trigger_end;
+	int			dtmf_trigger_digits;
+	enum block_dtmf_mode	block_dtmf_trigger_end;
+	unsigned int		block_dtmf_trigger_end_ms;
+	unsigned int		dtmf_delay;
+
+	bool			block_media;
+	bool			silence_media;
+
 	unsigned int		rec_forwarding:1;
 	unsigned int		inject_dtmf:1;
+	unsigned int		detect_dtmf:1;
 };
 
 struct call_iterator_list {
@@ -498,28 +586,66 @@ struct call_iterator_entry {
 			mutex_unlock(&rtpe_call_iterators[__which].lock); \
 	} while (0)
 
+/**
+ * stuct call is the main parent structure of all call-related objects.
+ * 
+ * The logical object hierarchy under the 'stuct call':
+ * call > call_monologue > call_media > packet_stream > stream_fd
+ * 
+ * struct call usually has multiple call_monologue objects.
+ * Meanwhile each sub-object of call, as a parent of own sub-objects,
+ * can also contain multiple child objects.
+ * 
+ * Furthermore, each child object contains a back ptr to its parent object.
+ * 
+ * The parent call object contains one list (as GQueue) for each kind of child object.
+ * These lists are what is used to free and release the child objects
+ * during a call teardown.
+ * Every child object owned by the call is added to its respective list exactly once.
+ * 
+ * Call object is reference-counted through the struct obj.
+ */
 struct call {
+
+	/* struct obj member must always be the first member in a struct.
+	 *
+	 * obj is created with a cleanup handler, see obj_alloc(),
+	 * and this handler is executed whenever the reference count drops to zero.
+	 * 
+	 * References are acquired and released through obj_get() and obj_put()
+	 * (plus some other wrapper functions).
+	 */
 	struct obj		obj;
 
 	mutex_t			buffer_lock;
 	call_buffer_t		buffer;
 
-	/* everything below protected by master_lock */
+	/* master_lock protects the entire call and all the contained objects.
+	 * 
+	 * All the fields and any nested sub-object must:
+	 * - only be accessed with the master_lock held as a read lock
+	 * - only be modified with the master_lock held as a write lock
+	 * 
+	 * Therefore, during signalling events acquire a write-lock,
+	 * and during RTP packets handling acquire a read-lock.
+	 */
 	rwlock_t		master_lock;
-	GQueue			monologues;
-	GQueue			medias;
+
+	/* everything below is protected by the master_lock */
+	GQueue			monologues;	/* call_monologue */
+	GQueue			medias;		/* call_media */
 	GHashTable		*tags;
 	GHashTable		*viabranches;
 	GHashTable		*labels;
 	GQueue			streams;
-	GQueue			stream_fds;
+	GQueue			stream_fds;	/* stream_fd */
 	GQueue			endpoint_maps;
-	struct dtls_cert	*dtls_cert; /* for outgoing */
+	struct dtls_cert	*dtls_cert;	/* for outgoing */
 	struct mqtt_timer	*mqtt_timer;
-	struct janus_session	*janus_session;
 
 	str			callid;
 	struct timeval		created;
+	struct timeval		destroyed;
 	time_t			last_signal;
 	time_t			deleted;
 	time_t			ml_deleted;
@@ -535,6 +661,10 @@ struct call {
 
 	struct call_iterator_entry iterator[NUM_CALL_ITERATORS];
 	int			cpu_affinity;
+	enum block_dtmf_mode	block_dtmf;
+
+	bool			block_media;
+	bool			silence_media;
 
 	// ipv4/ipv6 media flags
 	unsigned int		is_ipv4_media_offer:1;
@@ -543,9 +673,6 @@ struct call {
 	unsigned int		is_ipv6_media_answer:1;
 	unsigned int		is_call_media_counted:1;
 
-	unsigned int		block_dtmf:1;
-	unsigned int		block_media:1;
-	unsigned int		silence_media:1;
 	unsigned int		recording_on:1;
 	unsigned int		rec_forwarding:1;
 	unsigned int		drop_traffic:1;
@@ -556,43 +683,16 @@ struct call {
 };
 
 
-
+/**
+ * The main entry point into call objects for signalling events is the call-ID:
+ * Therefore the main entry point is the global hash table rtpe_callhash (protected by rtpe_callhash_lock),
+ * which uses call-IDs as keys and call objects as values,
+ * while holding a reference to each contained call.
+ */
 extern rwlock_t rtpe_callhash_lock;
 extern GHashTable *rtpe_callhash;
 extern struct call_iterator_list rtpe_call_iterators[NUM_CALL_ITERATORS];
 
-extern struct global_stats_gauge rtpe_stats_gauge;
-extern struct global_stats_gauge_min_max rtpe_stats_gauge_graphite_min_max;
-extern struct global_stats_gauge_min_max rtpe_stats_gauge_graphite_min_max_interval;
-
-#define RTPE_GAUGE_SET(field, num) \
-	do { \
-		atomic64_set(&rtpe_stats_gauge.field, num); \
-		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_stats_gauge_graphite_min_max, num); \
-	} while (0)
-#define RTPE_GAUGE_ADD(field, num) \
-	do { \
-		uint64_t __old = atomic64_add(&rtpe_stats_gauge.field, num); \
-		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_stats_gauge_graphite_min_max, __old + num); \
-	} while (0)
-#define RTPE_GAUGE_INC(field) RTPE_GAUGE_ADD(field, 1)
-#define RTPE_GAUGE_DEC(field) RTPE_GAUGE_ADD(field, -1)
-
-extern struct global_stats_ax rtpe_stats;
-extern struct global_stats_counter rtpe_stats_interval;	// accumulators copied out once per interval
-extern struct global_stats_counter rtpe_stats_cumulative;	// total, cumulative
-extern struct global_stats_ax rtpe_stats_graphite;
-extern struct global_stats_counter rtpe_stats_graphite_interval; // copied out when graphite stats run
-extern struct global_stats_min_max rtpe_stats_graphite_min_max; // running min/max
-extern struct global_stats_min_max rtpe_stats_graphite_min_max_interval; // updated once per graphite run
-
-#define RTPE_STATS_ADD(field, num) \
-	do { \
-		atomic64_add(&rtpe_stats.ax.field, num); \
-		atomic64_add(&rtpe_stats_cumulative.field, num); \
-		atomic64_add(&rtpe_stats_graphite.ax.field, num); \
-	} while (0)
-#define RTPE_STATS_INC(field) RTPE_STATS_ADD(field, 1)
 
 
 int call_init(void);
@@ -602,10 +702,11 @@ struct call_monologue *__monologue_create(struct call *call);
 void __monologue_tag(struct call_monologue *ml, const str *tag);
 void __monologue_viabranch(struct call_monologue *ml, const str *viabranch);
 struct packet_stream *__packet_stream_new(struct call *call);
-void __add_subscription(struct call_monologue *ml, struct call_monologue *other, bool offer_answer,
-		unsigned int media_offset);
+void __add_subscription(struct call_monologue *ml, struct call_monologue *other,
+		unsigned int media_offset, const struct sink_attrs *);
+struct call_subscription *call_get_call_subscription(GHashTable *ht, struct call_monologue *ml);
 void free_sink_handler(void *);
-void __add_sink_handler(GQueue *, struct packet_stream *);
+void __add_sink_handler(GQueue *, struct packet_stream *, const struct sink_attrs *);
 
 void call_subscription_free(void *);
 void call_subscriptions_clear(GQueue *q);
@@ -628,7 +729,7 @@ int monologue_subscribe_request(const GQueue *srcs, struct call_monologue *dst, 
 int monologue_subscribe_answer(struct call_monologue *dst, struct sdp_ng_flags *,
 		GQueue *);
 int monologue_unsubscribe(struct call_monologue *dst, struct sdp_ng_flags *);
-int monologue_destroy(struct call_monologue *ml);
+void monologue_destroy(struct call_monologue *ml);
 int call_delete_branch(const str *callid, const str *branch,
 	const str *fromtag, const str *totag, bencode_item_t *output, int delete_delay);
 void call_destroy(struct call *);
@@ -639,9 +740,10 @@ void call_media_state_machine(struct call_media *m);
 void call_media_unkernelize(struct call_media *media);
 void dialogue_unkernelize(struct call_monologue *ml);
 void __monologue_unkernelize(struct call_monologue *monologue);
+void update_init_subscribers(struct call_monologue *ml, enum call_opmode opmode);
 
 int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,
-		int *len, const struct local_intf *ifa, int keep_unspec);
+		int *len, const struct local_intf *ifa, bool keep_unspec);
 
 void add_total_calls_duration_in_interval(struct timeval *interval_tv);
 void call_timer(void *ptr);
@@ -709,6 +811,22 @@ INLINE void __call_unkernelize(struct call *call) {
 		struct call_monologue *ml = l->data;
 		__monologue_unkernelize(ml);
 	}
+}
+INLINE endpoint_t *packet_stream_local_addr(struct packet_stream *ps) {
+	if (ps->selected_sfd)
+		return &ps->selected_sfd->socket.local;
+	if (ps->last_local_endpoint.port)
+		return &ps->last_local_endpoint;
+	static endpoint_t dummy = {
+		.address = {
+			.u.ipv4.s_addr = 0,
+		},
+		.port = 0,
+	};
+	// one-time init
+	if (!dummy.address.family)
+		dummy.address.family = get_socket_family_enum(SF_IP4);
+	return &dummy;
 }
 
 #endif

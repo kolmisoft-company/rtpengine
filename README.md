@@ -51,7 +51,9 @@ the following additional features are available:
   + HMAC-SHA1 packet authentication
   + Bridging between RTP and SRTP user agents
   + Opportunistic SRTP (RFC 8643)
+  + Legacy non-RFC (dual `m=` line) best-effort SRTP
   + AES-GCM Authenticated Encryption (AEAD) (RFC 7714)
+  + `a=tls-id` as per RFC 8842
 - Support for RTCP profile with feedback extensions (RTP/AVPF, RFC 4585 and 5124)
 - Arbitrary bridging between any of the supported RTP profiles (RTP/AVP, RTP/AVPF,
   RTP/SAVP, RTP/SAVPF)
@@ -66,6 +68,9 @@ the following additional features are available:
 - Silence detection and comfort noise (RFC 3389) payloads
 * Media forking
 * Publish/subscribe mechanism for N-to-N media forwarding
+
+There is also limited support for *rtpengine* to be used as a drop-in
+replacement for *Janus* using the native Janus control protocol (see below).
 
 *Rtpengine* does not (yet) support:
 
@@ -166,6 +171,7 @@ test suite.
 	- *bcg729* for full G.729 transcoding support (optional)
 	- *libmosquitto*
 	- *libwebsockets*
+	- *libopus*
 
 	The `Makefile` contains a few Debian-specific flags, which may have to removed for compilation to
 	be successful. This will not affect operation in any way.
@@ -187,9 +193,9 @@ test suite.
 
 	With the `iptables` development headers installed, issuing `make` will compile the plugin for
 	`iptables` and `ip6tables`. The file will be called `libxt_RTPENGINE.so` and needs to be copied
-	into the `xtables` module directory. The location of this directory can be determined through
-	`pkg-config xtables --variable=xtlibdir` on newer systems, and/or is usually either
-	`/lib/xtables/` or `/usr/lib/x86_64-linux-gnu/xtables/`.
+	into the `xtables` module directory. It is copied on `make install`. The location of this
+	directory can be determined through `pkg-config xtables --variable=xtlibdir` on newer systems,
+	and/or is usually either `/lib/xtables/` or `/usr/lib/x86_64-linux-gnu/xtables/`.
 
 * `kernel-module`
 
@@ -204,8 +210,8 @@ test suite.
 	Successful compilation of the module will produce the file `xt_RTPENGINE.ko`. The module can be inserted
 	into the running kernel manually through `insmod xt_RTPENGINE.ko` (which will result in an error if
 	depending modules aren't loaded, for example the `x_tables` module), but it's recommended to copy the
-	module into `/lib/modules/$VERSION/updates/`, followed by running `depmod -a`. After this, the module can
-	be loaded by issuing `modprobe xt_RTPENGINE`.
+	module into `/lib/modules/$VERSION/updates/`, followed by running `depmod -a`.  This copying is performed
+	on `make install`. After this, the module can be loaded by issuing `modprobe xt_RTPENGINE`.
 
 * `recording-daemon`
 
@@ -367,7 +373,7 @@ A typical start-up sequence including in-kernel forwarding might look like this:
 	echo 'del 0' > /proc/rtpengine/control
 
 	# start daemon
-	/usr/sbin/rtpengine --table=0 --interface=10.64.73.31 --interface=2001:db8::4f3:3d \
+	/usr/bin/rtpengine --table=0 --interface=10.64.73.31 --interface=2001:db8::4f3:3d \
 	--listen-ng=127.0.0.1:2223 --tos=184 --pidfile=/run/rtpengine.pid --no-fallback
 
 Running Multiple Instances
@@ -389,9 +395,9 @@ then the start-up sequence might look like this:
 	echo 'del 0' > /proc/rtpengine/control
 	echo 'del 1' > /proc/rtpengine/control
 
-	/usr/sbin/rtpengine --table=0 --interface=10.64.73.31 \
+	/usr/bin/rtpengine --table=0 --interface=10.64.73.31 \
 	--listen-ng=127.0.0.1:2223 --tos=184 --pidfile=/run/rtpengine-10.pid --no-fallback
-	/usr/sbin/rtpengine --table=1 --interface=192.168.65.73 \
+	/usr/bin/rtpengine --table=1 --interface=192.168.65.73 \
 	--listen-ng=127.0.0.1:2224 --tos=184 --pidfile=/run/rtpengine-192.pid --no-fallback
 
 With this setup, the SIP proxy can choose which instance of *rtpengine* to talk to and thus which local
@@ -430,6 +436,7 @@ The following codecs are supported by *rtpengine*:
 * iLBC
 * Opus
 * AMR (narrowband and wideband)
+* EVS (if supplied -- see below)
 
 Codec support is dependent on support provided by the `ffmpeg` codec libraries, which may vary from
 version to version. Use the `--codecs` command line option to have *rtpengine* print a list of codecs
@@ -554,6 +561,33 @@ outgoing bitrate without being requested to by the peer via a CMR. To enable thi
 longer than this interval ago, *rtpengine* will increase the bitrate by one step if possible. Afterwards,
 the interval starts over.
 
+EVS
+---
+
+Enhanced Voice Services (EVS) is a patent-encumbered codec for which (at the
+time of writing) no implementation exists which can be freely used and
+distributed. As such, support for EVS is only available if an implementation is
+supplied separately. Currently the only implementation supported is the
+ETSI/3GPP reference implementation (either floating-point or fixed-point). Any
+licensing issues that might result from such usage are the responsibility of
+the user of this software.
+
+The EVS codec implementation can be provided as a shared object library (*.so*)
+which is loaded in during runtime (at startup). The supported implementations
+can be seen as subdirectories within the `evs/` directory. Currently supported
+are version 17.0.0 of the ETSI/3GPP reference implementation, [*126.442*](https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1464) for the
+fixed-point implementation and [*126.443*](https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1465) for the floating-point implementation.
+(The floating-point implementation seems to be significantly faster, but is not
+bit-precise.)
+
+To supply the codec implementation as a shared object during runtime, extract
+the reference implementation's *.zip* file and apply the provided `patch`
+([from here](https://github.com/sipwise/rtpengine/tree/master/evs)) that is
+appropriate for the chosen implementation. Run the build using `make`
+(suggested build flags are `RELEASE=1 make`) and it should produce a file
+`lib3gpp-evs.so`. Point *rtpengine* to this file using the `evs-lib-path=`
+option to enable support for EVS.
+
 Call recording
 ==============
 
@@ -603,6 +637,7 @@ a string and determines the type of message. Currently the following commands ar
 * query
 * start recording
 * stop recording
+* pause recording
 * block DTMF
 * unblock DTMF
 * block media
@@ -674,262 +709,28 @@ The request dictionary must contain at least the following keys:
 
 Optionally included keys are:
 
-* `from-tags`
-
-	Contains a list of strings used to selected multiple existing call
-	participants (e.g. for the `subscribe request` message). An alternative
-	way to list multiple tags is by putting them into the `flags` list,
-	each prefixed with `from-tags-`.
-
-* `via-branch`
-
-	The SIP `Via` branch as string. Used to additionally refine the matching logic between media streams
-	and calls and call branches.
-
-* `label` or `from-label`
-
-	A custom free-form string which *rtpengine* remembers for this participating endpoint and reports
-	back in logs and statistics output. For some commands (e.g. `block media`) the given label is not
-	used to set the label of the call participant, but rather to select an existing call participant.
-
-* `set-label` or `to-label`
-
-	Some commands (e.g. `block media`) use the given `label` to select
-	an existing call participant. For these commands, `set-label` instead
-	of `label` can be used to set the label at the same time, either for
-	the selected call participant (if selected via `from-tag`) or for the
-	newly created participant (e.g. for `subscribe request`).
-
-* `flags`
-
-	The value of the `flags` key is a list. The list contains zero or more of the following strings.
-	Spaces in each string my be replaced by hyphens.
-
-	- `SIP source address`
-
-		Ignore any IP addresses given in the SDP body and use the source address of the received
-		SIP message (given in `received from`) as default endpoint address. This was the default
-		behaviour of older versions of *rtpengine* and can still be made the default behaviour
-		through the `--sip-source` CLI switch.
-		Can be overridden through the `media address` key.
-
-	- `trust address`
-
-		The opposite of `SIP source address`. This is the default behaviour unless the CLI switch
-		`--sip-source` is active. Corresponds to the *rtpproxy* `r` flag.
-		Can be overridden through the `media address` key.
-
-	- `symmetric`
-
-		Corresponds to the *rtpproxy* `w` flag. Not used by *rtpengine* as this is the default,
-		unless `asymmetric` is specified.
-
-	- `asymmetric`
-
-		Corresponds to the *rtpproxy* `a` flag. Advertises an RTP endpoint which uses asymmetric
-		RTP, which disables learning of endpoint addresses (see below).
-
-	- `unidirectional`
-
-		When this flag is present, kernelize also one-way rtp media.
-
-	- `strict source`
-
-		Normally, *rtpengine* attempts to learn the correct endpoint address for every stream during
-		the first few seconds after signalling by observing the source address and port of incoming
-		packets (unless `asymmetric` is specified). Afterwards, source address and port of incoming
-		packets are normally ignored and packets are forwarded regardless of where they're coming from.
-		With the `strict source` option set, *rtpengine* will continue to inspect the source address
-		and port of incoming packets after the learning phase and compare them with the endpoint
-		address that has been learned before. If there's a mismatch, the packet will be dropped and
-		not forwarded.
-
-	- `media handover`
-
-		Similar to the `strict source` option, but instead of dropping packets when the source address
-		or port don't match, the endpoint address will be re-learned and moved to the new address. This
-		allows endpoint addresses to change on the fly without going through signalling again. Note that
-		this opens a security hole and potentially allows RTP streams to be hijacked, either partly or
-		in whole.
-
-	- `reset`
-
-		This causes *rtpengine* to un-learn certain aspects of the RTP endpoints involved, such as
-		support for ICE or support for SRTP. For example, if `ICE=force` is given, then *rtpengine*
-		will initially offer ICE to the remote endpoint. However, if a subsequent answer from that
-		same endpoint indicates that it doesn't support ICE, then no more ICE offers will be made
-		towards that endpoint, even if `ICE=force` is still specified. With the `reset` flag given,
-		this aspect will be un-learned and *rtpengine* will again offer ICE to this endpoint.
-		This flag is valid only in an `offer` message and is useful when the call has been
-		transferred to a new endpoint without change of `From` or `To` tags.
-
-	- `port latching`
-
-		Forces *rtpengine* to retain its local ports during a signalling exchange even when the
-		remote endpoint changes its port.
-
-	- `no port latching`
-
-		Port latching is enabled by default for endpoints which speak
-		ICE. With this option preset, a remote port change will result
-		in a local port change even for endpoints which speak ICE,
-		which will imply an ICE restart.
-
-	- `record call`
-
-		Identical to setting `record call` to `on` (see below).
-
-	- `no rtcp attribute`
-
-		Omit the `a=rtcp` line from the outgoing SDP.
-
-	- `full rtcp attribute`
-
-		Include the full version of the `a=rtcp` line (complete with network address) instead of
-		the short version with just the port number.
-
-	- `loop protect`
-
-		Inserts a custom attribute (`a=rtpengine:...`) into the outgoing SDP to prevent *rtpengine*
-		processing and rewriting the same SDP multiple times. This is useful if your setup
-		involves signalling loops and need to make sure that *rtpengine* doesn't start looping
-		media packets back to itself. When this flag is present and *rtpengine* sees a matching
-		attribute already present in the SDP, it will leave the SDP untouched and not process
-		the message.
-
-	- `always transcode`
-
-		Legacy flag, synonymous to `codec-accept=all`.
-
-	- `single codec`
-
-		Using this flag in an `answer` message will leave only the first listed codec in place
-		and will remove all others from the list. Useful for RTP clients which get confused if
-		more than one codec is listed in an answer.
-
-	- `reuse codecs` or `no codec renegotiation`
-
-		Instructs *rtpengine* to prevent endpoints from switching codecs during call run-time
-		if possible. Codecs that were listed as preferred in the past will be kept as preferred
-		even if the re-offer lists other codecs as preferred, or in a different order. Recommended
-		to be combined with `single codec`.
-
-	- `allow transcoding`
-
-		This flag is only useful in commands that provide an explicit answer SDP to *rtpengine*
-		(e.g. `subscribe answer`). For these commands, if the answer SDP does not accept all
-		codecs that were offered, the default behaviour is to reject the answer. With this flag
-		given, the answer will be accepted even if some codecs were rejected, and codecs will be
-		transcoded as required.
-
-	- `all`
-
-		Only relevant to the `unblock media` and `unsilence media`
-		messages. Instructs *rtpengine* to remove not only a full-call
-		media block, but also remove directional media blocks that were
-		imposed on individual participants.
-
-	- `pad crypto`
-
-		Legacy alias to SDES=pad.
-
-	- `generate mid`
-
-		Add `a=mid` attributes to the outgoing SDP if they were not already present.
-
-	- `strip extmap`
-
-		Remove `a=rtpmap` attributes from the outgoing SDP.
-
-	- `original sendrecv`
-
-		With this flag present, *rtpengine* will leave the media direction attributes
-		(`sendrecv`, `recvonly`, `sendonly`, and `inactive`) from the received SDP body
-		unchanged. Normally *rtpengine* would consume these attributes and insert its
-		own version of them based on other media parameters (e.g. a media section with
-		a zero IP address would come out as `sendonly` or `inactive`).
-
-	- `inject DTMF`
-
-		Signals to *rtpengine* that the audio streams involved in this `offer` or `answer`
-		(the flag should be present in both of them) are to be made available for DTMF
-		injection via the `play DTMF` control message. See `play DTMF` below for additional
-		information.
-
-	- `generate RTCP`
-
-		Identical to setting `generate RTCP = on`.
-
-	- `debug` or `debugging`
-
-		Enabled full debug logging for this call, regardless of global log level settings.
-
-	- `pierce NAT`
-
-		Sends empty UDP packets to the remote RTP peer as soon as an
-		endpoint address is available from a received SDP, for as long
-		as no incoming packets have been received. Useful to create an
-		initial NAT mapping. Not needed when ICE is in use.
-
-	- `NAT-wait`
-
-		Prevents forwarding media packets to the respective endpoint
-		until at least one media packet has been received from that
-		endpoint. This is to allow a NAT binding to open in the ingress
-		direction before sending packets out, which could result in an
-		automated firewall block.
-
-	- `trickle ICE`
-
-		Useful for `offer` messages when ICE as advertised to also advertise
-		support for trickle ICE.
-
-* `generate RTCP`
-
-	Contains a string, either `on` or `off`. If enabled for a call,
-	received RTCP packets will not simply be passed through as usual, but
-	instead will be consumed, and instead *rtpengine* will generate its own
-	RTCP packets to send to the RTP peers. This flag will be effective for
-	both sides of a call.
-
-* `replace`
-
-	Similar to the `flags` list. Controls which parts of the SDP body should be rewritten.
-	Contains zero or more of:
-
-	- `origin`
-
-		Replace the address found in the *origin* (o=) line of the SDP body. Corresponds
-		to *rtpproxy* `o` flag.
-
-	- `session connection` or `session-connection`
-
-		Replace the address found in the *session-level connection* (c=) line of the SDP body.
-		Corresponds to *rtpproxy* `c` flag.
-
-	- `SDP version` or `SDP-version`
-
-		Take control of the version field in the SDP and make sure it's increased every
-		time the SDP changes, and left unchanged if the SDP is the same.
-
-	- `username`
-
-		Take control of the origin username field in the SDP. With this
-		option in use, *rtpengine* will make sure the username field in
-		the `o=` line always remains the same in all SDPs going to a
-		particular RTP endpoint.
-
-	- `session name` or `session-name`
-
-		Same as `username` but for the entire contents of the `s=` line.
-
-	- `zero address`
-
-		Using a zero endpoint address is an obsolete way to signal a
-		muted or sendonly stream. Streams with zero addresses are
-		normally flagged as sendonly and the zero address in the SDP is
-		passed through. With this option set, the zero address is
-		replaced with a real address.
+* `all`
+
+	Can be set to the string `none` to disable any extra behaviour (which
+	is the default if this key is omitted altogether) or to one of `all`,
+	`offer-answer`, `except-offer-answer` or `flows`.  Applicable to
+	certain messages only. The behaviour is explained below separately for
+	each affected message.
+
+* `address family`
+
+	A string value of either `IP4` or `IP6` to select the primary address family in the substituted SDP
+	body. The default is to auto-detect the address family if possible (if the receiving end is known
+	already) or otherwise to leave it unchanged.
+
+* `delay-buffer`
+
+	Takes an integer as value. When set to non-zero, enables the delay
+	buffer when setting up codec handlers. The delay buffer delays all
+	media by the given number of milliseconds before passing it on. Once
+	the delay buffer is configured, it must explicitly be disabled again by
+	setting this value to zero. The delay buffer setting is honoured in all
+	messages that set up codec handlers, such as `block DTMF`.
 
 * `direction`
 
@@ -958,18 +759,9 @@ Optionally included keys are:
 	This special keyword is provided only for legacy support and should be considered obsolete.
 	It will be removed in future versions.
 
-* `interface`
+* `digit` or `code`
 
-	Contains a single string naming one of the configured interfaces, just like `direction` does. The
-	`interface` option is used instead of `direction` where only one interface is required (e.g. outside
-	of an offer/answer scenario), for example in the `publish` or `subscribe request` commands.
-
-* `received from`
-
-	Contains a list of exactly two elements. The first element denotes the address family and the second
-	element is the SIP message's source address itself. The address family can be one of `IP4` or `IP6`.
-	Used if SDP addresses are neither trusted (through `SIP source address` or `--sip-source`) nor the
-	`media address` key is present.
+	Sets the replacement digit for `DTMF-security=DTMF`.
 
 * `drop-traffic`
 
@@ -982,118 +774,6 @@ Optionally included keys are:
 	Can be present either in `offer` or `answer`, the behavior is for the entire call.
 
 	`stop` has priority over `start`, if both are present.
-
-* `ICE`
-
-	Contains a string which must be one of the following values:
-
-	With `remove`, any ICE attributes are stripped from the SDP body.
-
-	With `force`, ICE attributes are first stripped, then new attributes are
-	generated and inserted, which leaves the media proxy as the only ICE candidate.
-
-	With `default`, the behaviour will be the same as with `force` if the incoming SDP already
-	had ICE attributes listed. If the incoming SDP did not contain ICE attributes, then no
-	ICE attributes are added.
-
-	With `force-relay`, existing ICE candidates are left in place except `relay`
-	type candidates, and *rtpengine* inserts itself as a `relay` candidate. It will also leave SDP
-	c= and m= lines unchanged.
-
-	With `optional`, if no ICE attributes are present, a new set is generated and the
-	media proxy lists itself as ICE candidate; otherwise, the media proxy inserts itself as a
-	low-priority candidate. This used to be the default behaviour in previous versions of
-	*rtpengine*.
-
-	The default behaviour (no `ICE` key present at all) is the same as `default`.
-
-	This flag operates independently of the `replace` flags.
-
-	Note that if config parameter `save-interface-ports = true`, ICE will be broken, because
-	rtpengine will bind ports only on the first local interface of desired family of logical interface.
-
-* `ICE-lite`
-
-	Contains a string which must be one of the following values:
-
-	- `forward` to enable "ICE lite" mode towards the peer that this offer is sent to.
-
-	- `backward` to enable "ICE lite" mode towards the peer that has sent this offer.
-
-	- `both` to enable "ICE lite" towards both peers.
-
-	- `off` to disable "ICE lite" towards both peers and revert to full ICE support.
-
-	The default (keyword not present at all) is to use full ICE support, or to leave the previously
-	set "ICE lite" mode unchanged. This keyword is valid in `offer` messages only.
-
-* `transport protocol`
-
-	The transport protocol specified in the SDP body is to be rewritten to the string value given here.
-	The media
-	proxy will expect to receive this protocol on the allocated ports, and will talk this protocol when
-	sending packets out. Translation between different transport protocols will happen as necessary.
-
-	Valid values are: `RTP/AVP`, `RTP/AVPF`, `RTP/SAVP`, `RTP/SAVPF`.
-
-	Additionally the string `accept` can be given in `answer` messages to allow a special case: By
-	default (when no `transport-protocol` override is given) in answer messages, *rtpengine* will
-	use the transport protocol that was originally offered. However, an answering client may answer
-	with a different protocol than what was offered (e.g. offer was for `RTP/AVP` and answer comes
-	with `RTP/AVPF`). The default behaviour for *rtpengine* is to ignore this protocol change and
-	still proceed with the protocol that was originally offered. Using the `accept` option here
-	tells *rtpengine* to go along with this protocol change and pass it to the original offerer.
-
-* `media address`
-
-	This can be used to override both the addresses present in the SDP body
-	and the `received from` address. Contains either an IPv4 or an IPv6 address, expressed as a simple
-	string. The format must be dotted-quad notation for IPv4 or RFC 5952 notation for IPv6.
-	It's up to the RTP proxy to determine the address family type.
-
-* `address family`
-
-	A string value of either `IP4` or `IP6` to select the primary address family in the substituted SDP
-	body. The default is to auto-detect the address family if possible (if the receiving end is known
-	already) or otherwise to leave it unchanged.
-
-* `rtcp-mux`
-
-	A list of strings controlling the behaviour regarding rtcp-mux (multiplexing RTP and RTCP on a single
-	port, RFC 5761). The default behaviour is to go along with the client's preference. The list can contain
-	zero of more of the following strings. Note that some of them are mutually exclusive.
-
-	- `offer`
-
-		Instructs *rtpengine* to always offer rtcp-mux, even if the client itself doesn't offer it.
-
-	- `require`
-
-		Similar to `offer` but pretends that the receiving client has already accepted rtcp-mux.
-		The effect is that no separate RTCP ports will be advertised, even in an initial offer
-		(which is against RFC 5761). This option is provided to talk to WebRTC clients.
-
-	- `demux`
-
-		If the client is offering rtcp-mux, don't offer it to the other side, but accept it back to
-		the offering client.
-
-	- `accept`
-
-		Instructs *rtpengine* to accept rtcp-mux and also offer it to the other side if it has been
-		offered.
-
-	- `reject`
-
-		Reject rtcp-mux if it has been offered. Can be used together with `offer` to achieve the opposite
-		effect of `demux`.
-
-* `TOS`
-
-	Contains an integer. If present, changes the TOS value for the entire call, i.e. the TOS value used
-	in outgoing RTP packets of all RTP streams in all directions. If a negative value is used, the previously
-	used TOS value is left unchanged. If this key is not present or its value is too large (256 or more), then
-	the TOS value is reverted to the default (as per `--tos` command line).
 
 * `DTLS`
 
@@ -1140,6 +820,293 @@ Optionally included keys are:
 	from the certificate. The default is SHA-256, or the same hashing function as was used by the
 	peer. Available are `SHA-1`, `SHA-224`, `SHA-256`, `SHA-384`, and `SHA-512`.
 
+* `DTMF-security`
+
+	Used in the `block DTMF` message to select the DTMF blocking mode. The
+	default mode is `drop` which simply drops DTMF event packets. The other
+	supported modes are: `silence` which replaces DTMF events with silence
+	audio; `tone` which replaces DTMF events with a single sine wave tone;
+	`random` which replaces DTMF events with random other DTMF events (both
+	in-band DTMF audio tones and RFC event packets); `zero` which is
+	similar to `random` except that a zero event is always used; `DTMF`
+	which is similar to `zero` except that a different DTMF digit can be
+	specified; `off` to disable DTMF blocking.
+
+* `DTMF-security-trigger`
+
+	Blocking mode to enable when the DTMF `trigger` (see below) is detected.
+
+* `DTMF-security-trigger-end`
+
+	Blocking mode to enable when the DTMF `end trigger` (see below) is
+	detected.
+
+* `DTMF-delay`
+
+	Time in milliseconds to delay DTMF events (both RFC event packets and
+	DTMF tones) for. With this option enabled (set to non-zero), DTMF
+	events are initially replaced by silence and then subsequently
+	reproduced after the given delay. DTMF blocking modes are honoured at
+	the time when the DTMF events are reproduced.
+
+* `endpoint-learning`
+
+	Contains one of the strings `off`, `immediate`, `delayed` or `heuristic`. This tells rtpengine which endpoint learning algorithm to use and overrides the `endpoint-learning` configuration option. This option can also be put into the `flags` list using a prefix of `endpoint-learning-`.
+
+* `frequency` or `frequencies`
+
+    Sets the tone frequency or frequencies for `DTMF-security=tone` in Hertz.
+    The default is a single frequency of 400 Hz. A list of frequencies can be
+    given either as a list object, or as a string containing a comma-separated
+    list of integers. The given frequencies will be picked from the list in
+    order, one for each DTMF event detected, and will be repeated once the end
+    of the list is reached.
+
+* `from-tags`
+
+	Contains a list of strings used to selected multiple existing call
+	participants (e.g. for the `subscribe request` message). An alternative
+	way to list multiple tags is by putting them into the `flags` list,
+	each prefixed with `from-tags-`.
+
+* `generate RTCP`
+
+	Contains a string, either `on` or `off`. If enabled for a call,
+	received RTCP packets will not simply be passed through as usual, but
+	instead will be consumed, and instead *rtpengine* will generate its own
+	RTCP packets to send to the RTP peers. This flag will be effective for
+	both sides of a call.
+
+* `ICE`
+
+	Contains a string which must be one of the following values:
+
+	With `remove`, any ICE attributes are stripped from the SDP body. Also
+	see the flag `reject ICE` to effect an early removal of ICE support
+	during an `offer`.
+
+	With `force`, ICE attributes are first stripped, then new attributes are
+	generated and inserted, which leaves the media proxy as the only ICE candidate.
+
+	With `default`, the behaviour will be the same as with `force` if the incoming SDP already
+	had ICE attributes listed. If the incoming SDP did not contain ICE attributes, then no
+	ICE attributes are added.
+
+	With `force-relay`, existing ICE candidates are left in place except `relay`
+	type candidates, and *rtpengine* inserts itself as a `relay` candidate. It will also leave SDP
+	c= and m= lines unchanged.
+
+	With `optional`, if no ICE attributes are present, a new set is generated and the
+	media proxy lists itself as ICE candidate; otherwise, the media proxy inserts itself as a
+	low-priority candidate. This used to be the default behaviour in previous versions of
+	*rtpengine*.
+
+	The default behaviour (no `ICE` key present at all) is the same as `default`.
+
+	This flag operates independently of the `replace` flags.
+
+	Note that if config parameter `save-interface-ports = true`, ICE will be broken, because
+	rtpengine will bind ports only on the first local interface of desired family of logical interface.
+
+* `ICE-lite`
+
+	Contains a string which must be one of the following values:
+
+	- `forward` to enable "ICE lite" mode towards the peer that this offer is sent to.
+
+	- `backward` to enable "ICE lite" mode towards the peer that has sent this offer.
+
+	- `both` to enable "ICE lite" towards both peers.
+
+	- `off` to disable "ICE lite" towards both peers and revert to full ICE support.
+
+	The default (keyword not present at all) is to use full ICE support, or to leave the previously
+	set "ICE lite" mode unchanged. This keyword is valid in `offer` messages only.
+
+* `interface`
+
+	Contains a single string naming one of the configured interfaces, just like `direction` does. The
+	`interface` option is used instead of `direction` where only one interface is required (e.g. outside
+	of an offer/answer scenario), for example in the `publish` or `subscribe request` commands.
+
+* `label` or `from-label`
+
+	A custom free-form string which *rtpengine* remembers for this participating endpoint and reports
+	back in logs and statistics output. For some commands (e.g. `block media`) the given label is not
+	used to set the label of the call participant, but rather to select an existing call participant.
+
+* `media address`
+
+	This can be used to override both the addresses present in the SDP body
+	and the `received from` address. Contains either an IPv4 or an IPv6 address, expressed as a simple
+	string. The format must be dotted-quad notation for IPv4 or RFC 5952 notation for IPv6.
+	It's up to the RTP proxy to determine the address family type.
+
+* `media echo` or `media-echo`
+
+	Contains a string to enable a special media echo mode. Recognised values are:
+
+	- `blackhole` or `sinkhole`
+
+		Media arriving from either side of the call is simply discarded
+		and not forwarded.
+
+	- `forward`
+
+		Enables media echo towards the receiver of this message (e.g.
+		the called party if the message is an `offer` from the caller).
+		Media arriving from that side is echoed back to its sender
+		(with a new SSRC if it's RTP). Media arriving from the opposite
+		side is discarded.
+
+	- `backwards`
+
+		Enables media echo towards the sender of this message (i.e. the
+		opposite of `forward`). Media arriving from the other side is
+		discarded.
+
+	- `both`
+
+		Enables media echo towards both the sender and the receiver of
+		this message.
+
+* `metadata`
+
+	This is a generic metadata string. The metadata will be written to the bottom of
+	metadata files within `/path/to/recording_dir/metadata/` or to
+	`recording_metakeys` table.  In the latter case, `metadata` string must
+	contain a list of `key:val` pairs separated by `|` character.  `metadata` can be used to
+	record additional information about recorded calls. `metadata` values passed in
+	through subsequent messages will overwrite previous metadata values.
+
+	See the `--recording-dir` option above.
+
+* `OSRTP`
+
+	Similar to `SDES` but controls OSRTP behaviour. Default behaviour is to pass through
+	OSRTP negotiations. Supported options:
+
+	- `offer` or `offer-RFC`
+
+        When processing a non-OSRTP offer, convert it to an OSRTP offer. Will
+        result in RTP/SRTP transcoding if the OSRTP offer is accepted. The
+        transport protocol should be a non-SRTP (plain RTP) protocol such as
+        RTP/AVP.
+
+    - `offer-legacy`
+
+        Convert a regular offer to a legacy, non-RFC "best effort" SRTP offer,
+        which involves duplicating each SDP media section in the output,
+        advertised once as plain RTP and once as SRTP. The transport protocol
+        should be set to an SRTP protocol such as RTP/SAVP. To enable full
+        interoperability with endpoints which support this usage, the flag
+        `accept-legacy` (see below) should also be given in all signalling
+        exchanges.
+
+	- `accept-RFC`
+
+		When processing a non-OSRTP answer in response to an OSRTP offer, accept the
+		OSRTP offer anyway. Results in RTP/SRTP transcoding.
+
+    - `accept-legacy`
+
+        Enables support for legacy, non-RFC "best effort" SRTP offers, which
+        consist of media sections being advertised twice, once as plain RTP and
+        once as SRTP. With this option set, *rtpengine* will treat such SDPs as
+        SRTP SDPs, removing the duplicated media sections. This flag must be
+        given for both offer and answer messages.
+
+    - `accept`
+
+        Short for both `accept-RFC` and `accept-legacy`. Can be used
+        unconditionally in all signalling if so desired.
+
+* `ptime`
+
+	Contains an integer. If set, changes the `a=ptime` attribute's value in the outgoing
+	SDP to the provided value. It also engages the transcoding engine for supported codecs
+	to provide repacketization functionality, even if no additional codec has actually
+	been requested for transcoding. Note that not all codecs support all packetization
+	intervals.
+
+	The selected ptime (which represents the duration of a single media packet in milliseconds)
+	will be used towards the endpoint receiving this offer, even if the matching answer
+	prefers a different ptime.
+
+	This option is ignored in `answer` messages. See below for the reverse.
+
+* `ptime-reverse`
+
+	This is the reciprocal to `ptime`. It sets the ptime to be used towards the endpoint
+	who has sent the offer. It will be inserted in the `answer` SDP. This option is also
+	ignored in `answer` messages.
+
+* `received from`
+
+	Contains a list of exactly two elements. The first element denotes the address family and the second
+	element is the SIP message's source address itself. The address family can be one of `IP4` or `IP6`.
+	Used if SDP addresses are neither trusted (through `SIP source address` or `--sip-source`) nor the
+	`media address` key is present.
+
+* `record call`
+
+	Contains one of the strings `yes`, `no`, `on` or `off`. This tells the rtpengine
+	whether or not to record the call to PCAP files. If the call is recorded, it
+	will generate PCAP files for each stream and a metadata file for each call.
+	Note that rtpengine *will not* force itself into the media path, and other
+	flags like `ICE=force` may be necessary to ensure the call is recorded.
+
+	See the `--recording-dir` option above.
+
+	Enabling call recording via this option has the same effect as doing it separately
+	via the `start recording` message, except that this option guarantees that the
+	entirety of the call gets recorded, including all details such as SDP bodies
+	passing through *rtpengine*.
+
+* `rtcp-mux`
+
+	A list of strings controlling the behaviour regarding rtcp-mux (multiplexing RTP and RTCP on a single
+	port, RFC 5761). The default behaviour is to go along with the client's preference. The list can contain
+	zero of more of the following strings. Note that some of them are mutually exclusive.
+
+	- `offer`
+
+		Instructs *rtpengine* to always offer rtcp-mux, even if the client itself doesn't offer it.
+
+	- `require`
+
+		Similar to `offer` but pretends that the receiving client has already accepted rtcp-mux.
+		The effect is that no separate RTCP ports will be advertised, even in an initial offer
+		(which is against RFC 5761). This option is provided to talk to WebRTC clients.
+
+	- `demux`
+
+		If the client is offering rtcp-mux, don't offer it to the other side, but accept it back to
+		the offering client.
+
+	- `accept`
+
+		Instructs *rtpengine* to accept rtcp-mux and also offer it to the other side if it has been
+		offered.
+
+	- `reject`
+
+		Reject rtcp-mux if it has been offered. Can be used together with `offer` to achieve the opposite
+		effect of `demux`.
+
+* `via-branch`
+
+	The SIP `Via` branch as string. Used to additionally refine the matching logic between media streams
+	and calls and call branches.
+
+* `set-label`
+
+	Some commands (e.g. `block media`) use the given `label` to select
+	an existing call participant. For these commands, `set-label` instead
+	of `label` can be used to set the label at the same time, either for
+	the selected call participant (if selected via `from-tag`) or for the
+	newly created participant (e.g. for `subscribe request`).
+
 * `SDES`
 
 	A list of strings controlling the behaviour regarding SDES. The default is to offer SDES without any
@@ -1173,6 +1140,67 @@ Optionally included keys are:
 		offer, it will be removed and will be missing in the outgoing offer; and if a given crypto
 		suite was not present in the received offer, it will not be added to it.
 
+		*Remark: if after applying the policies to the processed offer, there are no crypto suites left,*
+		*which can be used later in the answer towards the offerer, then RTPEngine will intentionally*
+		*leave the top most one offered, for the answer towards the originator.*
+		*However it will be not used for the recipient.*
+
+	- `only-`*SUITE*
+
+		Add only these individual crypto suites and none of the others. For example,
+		`only-NULL_HMAC_SHA1_32` would only accept the crypto suite `NULL_HMAC_SHA1_32` for
+		the offer being generated. This takes precedence over the `SDES-no-` flag(s),
+		if used together, so the `SDES-no` will be not taken into account.
+		This has two effects: if a given crypto suite was present in a received offer, it will
+		be kept, so will be present in the outgoing offer; and if a given crypto suite was not
+		present in the received offer, it will be added to it. The rest, which is not mentioned,
+		will be dropped/not added.
+
+		*Remark: if after applying the policies to the processed offer, there are no crypto suites left,*
+		*which can be used later in the answer towards the offerer, then RTPEngine will intentionally*
+		*leave the top most one offered, for the answer towards the originator.*
+		*However it will be not used for the recipient.*
+
+	- `nonew`
+
+		Don't add any new crypto suites into the offer. This means, offered SDES crypto suites
+		will accepted, meanwhile no new is going to be generated by RTPEngine.
+		It takes precedence over the `SDES-no` and `SDES-only` flags, if used in combination.
+
+	- `order:`*SUITES LIST*
+
+		The order, in which crypto suites are being added to the SDP.
+		Example: `SDES-order:AES_256_CM_HMAC_SHA;AES_256_CM_HMAC_SHA1_32;AES_192_CM_HMAC_SHA1_80;`,
+		this means — those listed SDES crypto suites will be added into the generated SDP body at the top
+		of crypto suites list, in the given order. But, each of them is added, only if it is
+		about to be added/generated. In other words, the `SDES-order:` flag itself doesn't add crypto suites,
+		it just affects the order of those suites to be added.
+
+		And the rest of non-mentioned suites (not mentioned in the `SDES-order:` list),
+		which are also to be added, will be appended after those given, in the free manner of ordering.
+
+		Important thing to remember - it doesn't change the crypto suite tag
+		for the recipient, even though changing the order of them.
+
+		This flag does not contradict with `SDES-nonew`, `SDES-only-` and `SDES-no-` flags.
+		It just orders the list of crypto suites already prepared to be sent out.
+
+	- `offerer_pref:`*SUITES LIST*
+
+		The list of preferred crypto suites to be selected for the offerer.
+
+		It provides a possiblity to select specific crypto suite(s) for the offerer from
+		the given list of crypto suites received in the offer.
+    
+		This will be used later on, when processing an answer from
+		the recipient and generating an answer to be sent out towards offerer.
+
+		Furthermore, this is being decided not when the answer is processed,
+		but already when the offer is processed.
+
+		Flag usage example:
+		`SDES-offerer_pref:AES_256_CM_HMAC_SHA;AES_256_CM_HMAC_SHA1_32;`
+
 	- `pad`
 
 		RFC 4568 (section 6.1) is somewhat ambiguous regarding the base64 encoding format of
@@ -1191,217 +1219,77 @@ Optionally included keys are:
 		and instead leave the previously negotiated crypto suite in place. Only useful in
 		subsequent `answer` messages and ignored in `offer` messages.
 
-* `OSRTP`
+* `supports`
 
-	Similar to `SDES` but controls OSRTP behaviour. Default behaviour is to pass through
-	OSRTP negotiations. Supported options:
+	Contains a list of strings. Each string indicates support for an additional feature
+	that the controlling SIP proxy supports. Currently defined values are:
 
-	- `offer`
+	* `load limit`
 
-		When processing a non-OSRTP offer, convert it to an OSRTP offer. Will result
-		in RTP/SRTP transcoding if the OSRTP offer is accepted.
+		Indicates support for an extension to the *ng* protocol to facilitate certain load
+		balancing mechanisms. If *rtpengine* is configured with certain session or load
+		limit options enabled (such as the `max-sessions` option), then normally *rtpengine*
+		would reply with an error to an `offer` if one of the limits is exceeded. If support
+		for the `load limit` extension is indicated, then instead of replying with an error,
+		*rtpengine* responds with the string `load limit` in the `result` key of the response
+		dictionary. The response dictionary may also contain the optional key `message` with
+		an explanatory string. No other key is required in the response dictionary.
 
-	- `accept`
+* `to-label`
 
-		When processing a non-OSRTP answer in response to an OSRTP offer, accept the
-		OSRTP offer anyway. Results in RTP/SRTP transcoding.
+	Commands that allow selection of two call participants (e.g. `block
+	media`) can use `label` instead of `from-tag` to select the first call
+	participant. The `to-label` can then be used instead of `to-tag` to
+	select the other call participant.
 
-* `endpoint-learning`
+	For `subscribe request` the `to-label` is synonymous with `set-label`.
 
-	Contains one of the strings `off`, `immediate`, `delayed` or `heuristic`. This tells rtpengine which endpoint learning algorithm to use and overrides the `endpoint-learning` configuration option. This option can also be put into the `flags` list using a prefix of `endpoint-learning-`.
+* `TOS`
 
-* `record call`
+	Contains an integer. If present, changes the TOS value for the entire call, i.e. the TOS value used
+	in outgoing RTP packets of all RTP streams in all directions. If a negative value is used, the previously
+	used TOS value is left unchanged. If this key is not present or its value is too large (256 or more), then
+	the TOS value is reverted to the default (as per `--tos` command line).
 
-	Contains one of the strings `yes`, `no`, `on` or `off`. This tells the rtpengine
-	whether or not to record the call to PCAP files. If the call is recorded, it
-	will generate PCAP files for each stream and a metadata file for each call.
-	Note that rtpengine *will not* force itself into the media path, and other
-	flags like `ICE=force` may be necessary to ensure the call is recorded.
+* `transport protocol`
 
-	See the `--recording-dir` option above.
+	The transport protocol specified in the SDP body is to be rewritten to the string value given here.
+	The media
+	proxy will expect to receive this protocol on the allocated ports, and will talk this protocol when
+	sending packets out. Translation between different transport protocols will happen as necessary.
 
-	Enabling call recording via this option has the same effect as doing it separately
-	via the `start recording` message, except that this option guarantees that the
-	entirety of the call gets recorded, including all details such as SDP bodies
-	passing through *rtpengine*.
+	Valid values are: `RTP/AVP`, `RTP/AVPF`, `RTP/SAVP`, `RTP/SAVPF`.
 
-* `metadata`
+	Additionally the string `accept` can be given in `answer` messages to allow a special case: By
+	default (when no `transport-protocol` override is given) in answer messages, *rtpengine* will
+	use the transport protocol that was originally offered. However, an answering client may answer
+	with a different protocol than what was offered (e.g. offer was for `RTP/AVP` and answer comes
+	with `RTP/AVPF`). The default behaviour for *rtpengine* is to ignore this protocol change and
+	still proceed with the protocol that was originally offered. Using the `accept` option here
+	tells *rtpengine* to go along with this protocol change and pass it to the original offerer.
 
-	This is a generic metadata string. The metadata will be written to the bottom of
-	metadata files within `/path/to/recording_dir/metadata/` or to
-	`recording_metakeys` table.  In the latter case, `metadata` string must
-	contain a list of `key:val` pairs separated by `|` character.  `metadata` can be used to
-	record additional information about recorded calls. `metadata` values passed in
-	through subsequent messages will overwrite previous metadata values.
+* `trigger`
 
-	See the `--recording-dir` option above.
+	A string of DTMF digits that enable a DTMF blocking mode when detected.
 
-* `codec`
+* `trigger-end` or `end trigger`
 
-	Contains a dictionary controlling various aspects of codecs (or RTP payload types).
+	A string of DTMF digits that disable DTMF blocking or enable a
+	different DTMF blocking mode when detected, but only after the initial
+	enabling `trigger` has been detected.
 
-	These options can also be put into the `flags` list using a prefix of `codec-`. For example,
-	to set the codec options for two variants of Opus when they're implicitly accepted, (see
-	the example under `set`), one would put the following into the `flags` list:
-	`codec-set-opus/48000/1/16000` `codec-set-opus/48000/2/32000`
+* `trigger-end-time`
 
-	The following keys are understood:
+	Time in milliseconds that a DTMF blocking mode enabled by the `trigger`
+	should remain active the most. After the time has expired, the blocking
+	mode is switched to the `trigger-end` mode.
 
-	* `strip`
+* `trigger-end-digits`
 
-		Contains a list of strings. Each string is the name of a codec or RTP payload
-		type that should be removed from the SDP. Codec names are case sensitive, and
-		can be either from the list of codecs explicitly defined by the SDP through
-		an `a=rtpmap` attribute, or can be from the list of RFC-defined codecs. Examples
-		are `PCMU`, `opus`, or `telephone-event`. Codecs stripped using this option
-		are treated as if they had never been in the SDP.
-
-		It is possible to specify codec format parameters alongside with the codec name
-		in the same format as they're written in SDP for codecs that support them,
-		for example `opus/48000` to
-		specify Opus with 48 kHz sampling rate and one channel (mono), or
-		`opus/48000/2` for stereo Opus. If any format parameters are specified,
-		the codec will only be stripped if all of the format parameters match, and other
-		instances of the same codec with different format parameters will be left
-		untouched.
-
-		As a special keyword, `all` can be used to remove all codecs, except the ones
-		that should explicitly offered (see below). Note that it is an error to strip
-		all codecs and leave none that could be offered. In this case, the original
-		list of codecs will be left unchanged.
-
-		The keyword `full` can also be used, which behaves the same as `all` with the
-		exception listed under `transcode` below.
-
-	* `except`
-
-		Contains a list of strings. Each string is the name of a codec that should be
-		included in the list of codecs offered. This is primarily useful to block all
-		codecs (`strip -> all` or `mask -> all`) except the ones given in the `except`
-		whitelist.  Codecs that were not present in the original list of codecs
-		offered by the client will be ignored.
-
-		This list also supports codec format parameters as per above.
-
-	* `offer`
-
-		This is identical to `except` but additionally allows the codec order to be
-		changed. So the first codec listed in `offer` will be the primary (preferred)
-		codec in the output SDP, even if it wasn't originally so.
-
-	* `transcode`
-
-		Similar to `offer` but allows codecs to be added to the list of offered codecs
-		even if they were not present in the original list of codecs. In this case,
-		the transcoding engine will be engaged. Only codecs that are supported for both
-		decoding and encoding can be added in this manner. This also has the side effect
-		of automatically stripping all unsupported codecs from the list of offered codecs,
-		as *rtpengine* must expect to receive or even send in any codec that is present
-		in the list.
-
-		Note that using this option does not necessarily always engage the transcoding
-		engine. If all codecs given in the `transcode` list were present in the original
-		list of offered codecs, then no transcoding will be done. Also note that if
-		transcoding takes place, in-kernel forwarding is disabled for this media stream
-		and all processing happens in userspace.
-
-		If no codec format parameters are specified in this list (e.g. just `opus`
-		instead of `opus/48000/2`), default values will be chosen for them.
-
-		For codecs that support different bitrates, it can be specified by appending
-		another slash followed by the bitrate in bits per second,
-		e.g. `opus/48000/2/32000`. In this case, all format parameters (clock rate,
-		channels) must also be specified.
-
-		Additional options that can be appended to the codec string with additional slashes
-		are ptime, the `fmtp` string, and additional codec-specific options, for example
-		`iLBC/8000/1///mode=30` to use as `fmtp`.
-
-		If a literal `=` cannot be used due to parsing constraints (i.e. being wrongly
-		interpreted as a key-value pair), it can be escaped by using two dashes instead,
-		e.g. `iLBC/8000/1///mode--30`.
-
-		As a special case, if the `strip=all` or `mask=all` option has been used and
-		the `transcode` option is used on a codec that was originally present in the offer,
-		then *rtpengine* will treat this codec the same as if it had been used with the
-		`offer` option, i.e. it will simply restore it from the list of stripped codecs and
-		won't actually engage transcoding for this codec. On the other hand, if a codec has
-		been stripped explicitly by name using the `strip` or `mask` option and then used again
-		with the `transcode` option, then the codec will not simply be restored from the
-		list of stripped codecs, but instead a new transcoded instance of the codec will
-		be inserted into the offer. (This special exception does not apply to `mask=full`
-		or `strip=full`.)
-
-		This option is only processed in `offer` messages and ignored otherwise.
-
-	* `mask`
-
-		Similar to `strip` except that codecs listed here will still be accepted and
-		used for transcoding on the offering side. Useful only in combination with
-		`transcode`. For example, if an offer advertises Opus and the options
-		`mask=opus, transcode=G723` are given, then the rewritten outgoing offer
-		will contain only G.723 as offered codec, and transcoding will happen
-		between Opus and G.723. In contrast, if only `transcode=G723` were given, then
-		the rewritten outgoing offer would contain both Opus and G.723. On the other
-		hand, if `strip=opus, transcode=G723` were given, then Opus would be unavailable
-		for transcoding.
-
-		As with the `strip` option, the special keywords `all`  and `full` can be used
-		to mask all codecs that have been offered.
-
-		This option is only processed in `offer` messages and ignored otherwise.
-
-	* `consume`
-
-		Identical to `mask` but enables the transcoding engine even if no other transcoding
-		related options are given.
-
-	* `accept`
-
-		Similar to `mask` and `consume` but doesn't remove the codec from the list of
-		offered codecs. This means that a codec listed under `accept` will still be offered
-		to the remote peer, but if the remote peer rejects it, it will still be accepted
-		torwards the original offerer and then used for transcoding. It is a more selective
-		version of what the `always transcode` flag does.
-
-	* `set`
-
-		Contains a list of strings. This list makes it possible to set codec options
-		(bitrate in particular) for codecs that are implicitly accepted for transcoding.
-		For example, if `AMR` was offered, `transcode=PCMU` was given, and the remote
-		ended up accepting `PCMU`, then this option can be used to set the bitrate used
-		for the AMR transcoding process.
-
-		Each string must be a full codec specification as per above, including clock rate
-		and number of channels. Using the example above, `set=AMR/8000/1/7400` can be used
-		to transcode to AMR with 7.4 kbit/s.
-
-		Codec options (bitrate) are only applied to codecs that match the given parameters
-		(clock rate, channels), and multiple options can be given for the same coded with
-		different parameters. For example, to specify different bitrates for Opus for both
-		mono and stereo output, one could use `set=[opus/48000/1/16000,opus/48000/2/32000]`.
-
-		This option is only processed in `offer` messages and ignored otherwise.
-
-* `ptime`
-
-	Contains an integer. If set, changes the `a=ptime` attribute's value in the outgoing
-	SDP to the provided value. It also engages the transcoding engine for supported codecs
-	to provide repacketization functionality, even if no additional codec has actually
-	been requested for transcoding. Note that not all codecs support all packetization
-	intervals.
-
-	The selected ptime (which represents the duration of a single media packet in milliseconds)
-	will be used towards the endpoint receiving this offer, even if the matching answer
-	prefers a different ptime.
-
-	This option is ignored in `answer` messages. See below for the reverse.
-
-* `ptime-reverse`
-
-	This is the reciprocal to `ptime`. It sets the ptime to be used towards the endpoint
-	who has sent the offer. It will be inserted in the `answer` SDP. This option is also
-	ignored in `answer` messages.
+	Number of DTMF digits that a DTMF blocking mode enabled by the
+	`trigger` should remain active the most. After this number of DTMF
+	digits has been detected, the blocking mode is switched to the
+	`trigger-end` mode.
 
 * `T.38`
 
@@ -1463,21 +1351,11 @@ Optionally included keys are:
 		Use UDPTL FEC instead of redundancy. Only useful with `T.38=force` as
 		it's a negotiated parameter.
 
-* `supports`
+* `volume`
 
-	Contains a list of strings. Each string indicates support for an additional feature
-	that the controlling SIP proxy supports. Currently defined values are:
-
-	* `load limit`
-
-		Indicates support for an extension to the *ng* protocol to facilitate certain load
-		balancing mechanisms. If *rtpengine* is configured with certain session or load
-		limit options enabled (such as the `max-sessions` option), then normally *rtpengine*
-		would reply with an error to an `offer` if one of the limits is exceeded. If support
-		for the `load limit` extension is indicated, then instead of replying with an error,
-		*rtpengine* responds with the string `load limit` in the `result` key of the response
-		dictionary. The response dictionary may also contain the optional key `message` with
-		an explanatory string. No other key is required in the response dictionary.
+	Sets the tone volume for `DTMF-security` modes `tone`, `zero, `DTMF`,
+	and `random` in negative dB. The default is -10 dB. The highest
+	possible volume is 0 dB and the lowest possible volume is -63 dB.
 
 * `xmlrpc-callback`
 
@@ -1485,33 +1363,407 @@ Optionally included keys are:
 	If specified, then this address will be used as destination address for the XMLRPC timeout
 	callback (see `b2b-url` option).
 
-* `media echo` or `media-echo`
+**Optionally included flags are:**
 
-	Contains a string to enable a special media echo mode. Recognised values are:
+The value of the `flags` key is a list. The list contains zero or more of the following strings.
+Spaces in each string may be replaced by hyphens.
 
-	- `blackhole` or `sinkhole`
+* `all`
 
-		Media arriving from either side of the call is simply discarded
-		and not forwarded.
+	Synonymous to `all=all` (see below).
 
-	- `forward`
+* `allow transcoding`
 
-		Enables media echo towards the receiver of this message (e.g.
-		the called party if the message is an `offer` from the caller).
-		Media arriving from that side is echoed back to its sender
-		(with a new SSRC if it's RTP). Media arriving from the opposite
-		side is discarded.
+	This flag is only useful in commands that provide an explicit answer SDP to *rtpengine*
+	(e.g. `subscribe answer`). For these commands, if the answer SDP does not accept all
+	codecs that were offered, the default behaviour is to reject the answer. With this flag
+	given, the answer will be accepted even if some codecs were rejected, and codecs will be
+	transcoded as required.
 
-	- `backwards`
+* `always transcode`
 
-		Enables media echo towards the sender of this message (i.e. the
-		opposite of `forward`). Media arriving from the other side is
-		discarded.
+	Legacy flag, synonymous to `codec-accept=all`.
 
-	- `both`
+* `asymmetric`
 
-		Enables media echo towards both the sender and the receiver of
-		this message.
+	Corresponds to the *rtpproxy* `a` flag. Advertises an RTP endpoint which uses asymmetric
+	RTP, which disables learning of endpoint addresses (see below).
+
+* `debug` or `debugging`
+
+	Enabled full debug logging for this call, regardless of global log level settings.
+
+* `detect DTMF`
+
+	When present in a message that sets up codec handlers, enables
+	the DSP to detect in-band DTMF audio tones even when it
+	wouldn't otherwise be necessary.
+
+* `full rtcp attribute`
+
+	Include the full version of the `a=rtcp` line (complete with network address) instead of
+	the short version with just the port number.
+
+* `generate RTCP`
+
+	Identical to setting `generate RTCP = on`.
+
+* `generate mid`
+
+	Add `a=mid` attributes to the outgoing SDP if they were not already present.
+
+* `inject DTMF`
+
+	Signals to *rtpengine* that the audio streams involved in this `offer` or `answer`
+	(the flag should be present in both of them) are to be made available for DTMF
+	injection via the `play DTMF` control message. See `play DTMF` below for additional
+	information.
+
+* `loop protect`
+
+	Inserts a custom attribute (`a=rtpengine:...`) into the outgoing SDP to prevent *rtpengine*
+	processing and rewriting the same SDP multiple times. This is useful if your setup
+	involves signalling loops and need to make sure that *rtpengine* doesn't start looping
+	media packets back to itself. When this flag is present and *rtpengine* sees a matching
+	attribute already present in the SDP, it will leave the SDP untouched and not process
+	the message.
+
+* `media handover`
+
+	Similar to the `strict source` option, but instead of dropping packets when the source address
+	or port don't match, the endpoint address will be re-learned and moved to the new address. This
+	allows endpoint addresses to change on the fly without going through signalling again. Note that
+	this opens a security hole and potentially allows RTP streams to be hijacked, either partly or
+	in whole.
+
+* `NAT-wait`
+
+	Prevents forwarding media packets to the respective endpoint
+	until at least one media packet has been received from that
+	endpoint. This is to allow a NAT binding to open in the ingress
+	direction before sending packets out, which could result in an
+	automated firewall block.
+
+* `no port latching`
+
+	Port latching is enabled by default for endpoints which speak
+	ICE. With this option preset, a remote port change will result
+	in a local port change even for endpoints which speak ICE,
+	which will imply an ICE restart.
+
+* `no rtcp attribute`
+
+	Omit the `a=rtcp` line from the outgoing SDP.
+
+* `original sendrecv`
+
+	With this flag present, *rtpengine* will leave the media direction attributes
+	(`sendrecv`, `recvonly`, `sendonly`, and `inactive`) from the received SDP body
+	unchanged. Normally *rtpengine* would consume these attributes and insert its
+	own version of them based on other media parameters (e.g. a media section with
+	a zero IP address would come out as `sendonly` or `inactive`).
+
+* `pad crypto`
+
+	Legacy alias to SDES=pad.
+
+* `pierce NAT`
+
+	Sends empty UDP packets to the remote RTP peer as soon as an
+	endpoint address is available from a received SDP, for as long
+	as no incoming packets have been received. Useful to create an
+	initial NAT mapping. Not needed when ICE is in use.
+
+* `port latching`
+
+	Forces *rtpengine* to retain its local ports during a signalling exchange even when the
+	remote endpoint changes its port.
+
+* `record call`
+
+	Identical to setting `record call` to `on` (see below).
+
+* `reject ICE`
+
+	Useful for `offer` messages that advertise support for ICE.
+	Instructs *rtpengine* to reject the offered ICE. This is
+	similar to using `ICE=remove` in the respective `answer`.
+
+* `reset`
+
+	This causes *rtpengine* to un-learn certain aspects of the RTP endpoints involved, such as
+	support for ICE or support for SRTP. For example, if `ICE=force` is given, then *rtpengine*
+	will initially offer ICE to the remote endpoint. However, if a subsequent answer from that
+	same endpoint indicates that it doesn't support ICE, then no more ICE offers will be made
+	towards that endpoint, even if `ICE=force` is still specified. With the `reset` flag given,
+	this aspect will be un-learned and *rtpengine* will again offer ICE to this endpoint.
+	This flag is valid only in an `offer` message and is useful when the call has been
+	transferred to a new endpoint without change of `From` or `To` tags.
+
+* `reuse codecs` or `no codec renegotiation`
+
+	Instructs *rtpengine* to prevent endpoints from switching codecs during call run-time
+	if possible. Codecs that were listed as preferred in the past will be kept as preferred
+	even if the re-offer lists other codecs as preferred, or in a different order. Recommended
+	to be combined with `single codec`.
+
+* `RTCP mirror`
+
+	Useful only for `subscribe request` message. Instructs
+	*rtpengine* to not only create a one-way subscription for both
+	RTP and RTCP from the source to the sink, but also create a
+	reverse subscription for RTCP only from the sink back to the
+	source.  This makes it possible for the media source to receive
+	feedback from all media receivers (sinks).
+
+* `single codec`
+
+	Using this flag in an `answer` message will leave only the first listed codec in place
+	and will remove all others from the list. Useful for RTP clients which get confused if
+	more than one codec is listed in an answer.
+
+* `SIP source address`
+
+	Ignore any IP addresses given in the SDP body and use the source address of the received
+	SIP message (given in `received from`) as default endpoint address. This was the default
+	behaviour of older versions of *rtpengine* and can still be made the default behaviour
+	through the `--sip-source` CLI switch.
+	Can be overridden through the `media address` key.
+
+* `symmetric`
+
+	Corresponds to the *rtpproxy* `w` flag. Not used by *rtpengine* as this is the default,
+	unless `asymmetric` is specified.
+
+* `trust address`
+
+	The opposite of `SIP source address`. This is the default behaviour unless the CLI switch
+	`--sip-source` is active. Corresponds to the *rtpproxy* `r` flag.
+	Can be overridden through the `media address` key.
+
+* `strip extmap`
+
+	Remove `a=rtpmap` attributes from the outgoing SDP.
+
+* `strict source`
+
+	Normally, *rtpengine* attempts to learn the correct endpoint address for every stream during
+	the first few seconds after signalling by observing the source address and port of incoming
+	packets (unless `asymmetric` is specified). Afterwards, source address and port of incoming
+	packets are normally ignored and packets are forwarded regardless of where they're coming from.
+	With the `strict source` option set, *rtpengine* will continue to inspect the source address
+	and port of incoming packets after the learning phase and compare them with the endpoint
+	address that has been learned before. If there's a mismatch, the packet will be dropped and
+	not forwarded.
+
+* `trickle ICE`
+
+	Useful for `offer` messages when ICE is advertised to also advertise
+	support for trickle ICE.
+
+* `unidirectional`
+
+	When this flag is present, kernelize also one-way rtp media.
+
+**Optionally included replace-flags are:**
+
+Similar to the usual `flags` list, but this one controls which parts of the SDP body should be rewritten.
+Contains zero or more of:
+
+* `force-increment-sdp-ver`
+
+	Force increasing the SDP version, even if the SDP hasn't been changed.
+
+* `origin`
+
+	Replace the address found in the *origin* (o=) line of the SDP body. Corresponds
+	to *rtpproxy* `o` flag.
+
+* `session name` or `session-name`
+
+	Same as `username` but for the entire contents of the `s=` line.
+
+* `session connection` or `session-connection`
+
+	Replace the address found in the *session-level connection* (c=) line of the SDP body.
+	Corresponds to *rtpproxy* `c` flag.
+
+* `SDP version` or `SDP-version`
+
+	Take control of the version field in the SDP and make sure it's increased every
+	time the SDP changes, and left unchanged if the SDP is the same.
+
+* `username`
+
+	Take control of the origin username field in the SDP. With this
+	option in use, *rtpengine* will make sure the username field in
+	the `o=` line always remains the same in all SDPs going to a
+	particular RTP endpoint.
+
+* `zero address`
+
+	Using a zero endpoint address is an obsolete way to signal a
+	muted or sendonly stream. Streams with zero addresses are
+	normally flagged as sendonly and the zero address in the SDP is
+	passed through. With this option set, the zero address is
+	replaced with a real address.
+
+**Optionally included codec manipulations:**
+
+`codec` contains a dictionary controlling various aspects of codecs (or RTP payload types).
+
+These options can also be put into the `flags` list using a prefix of `codec-`. For example,
+to set the codec options for two variants of Opus when they're implicitly accepted, (see
+the example under `set`), one would put the following into the `flags` list:
+`codec-set-opus/48000/1/16000` `codec-set-opus/48000/2/32000`
+
+The following keys are understood:
+
+* `accept`
+
+	Similar to `mask` and `consume` but doesn't remove the codec from the list of
+	offered codecs. This means that a codec listed under `accept` will still be offered
+	to the remote peer, but if the remote peer rejects it, it will still be accepted
+	towards the original offerer and then used for transcoding. It is a more selective
+	version of what the `always transcode` flag does.
+
+	The special string `any` can be used for the `publish` message.
+	See below for more details.
+
+* `consume`
+
+	Identical to `mask` but enables the transcoding engine even if no other transcoding
+	related options are given.
+
+* `except`
+
+	Contains a list of strings. Each string is the name of a codec that should be
+	included in the list of codecs offered. This is primarily useful to block all
+	codecs (`strip -> all` or `mask -> all`) except the ones given in the `except`
+	whitelist.  Codecs that were not present in the original list of codecs
+	offered by the client will be ignored.
+
+	This list also supports codec format parameters as per above.
+
+* `mask`
+
+	Similar to `strip` except that codecs listed here will still be accepted and
+	used for transcoding on the offering side. Useful only in combination with
+	`transcode`. For example, if an offer advertises Opus and the options
+	`mask=opus, transcode=G723` are given, then the rewritten outgoing offer
+	will contain only G.723 as offered codec, and transcoding will happen
+	between Opus and G.723. In contrast, if only `transcode=G723` were given, then
+	the rewritten outgoing offer would contain both Opus and G.723. On the other
+	hand, if `strip=opus, transcode=G723` were given, then Opus would be unavailable
+	for transcoding.
+
+	As with the `strip` option, the special keywords `all`  and `full` can be used
+	to mask all codecs that have been offered.
+
+	This option is only processed in `offer` messages and ignored otherwise.
+
+* `offer`
+
+	This is identical to `except` but additionally allows the codec order to be
+	changed. So the first codec listed in `offer` will be the primary (preferred)
+	codec in the output SDP, even if it wasn't originally so.
+
+* `set`
+
+	Contains a list of strings. This list makes it possible to set codec options
+	(bitrate in particular) for codecs that are implicitly accepted for transcoding.
+	For example, if `AMR` was offered, `transcode=PCMU` was given, and the remote
+	ended up accepting `PCMU`, then this option can be used to set the bitrate used
+	for the AMR transcoding process.
+
+	Each string must be a full codec specification as per above, including clock rate
+	and number of channels. Using the example above, `set=AMR/8000/1/7400` can be used
+	to transcode to AMR with 7.4 kbit/s.
+
+	Codec options (bitrate) are only applied to codecs that match the given parameters
+	(clock rate, channels), and multiple options can be given for the same coded with
+	different parameters. For example, to specify different bitrates for Opus for both
+	mono and stereo output, one could use `set=[opus/48000/1/16000,opus/48000/2/32000]`.
+
+	This option is only processed in `offer` messages and ignored otherwise.
+
+* `strip`
+
+	Contains a list of strings. Each string is the name of a codec or RTP payload
+	type that should be removed from the SDP. Codec names are case sensitive, and
+	can be either from the list of codecs explicitly defined by the SDP through
+	an `a=rtpmap` attribute, or can be from the list of RFC-defined codecs. Examples
+	are `PCMU`, `opus`, or `telephone-event`. Codecs stripped using this option
+	are treated as if they had never been in the SDP.
+
+	It is possible to specify codec format parameters alongside with the codec name
+	in the same format as they're written in SDP for codecs that support them,
+	for example `opus/48000` to
+	specify Opus with 48 kHz sampling rate and one channel (mono), or
+	`opus/48000/2` for stereo Opus. If any format parameters are specified,
+	the codec will only be stripped if all of the format parameters match, and other
+	instances of the same codec with different format parameters will be left
+	untouched.
+
+	As a special keyword, `all` can be used to remove all codecs, except the ones
+	that should explicitly offered (see below). Note that it is an error to strip
+	all codecs and leave none that could be offered. In this case, the original
+	list of codecs will be left unchanged.
+
+	The keyword `full` can also be used, which behaves the same as `all` with the
+	exception listed under `transcode` below.
+
+* `transcode`
+
+	Similar to `offer` but allows codecs to be added to the list of offered codecs
+	even if they were not present in the original list of codecs. In this case,
+	the transcoding engine will be engaged. Only codecs that are supported for both
+	decoding and encoding can be added in this manner. This also has the side effect
+	of automatically stripping all unsupported codecs from the list of offered codecs,
+	as *rtpengine* must expect to receive or even send in any codec that is present
+	in the list.
+
+	Note that using this option does not necessarily always engage the transcoding
+	engine. If all codecs given in the `transcode` list were present in the original
+	list of offered codecs, then no transcoding will be done. Also note that if
+	transcoding takes place, in-kernel forwarding is disabled for this media stream
+	and all processing happens in userspace.
+
+	If no codec format parameters are specified in this list (e.g. just `opus`
+	instead of `opus/48000/2`), default values will be chosen for them.
+
+	For codecs that support different bitrates, it can be specified by appending
+	another slash followed by the bitrate in bits per second,
+	e.g. `opus/48000/2/32000`. In this case, all format parameters (clock rate,
+	channels) must also be specified.
+
+	Additional options that can be appended to the codec string with additional slashes
+	are ptime, the `fmtp` string, and additional codec-specific options. For example
+	`iLBC/8000/1///mode=30` to use `mode=30` as `fmtp` string.
+
+	For Opus, the string of codec-specific options is passed
+	directly to ffmpeg, so all ffmpeg codec options can be set. Use
+	space, colon, semicolon, or comma to separate individual
+	options. For example to set the encoding complexity (also known
+	as compression level by ffmpeg):
+	`opus/48000/2////compression_level=2`
+
+	If a literal `=` cannot be used due to parsing constraints (i.e. being wrongly
+	interpreted as a key-value pair), it can be escaped by using two dashes instead,
+	e.g. `iLBC/8000/1///mode--30`.
+
+	As a special case, if the `strip=all` or `mask=all` option has been used and
+	the `transcode` option is used on a codec that was originally present in the offer,
+	then *rtpengine* will treat this codec the same as if it had been used with the
+	`offer` option, i.e. it will simply restore it from the list of stripped codecs and
+	won't actually engage transcoding for this codec. On the other hand, if a codec has
+	been stripped explicitly by name using the `strip` or `mask` option and then used again
+	with the `transcode` option, then the codec will not simply be restored from the
+	list of stripped codecs, but instead a new transcoded instance of the codec will
+	be inserted into the offer. (This special exception does not apply to `mask=full`
+	or `strip=full`.)
+
+	This option is only processed in `offer` messages and ignored otherwise.
 
 An example of a complete `offer` request dictionary could be (SDP body abbreviated):
 
@@ -1866,10 +2118,22 @@ as an output file. Note that a filename extension will not be added.
 `stop recording` Message
 -------------------------
 
-The `stop recording` message must contain the key `call-id` as defined above. The reply dictionary contains
-no additional keys.
+The `stop recording` message must contain the key `call-id` as defined above.
+The reply dictionary contains no additional keys. See below under `pause
+recording` for another alternative usage for this message.
 
 Disables call recording for the call. This can be sent during a call to immediately stop recording it.
+
+`pause recording` Message
+-------------------------
+
+Identical to `stop recording` except that it instructs the recording daemon not
+to close the recording file, but instead leave it open so that recording can
+later be resumed via another `start recording` message.
+
+Alternatively the `stop recording` message can be used if either the string
+`pause` is given in the `flags` list, or if the dictionary contains the key
+`pause=yes`.
 
 `block DTMF` and `unblock DTMF` Messages
 ----------------------------------------
@@ -1885,9 +2149,10 @@ message. For an address, it can be an IPv4 or IPv6 address, and any participant 
 found to have a matching address advertised as their SDP media address will have their originating RTP
 packets blocked (or unblocked).
 
-Unblocking packets for the entire call (i.e. only `call-id` is given) does not automatically unblock packets for
-participants which had their packets blocked directionally, unless the string `all` is included in the `flags`
-section of the message.
+Unblocking packets for the entire call (i.e. only `call-id` is given) does not
+automatically unblock packets for participants which had their packets blocked
+directionally, unless the string `all` (equivalent to setting `all=all`) is
+included in the `flags` section of the message.
 
 When DTMF blocking is enabled, DTMF event packets will not be forwarded to the receiving peer.
 If DTMF logging is enabled, DTMF events will still be logged to syslog while blocking is enabled. Blocking
@@ -1899,6 +2164,20 @@ of DTMF events can be enabled and disabled at any time during call runtime.
 Analogous to `block DTMF` and `unblock DTMF` but blocks media packets instead of DTMF packets. DTMF packets
 can still pass through when media blocking is enabled. Media packets can be blocked for an entire call, or
 directionally for individual participants. See `block DTMF` above for details.
+
+In addition to blocking media for just one call participant, it's possible to
+block media for just a single media flow. This is relevant to scenarios that
+involve forked media that were established with one or more `subscribe
+request`. To select just one media flow for media blocking, in addition to
+selecting a source call participant as above, a destination call participant
+must be specified using the `to-tag` or `to-label`key in the message.
+
+Another possibility to block media for individual media flows is to use one of
+the special `all=` keywords instead of directly specifying a single `to-tag` or
+`to-label`. With `all=offer-answer` all media flows from the given `from-tag`
+that resulted from an offer/answer negotiation are affected. Respectively with
+`all=except-offer-answer` the opposite happens. With `all=flows` all currently
+established media flows are affected regardless or how they were created.
 
 `silence media` and `unsilence media` Messages
 ----------------------------------------------
@@ -1952,6 +2231,10 @@ Media files can be provided through one of these keys:
 
 	Contains an integer. How many times to repeat playback of the media. Default is 1.
 
+* `start-pos`
+
+	Contains an integer. The start frame position to begin the playback from.
+
 In addition to the `result` key, the response dictionary may contain the key `duration` if the length of
 the media file could be determined. The duration is given as in integer representing milliseconds.
 
@@ -1960,7 +2243,8 @@ the media file could be determined. The duration is given as in integer represen
 
 Stops the playback previously started by a `play media` message. Media playback stops automatically when
 the end of the media file is reached, so this message is only useful for prematurely stopping playback.
-The same participant selection keys as for the `play media` message can and must be used.
+The same participant selection keys as for the `play media` message can and must be used. Will return the
+last frame played in `last-frame-pos` key.
 
 `play DTMF` Message
 -------------------
@@ -1970,7 +2254,8 @@ be selected in the same way as described under the `play media` message above (i
 of using the `all` flag). The selected call participant is the one generating the DTMF event, not the
 one receiving it.
 
-The dictionary key `code` must be present in the message, indicating the DTMF event to be generated. It can
+The dictionary key `code` (or alternatively `digit`) must be present in the message,
+indicating the DTMF event to be generated. It can
 be either an integer with values 0-15, or a string containing a single character
 (`0` - `9`, `*`, `#`, `A` - `D`). Additional optional dictionary keys are: `duration` indicating the duration
 of the event in milliseconds (defaults to 250 ms, with a minimum of 100 and a maximum of 5000);
@@ -2111,7 +2396,17 @@ this is not a rewritten version of the received SDP, but rather a `recvonly`
 answer SDP generated by *rtpengine* locally. Only one codec for each media
 section will be listed, and by default this will be the first supported codec
 from the published media. This can be influenced with the `codec` options
-described above.
+described above, in particular the `accept` option.
+
+The list of codecs given in the `accept` option is treated as a list of codec
+preferences, with the first codec listed being the most preferred codec to be
+accepted, and so on. It is allowable to list codecs that are not supported for
+transcoding. If no codecs from the `accept` list are present in the offer, then
+the first codec that is supported for transcoding is selected. If no such codec
+is present, then the offer is rejected. The special string `any` can be given
+in the `accept` list to influence this behaviour: If `any` is listed, then the
+first codec from the offer is accepted even if it's not supported for
+transcoding.
 
 `subscribe request` Message
 ---------------------------
@@ -2155,7 +2450,7 @@ the `subscribe request` as well as the answer SDP in `sdp`.
 
 By default, the answer SDP must accept all codecs that were presented in the
 offer SDP (given in the reply to `subscribe request`). If not all codecs were
-accepted, then the `subscribe answer` will be rejected. This behavious can be
+accepted, then the `subscribe answer` will be rejected. This behaviour can be
 changed by including the `allow transcoding` flag in the message. If this flag
 is present, then the answer SDP will be accepted as long as at least one valid
 codec is present, and the media will be transcoded as required. This also holds
@@ -2227,3 +2522,40 @@ Prometheus Stats Exporter
 -------------------------
 
 The Prometheus metrics can be found under the URI `/metrics`.
+
+*Janus* Interface and Replacement Functionality
+===============================================
+
+*Rtpengine* supports a limited and narrow subset of the features provided by
+[Janus](https://janus.conf.meetecho.com/), specifically the basic business
+logic behind the *videoroom* plugin. This makes it possible to use *rtpengine*
+as a drop-in replacement for *Janus* for this one specific use case, and has
+the benefit of being able to use all the extra features that *rtpengine*
+provides, such as transcoding, in-kernel packet forwarding for improved
+performance, etc.
+
+The required subset of the *Janus* API is exposed via *rtpengine*'s HTTP/WS
+interface. The HTTP admin API is connected to the `/admin` URI path using a
+JSON payload (same as *Janus* does), while the module communication happens on
+the WS protocol `janus-protocol`, also with JSON payloads (same as *Janus*
+does). Unlike *Janus*, both HTTP and WS endpoints are running on the same port.
+In fact, there is no real distinction between both interfaces, therefore both
+admin and non-admin messages can be sent via either interface. HTTPS and WSS
+are also supported.
+
+Token-based plugin authentication works similar to how it works in *Janus*
+except that only the single *videoroom* plugin is supported. The configuration
+setting `janus-secret` must be set to enable clients to connect to this
+simulated *Janus* interface and make use of its features.
+
+Under the hood the functionality of the *videoroom* plugin is facilitated using
+*rtpengine*'s `publish` and `subscribe` methods, which are mapped directly to
+the respective *Janus* methods. One *Janus* video room becomes one *rtpengine*
+call, with a distinctive and unique call ID based on the video room ID.
+
+There's currently no support for customising the SDP features and options used
+within the *Janus* drop-in mode, and, as *Janus* is WebRTC-specific, all SDPs
+produced from this mode can be used directly by WebRTC clients. Non-WebRTC
+clients can participate in the same video room as *Janus* clients if the
+respective mapped `publish` and `subscribe` methods are used, and with the call
+ID mapped to the video room ID.

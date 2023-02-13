@@ -8,6 +8,7 @@
 #include "main.h"
 #include "log.h"
 #include "tag.h"
+#include "recaux.h"
 
 
 /*
@@ -57,6 +58,7 @@ static __thread MYSQL *mysql_conn;
 static __thread MYSQL_STMT
 	*stm_insert_call,
 	*stm_close_call,
+	*stm_delete_call,
 	*stm_insert_stream,
 	*stm_close_stream,
 	*stm_delete_stream,
@@ -75,6 +77,7 @@ static void my_stmt_close(MYSQL_STMT **st) {
 static void reset_conn(void) {
 	my_stmt_close(&stm_insert_call);
 	my_stmt_close(&stm_close_call);
+	my_stmt_close(&stm_delete_call);
 	my_stmt_close(&stm_insert_stream);
 	my_stmt_close(&stm_close_stream);
 	my_stmt_close(&stm_delete_stream);
@@ -130,7 +133,10 @@ static int check_conn(void) {
 				"(?,concat(?,'.',?),concat(?,'.',?),?,?,?,?,?,?)"))
 		goto err;
 	if (prep(&stm_close_call, "update recording_calls set " \
-				"end_timestamp = ?, status = 'completed' where id = ?"))
+				"end_timestamp = ?, status = 'completed' where id = ? " \
+				"and status != 'completed'"))
+		goto err;
+	if (prep(&stm_delete_call, "delete from recording_calls where id = ?"))
 		goto err;
 	if ((output_storage & OUTPUT_STORAGE_DB)) {
 		if (prep(&stm_close_stream, "update recording_streams set " \
@@ -244,23 +250,15 @@ err:
 }
 
 
-static double now_double(void) {
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return tv.tv_sec + tv.tv_usec / 1000000.0;
-}
-
 static void db_do_call_id(metafile_t *mf) {
 	if (mf->db_id > 0)
 		return;
 	if (!mf->call_id)
 		return;
 
-	double now = now_double();
-
 	MYSQL_BIND b[2];
 	my_cstr(&b[0], mf->call_id);
-	my_d(&b[1], &now);
+	my_d(&b[1], &mf->start_time);
 
 	execute_wrap(&stm_insert_call, b, &mf->db_id);
 }
@@ -306,7 +304,7 @@ void db_do_call(metafile_t *mf) {
 
 
 // mf is locked
-void db_do_stream(metafile_t *mf, output_t *op, const char *type, stream_t *stream, unsigned long ssrc) {
+void db_do_stream(metafile_t *mf, output_t *op, stream_t *stream, unsigned long ssrc) {
 	if (check_conn())
 		return;
 	if (mf->db_id == 0)
@@ -315,7 +313,6 @@ void db_do_stream(metafile_t *mf, output_t *op, const char *type, stream_t *stre
 		return;
 
 	unsigned long id = stream ? stream->id : 0;
-	double now = now_double();
 
 	MYSQL_BIND b[11];
 	my_ull(&b[0], &mf->db_id);
@@ -324,7 +321,7 @@ void db_do_stream(metafile_t *mf, output_t *op, const char *type, stream_t *stre
 	my_cstr(&b[3], op->full_filename);
 	my_cstr(&b[4], op->file_format);
 	my_cstr(&b[5], op->file_format);
-	my_cstr(&b[6], type);
+	my_cstr(&b[6], op->kind);
 	b[7] = (MYSQL_BIND) {
 		.buffer_type = MYSQL_TYPE_LONG,
 		.buffer = &id,
@@ -343,9 +340,12 @@ void db_do_stream(metafile_t *mf, output_t *op, const char *type, stream_t *stre
 	}
 	else
 		my_cstr(&b[9], "");
-	my_d(&b[10], &now);
+	my_d(&b[10], &op->start_time);
 
 	execute_wrap(&stm_insert_stream, b, &op->db_id);
+
+	if (op->db_id > 0)
+		mf->db_streams++;
 }
 
 void db_close_call(metafile_t *mf) {
@@ -357,10 +357,17 @@ void db_close_call(metafile_t *mf) {
 	double now = now_double();
 
 	MYSQL_BIND b[2];
-	my_d(&b[0], &now);
-	my_ull(&b[1], &mf->db_id);
 
-	execute_wrap(&stm_close_call, b, NULL);
+	if (mf->db_streams > 0) {
+		my_d(&b[0], &now);
+		my_ull(&b[1], &mf->db_id);
+		execute_wrap(&stm_close_call, b, NULL);
+	}
+	else {
+		my_ull(&b[0], &mf->db_id);
+		execute_wrap(&stm_delete_call, b, NULL);
+		mf->db_id = 0;
+	}
 }
 
 void db_close_stream(output_t *op) {
@@ -427,7 +434,7 @@ file:;
 			ilog(LOG_ERR, "Failed to delete file '%s': %s", op->filename, strerror(errno));
 }
 
-void db_delete_stream(output_t *op) {
+void db_delete_stream(metafile_t *mf, output_t *op) {
 	if (check_conn())
 		return;
 	if (op->db_id == 0)
@@ -437,6 +444,8 @@ void db_delete_stream(output_t *op) {
 	my_ull(&b[0], &op->db_id);
 
 	execute_wrap(&stm_delete_stream, b, NULL);
+
+	mf->db_streams--;
 }
 
 void db_config_stream(output_t *op) {

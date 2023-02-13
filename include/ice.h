@@ -120,6 +120,7 @@ struct ice_agent {
 	GQueue			candidate_pairs; /* for storage */
 	GQueue			triggered;
 	GHashTable		*candidate_hash;
+	GHashTable		*cand_prio_hash;
 	GHashTable		*pair_hash;
 	GHashTable		*transaction_hash;
 	GHashTable		*foundation_hash;
@@ -153,7 +154,7 @@ bool ice_has_related(enum ice_candidate_type);
 void ice_foundation(str *);
 
 void ice_agent_init(struct ice_agent **agp, struct call_media *media);
-void ice_update(struct ice_agent *, struct stream_params *);
+void ice_update(struct ice_agent *, struct stream_params *, bool allow_restart);
 void ice_shutdown(struct ice_agent **);
 void ice_restart(struct ice_agent *);
 
@@ -172,28 +173,41 @@ int ice_response(struct stream_fd *, const endpoint_t *src,
 
 
 /* returns 0 if ICE still has work to do, 1 otherwise */
-INLINE int ice_has_finished(struct call_media *media) {
+INLINE bool ice_has_finished(struct call_media *media) {
 	if (!media)
-		return 1;
+		return true;
 	if (!MEDIA_ISSET(media, ICE))
-		return 1;
+		return true;
 	if (!media->ice_agent)
-		return 1;
+		return true;
 	if (AGENT_ISSET(media->ice_agent, COMPLETED))
-		return 1;
-	return 0;
+		return true;
+	return false;
 }
 /* returns 1 if media has connectivity */
-INLINE int ice_is_usable(struct call_media *media) {
+INLINE bool ice_is_usable(struct call_media *media) {
 	if (!media)
-		return 1;
+		return true;
 	if (!MEDIA_ISSET(media, ICE))
-		return 1;
+		return true;
 	if (!media->ice_agent)
-		return 1;
+		return true;
 	if (AGENT_ISSET(media->ice_agent, USABLE))
-		return 1;
-	return 0;
+		return true;
+	return false;
+}
+INLINE bool ice_is_restart(struct ice_agent *ag, struct stream_params *sp) {
+	if (!ag || !sp)
+		return false;
+	struct call_media *media = ag->media;
+	if (ag->ufrag[0].s && sp->ice_ufrag.s && str_cmp_str(&ag->ufrag[0], &sp->ice_ufrag))
+		return true;
+	else if (ag->pwd[0].s && sp->ice_pwd.s && str_cmp_str(&ag->pwd[0], &sp->ice_pwd))
+		return true;
+	else if (ag->logical_intf != media->logical_intf)
+		return true;
+	return false;
+
 }
 INLINE unsigned int ice_type_preference(enum ice_candidate_type type) {
 	if (type >= __ICT_LAST)

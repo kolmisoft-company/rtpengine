@@ -469,13 +469,13 @@ static unsigned int __ip6_packet_header(unsigned char *out, const endpoint_t *sr
 unsigned int sockaddr_hash(const sockaddr_t *a) {
 	return a->family->hash(a) ^ g_direct_hash(a->family);
 }
-int sockaddr_eq(const sockaddr_t *a, const sockaddr_t *b) {
+bool sockaddr_eq(const sockaddr_t *a, const sockaddr_t *b) {
 	return a->family == b->family && a->family->eq(a, b);
 }
-unsigned int g_sockaddr_hash(const void *a) {
+guint sockaddr_t_hash(gconstpointer a) {
 	return sockaddr_hash(a);
 }
-int g_sockaddr_eq(const void *a, const void *b) {
+gint sockaddr_t_eq(gconstpointer a, gconstpointer b) {
 	return sockaddr_eq(a, b);
 }
 
@@ -483,13 +483,13 @@ int g_sockaddr_eq(const void *a, const void *b) {
 unsigned int endpoint_hash(const endpoint_t *a) {
 	return sockaddr_hash(&a->address) ^ a->port;
 }
-int endpoint_eq(const endpoint_t *a, const endpoint_t *b) {
+bool endpoint_eq(const endpoint_t *a, const endpoint_t *b) {
 	return sockaddr_eq(&a->address, &b->address) && a->port == b->port;
 }
-unsigned int g_endpoint_hash(const void *a) {
+guint endpoint_t_hash(gconstpointer a) {
 	return endpoint_hash(a);
 }
-int g_endpoint_eq(const void *a, const void *b) {
+gint endpoint_t_eq(gconstpointer a, const void *b) {
 	return endpoint_eq(a, b);
 }
 
@@ -576,20 +576,7 @@ int endpoint_parse_any(endpoint_t *d, const char *s) {
 	return -1;
 }
 
-int sockaddr_getaddrinfo(sockaddr_t *a, const char *s) {
-	struct addrinfo hints, *res;
-	int status;
-	int ret;
-
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_UNSPEC;
-
-	if ((status = getaddrinfo(s, NULL, &hints, &res)) != 0) {
-		__C_DBG("getaddrinfo failed for %s, status is \"%s\"\n", s, gai_strerror(status));
-		return -1;
-	}
-
-	ret = 0;
+static int socket_addrinfo_convert(sockaddr_t *a, struct addrinfo *res) {
 	if (res->ai_family == AF_INET) { // IPv4
 		struct sockaddr_in *ipv4 = (struct sockaddr_in *) res->ai_addr;
 		a->u.ipv4 = ipv4->sin_addr;
@@ -601,13 +588,40 @@ int sockaddr_getaddrinfo(sockaddr_t *a, const char *s) {
 		a->family = &__socket_families[SF_IP6];
 	}
 	else
-		ret = -1;
+		return -1;
+	return 0;
+}
+int sockaddr_getaddrinfo_alt(sockaddr_t *a, sockaddr_t *a2, const char *s) {
+	struct addrinfo hints, *res;
+	int status;
+	int ret;
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_socktype = SOCK_DGRAM;
+
+	if ((status = getaddrinfo(s, NULL, &hints, &res)) != 0) {
+		__C_DBG("getaddrinfo failed for %s, status is \"%s\"\n", s, gai_strerror(status));
+		return -1;
+	}
+
+	ret = socket_addrinfo_convert(a, res);
+
+	if (a2) {
+		if (ret == 0 && res->ai_next) {
+			struct addrinfo *next = res->ai_next;
+			ret = socket_addrinfo_convert(a2, next);
+		}
+		else
+			ZERO(*a2);
+	}
 
 	freeaddrinfo(res);
 	return ret;
 }
 
-int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s) {
+int endpoint_parse_any_getaddrinfo_alt(endpoint_t *d, endpoint_t *d2, const char *s) {
 	unsigned int len;
 	const char *ep;
 	char buf[64];
@@ -620,6 +634,11 @@ int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s) {
 		d->port = atoi(s);
 		ZERO(d->address);
 		d->address.family = __get_socket_family_enum(SF_IP4);
+		if (d2) {
+			ZERO(*d2);
+			*d2 = *d;
+			ipv46_any_convert(d2);
+		}
 		return 0;
 	}
 	len = ep - s;
@@ -636,8 +655,15 @@ int endpoint_parse_any_getaddrinfo(endpoint_t *d, const char *s) {
 		sprintf(buf, "%.*s", len, s);
 	}
 
-	if (sockaddr_getaddrinfo(&d->address, buf))
+	if (sockaddr_getaddrinfo_alt(&d->address, d2 ? &d2->address : NULL, buf))
 		return -1;
+
+	if (d2) {
+		if (d2->address.family)
+			d2->port = d->port;
+		else
+			ZERO(*d2);
+	}
 
 	return 0;
 }
@@ -691,6 +717,14 @@ int open_socket(socket_t *r, int type, unsigned int port, const sockaddr_t *sa) 
 fail:
 	close_socket(r);
 	return -1;
+}
+
+void dummy_socket(socket_t *r, const sockaddr_t *sa) {
+	ZERO(*r);
+	r->fd = -1;
+	r->family = sa->family;
+	r->local.address = *sa;
+	r->remote.address.family = sa->family;
 }
 
 int connect_socket(socket_t *r, int type, const endpoint_t *ep) {
@@ -764,6 +798,17 @@ int close_socket(socket_t *r) {
 	ZERO(r->remote);
 
 	return 0;
+}
+
+// moves the contents of the socket object:
+// dst must be initialised
+// src will be reset and cleared, as if it was closed
+// does not actually close the socket
+void move_socket(socket_t *dst, socket_t *src) {
+	*dst = *src;
+	src->fd = -1;
+	ZERO(src->local);
+	ZERO(src->remote);
 }
 
 

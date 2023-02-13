@@ -26,25 +26,33 @@ static void meta_free(void *ptr) {
 	metafile_t *mf = ptr;
 
 	dbg("freeing metafile info for %s%s%s", FMT_M(mf->name));
-	output_close(mf->mix_out);
+	output_close(mf, mf->mix_out, NULL);
 	mix_destroy(mf->mix);
+	db_close_call(mf);
 	g_string_chunk_free(mf->gsc);
+	// SSRCs first as they have linked outputs which need to be closed first
+	if (mf->ssrc_hash)
+		g_hash_table_destroy(mf->ssrc_hash);
 	for (int i = 0; i < mf->streams->len; i++) {
 		stream_t *stream = g_ptr_array_index(mf->streams, i);
 		stream_close(stream); // should be closed already
 		stream_free(stream);
 	}
-	g_ptr_array_free(mf->streams, TRUE);
 	for (int i = 0; i < mf->tags->len; i++) {
 		tag_t *tag = g_ptr_array_index(mf->tags, i);
 		tag_free(tag);
 	}
+
 	g_ptr_array_free(mf->tags, TRUE);
-	if (mf->ssrc_hash)
-		g_hash_table_destroy(mf->ssrc_hash);
+	g_ptr_array_free(mf->streams, TRUE);
 	g_slice_free1(sizeof(*mf), mf);
 }
 
+
+static void meta_close_ssrcs(gpointer key, gpointer value, gpointer user_data) {
+	ssrc_t *s = value;
+	ssrc_close(s);
+}
 
 // mf is locked
 static void meta_destroy(metafile_t *mf) {
@@ -63,6 +71,8 @@ static void meta_destroy(metafile_t *mf) {
 		close(mf->forward_fd);
 		mf->forward_fd = -1;
 	}
+	// shut down SSRCs, which closes TLS connections
+	g_hash_table_foreach(mf->ssrc_hash, meta_close_ssrcs, NULL);
 	db_close_call(mf);
 }
 
@@ -70,14 +80,14 @@ static void meta_destroy(metafile_t *mf) {
 // mf is locked
 static void meta_stream_interface(metafile_t *mf, unsigned long snum, char *content) {
 	db_do_call(mf);
-	if (output_enabled && output_mixed) {
+	if (output_enabled && output_mixed && mf->recording_on) {
 		pthread_mutex_lock(&mf->mix_lock);
 		if (!mf->mix) {
-			mf->mix_out = output_new(output_dir, mf->parent, "mix", "mix");
+			mf->mix_out = output_new(output_dir, mf->parent, "mix", "mixed", "mix");
 			if (mix_method == MM_CHANNELS)
-				mf->mix_out->channel_mult = MIX_NUM_INPUTS;
+				mf->mix_out->channel_mult = mix_num_inputs;
 			mf->mix = mix_new();
-			db_do_stream(mf, mf->mix_out, "mixed", NULL, 0);
+			db_do_stream(mf, mf->mix_out, NULL, 0);
 		}
 		pthread_mutex_unlock(&mf->mix_lock);
 	}
@@ -170,7 +180,14 @@ static void meta_section(metafile_t *mf, char *section, char *content, unsigned 
 	else if (!strcmp(section, "PARENT"))
 		mf->parent = g_string_chunk_insert(mf->gsc, content);
 	else if (!strcmp(section, "METADATA"))
-		meta_metadata(mf, content);
+		if (mf->forward_fd >= 0) {
+			ilog(LOG_INFO, "Connection already established, sending mid-call metadata %.*s", (int)len, content);
+			if (send(mf->forward_fd, content, len, 0) == -1) {
+				ilog(LOG_ERR, "Error sending mid-call metadata: %s.", strerror(errno));
+			}
+		} else {
+			meta_metadata(mf, content);
+		}
 	else if (sscanf_match(section, "STREAM %lu interface", &lu) == 1)
 		meta_stream_interface(mf, lu, content);
 	else if (sscanf_match(section, "STREAM %lu details", &lu) == 1)
@@ -183,6 +200,8 @@ static void meta_section(metafile_t *mf, char *section, char *content, unsigned 
 		meta_ptime(mf, lu, i);
 	else if (sscanf_match(section, "TAG %lu", &lu) == 1)
 		tag_name(mf, lu, content);
+	else if (sscanf_match(section, "METADATA-TAG %lu", &lu) == 1)
+		tag_metadata(mf, lu, content);
 	else if (sscanf_match(section, "LABEL %lu", &lu) == 1)
 		tag_label(mf, lu, content);
 	else if (sscanf_match(section, "RECORDING %u", &u) == 1)
@@ -204,7 +223,8 @@ static metafile_t *metafile_get(char *name) {
 	if (mf)
 		goto out;
 
-	dbg("allocating metafile info for %s%s%s", FMT_M(name));
+	ilog(LOG_INFO, "New call for recording: '%s%s%s'", FMT_M(name));
+
 	mf = g_slice_alloc0(sizeof(*mf));
 	mf->gsc = g_string_chunk_new(0);
 	mf->name = g_string_chunk_insert(mf->gsc, name);
@@ -215,6 +235,7 @@ static metafile_t *metafile_get(char *name) {
 	mf->forward_count = 0;
 	mf->forward_failed = 0;
 	mf->recording_on = 1;
+	mf->start_time = now_double();
 
 	if (decoding_enabled) {
 		pthread_mutex_init(&mf->payloads_lock, NULL);
@@ -350,6 +371,8 @@ void metafile_delete(char *name) {
 	pthread_mutex_lock(&mf->lock);
 	g_hash_table_remove(metafiles, name);
 	pthread_mutex_unlock(&metafiles_lock);
+
+	ilog(LOG_INFO, "Recording for call '%s%s%s' finished", FMT_M(name));
 
 	meta_destroy(mf);
 

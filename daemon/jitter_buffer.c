@@ -66,7 +66,7 @@ static void reset_jitter_buffer(struct jitter_buffer *jb) {
 
 static struct rtp_payload_type *get_rtp_payload_type(struct media_packet *mp, int payload_type) {
 	struct rtp_payload_type *rtp_pt = NULL;
-	struct codec_handler *transcoder = codec_handler_get(mp->media, payload_type, mp->media_out);
+	struct codec_handler *transcoder = codec_handler_get(mp->media, payload_type, mp->media_out, NULL);
 	if(transcoder) {
 		if(transcoder->source_pt.payload_type == payload_type)
 			rtp_pt = &transcoder->source_pt;
@@ -155,8 +155,8 @@ static int queue_packet(struct media_packet *mp, struct jb_packet *p) {
 	long long ts_diff_us =
 		(long long) (ts_diff + (jb->rtptime_delta * jb->buffer_len))* 1000000 / clockrate;
 
-	ts_diff_us += (jb->clock_drift_val * seq_diff); 
-	ts_diff_us += (jb->dtmf_mult_factor * DELAY_FACTOR);
+	ts_diff_us += ((long long) jb->clock_drift_val * seq_diff);
+	ts_diff_us += ((long long) jb->dtmf_mult_factor * DELAY_FACTOR);
 
 	timeval_add_usec(&p->ttq_entry.when, ts_diff_us);
 

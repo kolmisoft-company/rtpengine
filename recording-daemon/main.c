@@ -19,6 +19,7 @@
 #include "epoll.h"
 #include "inotify.h"
 #include "metafile.h"
+#include "mix.h"
 #include "garbage.h"
 #include "auxlib.h"
 #include "decoder.h"
@@ -27,6 +28,7 @@
 #include "codeclib.h"
 #include "socket.h"
 #include "ssllib.h"
+#include "notify.h"
 
 
 
@@ -38,6 +40,7 @@ char *output_dir = NULL;
 static char *output_format = NULL;
 int output_mixed;
 enum mix_method mix_method;
+int mix_num_inputs = MIX_MAX_INPUTS;
 int output_single;
 int output_enabled = 1;
 mode_t output_chmod;
@@ -55,6 +58,11 @@ char *forward_to = NULL;
 static char *tls_send_to = NULL;
 endpoint_t tls_send_to_ep;
 int tls_resample = 8000;
+char *notify_uri;
+int notify_post;
+int notify_nverify;
+int notify_threads = 5;
+int notify_retries = 10;
 
 static GQueue threads = G_QUEUE_INIT; // only accessed from main thread
 
@@ -151,6 +159,7 @@ static void wait_for_signal(void) {
 
 
 static void cleanup(void) {
+	notify_cleanup();
 	garbage_collect_all();
 	metafile_cleanup();
 	inotify_cleanup();
@@ -190,6 +199,7 @@ static void options(int *argc, char ***argv) {
 		{ "mp3-bitrate",	0,   0, G_OPTION_ARG_INT,	&mp3_bitrate,	"Bits per second for MP3 encoding",	"INT"		},
 		{ "output-mixed",	0,   0, G_OPTION_ARG_NONE,	&output_mixed,	"Mix participating sources into a single output",NULL	},
 		{ "mix-method",		0,   0, G_OPTION_ARG_STRING,	&mix_method_str,"How to mix multiple sources",		"direct|channels"},
+		{ "mix-num-inputs",	0,   0, G_OPTION_ARG_INT,	&mix_num_inputs, "Number of channels for recordings",	"INT"		},
 		{ "output-single",	0,   0, G_OPTION_ARG_NONE,	&output_single,	"Create one output file for each source",NULL		},
 		{ "output-chmod",	0,   0, G_OPTION_ARG_STRING,	&chmod_mode,	"File mode for recordings",		"OCTAL"		},
 		{ "output-chmod-dir",	0,   0, G_OPTION_ARG_STRING,	&chmod_dir_mode,"Directory mode for recordings",	"OCTAL"		},
@@ -203,6 +213,11 @@ static void options(int *argc, char ***argv) {
 		{ "forward-to", 	0,   0, G_OPTION_ARG_STRING,	&forward_to,	"Where to forward to (unix socket)",	"PATH"		},
 		{ "tls-send-to", 	0,   0, G_OPTION_ARG_STRING,	&tls_send_to,	"Where to send to (TLS destination)",	"IP:PORT"	},
 		{ "tls-resample", 	0,   0, G_OPTION_ARG_INT,	&tls_resample,	"Sampling rate for TLS PCM output",	"INT"		},
+		{ "notify-uri", 	0,   0, G_OPTION_ARG_STRING,	&notify_uri,	"Notify destination for finished outputs","URI"		},
+		{ "notify-post", 	0,   0, G_OPTION_ARG_NONE,	&notify_post,	"Use POST instead of GET",		NULL		},
+		{ "notify-no-verify", 	0,   0, G_OPTION_ARG_NONE,	&notify_nverify,"Don't verify HTTPS peer certificate",	NULL		},
+		{ "notify-concurrency",	0,   0, G_OPTION_ARG_INT,	&notify_threads,"How many simultaneous requests",	"INT"		},
+		{ "notify-retries",	0,   0, G_OPTION_ARG_INT,	&notify_retries,"How many times to retry failed requesets","INT"	},
 		{ NULL, }
 	};
 
@@ -255,6 +270,9 @@ static void options(int *argc, char ***argv) {
 		mix_method = MM_CHANNELS;
 	else
 		die("Invalid 'mix-method' option");
+
+	if (mix_num_inputs <= 0 || mix_num_inputs > MIX_MAX_INPUTS)
+		die("Invalid mix_num_inputs value, it must be between 1 and %d", MIX_MAX_INPUTS);
 
 	if ((output_storage & OUTPUT_STORAGE_FILE) && !strcmp(output_dir, spool_dir))
 		die("The spool-dir cannot be the same as the output-dir");
@@ -321,6 +339,7 @@ int main(int argc, char **argv) {
 	setup();
 	daemonize();
 	wpidfile();
+	notify_setup();
 
 	service_notify("READY=1\n");
 

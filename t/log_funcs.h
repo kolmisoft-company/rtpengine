@@ -8,7 +8,11 @@ struct call;
 struct stream_fd;
 struct ice_agent;
 
-INLINE void log_info_clear(void) {
+INLINE void log_info_reset(void) {
+}
+INLINE void log_info_pop(void) {
+}
+INLINE void log_info_pop_until(void *p) {
 }
 INLINE void log_info_call(struct call *c) {
 }

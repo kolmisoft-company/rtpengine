@@ -32,6 +32,18 @@ else
 	fi
 fi
 
+if [ "$1" = configure ]; then
+	adduser --system --home /nonexistent --gecos rtpengine \
+		--no-create-home --disabled-password \
+		--group --quiet rtpengine || true
+
+	rtpdir='/var/spool/rtpengine'
+	if ! dpkg-statoverride --list "$rtpdir" > /dev/null 2>&1; then
+		chown rtpengine:rtpengine "$rtpdir"
+		chmod 0770 "$rtpdir"
+	fi
+fi
+
 #DEBHELPER#
 
 exit 0

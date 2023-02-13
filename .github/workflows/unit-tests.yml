@@ -8,12 +8,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     name: Run unit tests
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Update APT cache
         run: |
@@ -21,7 +21,14 @@ jobs:
 
       - name: Get build dependencies
         run: |
-          sudo apt-get build-dep -qq -y -Ppkg.ngcp-rtpengine.nobcg729 .
+          echo "Generating Debian source for usage on Ubuntu/jammy / ubuntu-22.04"
+          cd pkg/deb/
+          ./generator.sh
+          ./backports/jammy
+          rm -rf debian
+          mv jammy debian
+          echo "Installing Debian packages"
+          sudo apt-get build-dep -q -y -Ppkg.ngcp-rtpengine.nobcg729 .
 
       - name: Run unit tests with sanitizers enabled
         run: |

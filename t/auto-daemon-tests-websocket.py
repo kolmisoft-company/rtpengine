@@ -11,17 +11,27 @@ import traceback
 import unittest
 import uuid
 
-import websockets
+from websockets import connect
+
+
+eventloop = None
 
 
 async def get_ws(cls, proto):
+    from platform import python_version
+    from websockets import __version__
+
+    if sys.version_info >= (3, 10) and float(__version__) <= 9.1:
+        python_v = python_version()
+        msg = "python3-websocket {} unsupported in {}".format(__version__, python_v)
+        raise unittest.SkipTest(msg)
     for _ in range(1, 300):
         try:
-            cls._ws = await websockets.connect(
+            cls._ws = await connect(
                 "ws://127.0.0.1:9191/", subprotocols=[proto]
             )
             break
-        except:
+        except FileNotFoundError:
             await asyncio.sleep(0.1)
 
 
@@ -66,27 +76,33 @@ async def testOJanus(self, msg):
 class TestWSEcho(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._eventloop = asyncio.get_event_loop()
-        cls._eventloop.run_until_complete(get_ws(cls, "echo.rtpengine.com"))
+        eventloop.run_until_complete(get_ws(cls, "echo.rtpengine.com"))
+
+    @classmethod
+    def tearDownClass(cls):
+        eventloop.run_until_complete(cls._ws.close())
 
     def testEcho(self):
-        self._eventloop.run_until_complete(testIO(self, b"foobar"))
+        eventloop.run_until_complete(testIO(self, b"foobar"))
         self.assertEqual(self._res, b"foobar")
 
     def testEchoText(self):
-        self._eventloop.run_until_complete(testIO(self, "foobar"))
+        eventloop.run_until_complete(testIO(self, "foobar"))
         self.assertEqual(self._res, b"foobar")
 
 
 class TestWSCli(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._eventloop = asyncio.get_event_loop()
-        cls._eventloop.run_until_complete(get_ws(cls, "cli.rtpengine.com"))
+        eventloop.run_until_complete(get_ws(cls, "cli.rtpengine.com"))
+
+    @classmethod
+    def tearDownClass(cls):
+        eventloop.run_until_complete(cls._ws.close())
 
     def testListNumsessions(self):
         # race condition here if this runs at the same as the janus test (creates call)
-        self._eventloop.run_until_complete(testIO(self, "list numsessions"))
+        eventloop.run_until_complete(testIO(self, "list numsessions"))
         self.assertEqual(
             self._res,
             b"Current sessions own: 0\n"
@@ -102,17 +118,20 @@ class TestWSCli(unittest.TestCase):
 class TestWSJanus(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._eventloop = asyncio.get_event_loop()
-        cls._eventloop.run_until_complete(get_ws(cls, "janus-protocol"))
+        eventloop.run_until_complete(get_ws(cls, "janus-protocol"))
+
+    @classmethod
+    def tearDownClass(cls):
+        eventloop.run_until_complete(cls._ws.close())
 
     def testPing(self):
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJson(self, {"janus": "ping", "transaction": "test123"})
         )
         self.assertEqual(self._res, {"janus": "pong", "transaction": "test123"})
 
     def testPingNoTS(self):
-        self._eventloop.run_until_complete(testIOJson(self, {"janus": "ping"}))
+        eventloop.run_until_complete(testIOJson(self, {"janus": "ping"}))
         self.assertEqual(
             self._res,
             {
@@ -125,7 +144,7 @@ class TestWSJanus(unittest.TestCase):
         )
 
     def testInfo(self):
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJson(self, {"janus": "info", "transaction": "foobar"})
         )
         # ignore version string
@@ -147,15 +166,18 @@ class TestWSJanus(unittest.TestCase):
 class TestVideoroom(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._eventloop = asyncio.get_event_loop()
-        cls._eventloop.run_until_complete(get_ws(cls, "janus-protocol"))
+        eventloop.run_until_complete(get_ws(cls, "janus-protocol"))
+
+    @classmethod
+    def tearDownClass(cls):
+        eventloop.run_until_complete(cls._ws.close())
 
     def startSession(self):
         self.maxDiff = None
 
         token = str(uuid.uuid4())
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -171,7 +193,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # create session
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -193,7 +215,7 @@ class TestVideoroom(unittest.TestCase):
         handle = self.createHandle(token, session)
 
         # create room
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -229,7 +251,7 @@ class TestVideoroom(unittest.TestCase):
         return (token, session, handle, room)
 
     def destroyVideoroom(self, token, session, handle, room):
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -261,7 +283,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
     def createHandle(self, token, session):
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -284,7 +306,7 @@ class TestVideoroom(unittest.TestCase):
         return handle
 
     def createPublisher(self, token, session, room, handle, pubs=[]):
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -299,7 +321,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the joined event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         feed = self._res["plugindata"]["data"]["id"]
         self.assertIsInstance(feed, int)
         self.assertNotEqual(feed, session)
@@ -328,7 +350,7 @@ class TestVideoroom(unittest.TestCase):
     def testKeepalive(self):
         (token, session) = self.startSession()
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self, {"janus": "keepalive", "token": token, "session_id": session}
             )
@@ -339,9 +361,9 @@ class TestVideoroom(unittest.TestCase):
         (token, session, control_handle, room) = self.startVideoroom()
 
         # timeout test
-        self._eventloop.run_until_complete(asyncio.sleep(3))
+        eventloop.run_until_complete(asyncio.sleep(3))
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -380,7 +402,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertNotEqual(feed, control_handle)
 
         # publish as plain RTP
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -414,7 +436,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -445,6 +467,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": None,
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -456,7 +487,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertNotEqual(sub_handle, control_handle)
 
         # subscriber expects full WebRTC attributes
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -476,7 +507,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(feed, self._res["plugindata"]["data"]["id"])
         self.assertNotEqual(feed, control_handle)
         self.assertNotEqual(feed, session)
@@ -500,6 +531,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:actpass\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -527,7 +559,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # subscriber #1 answer
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -559,7 +591,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(
             self._res,
             {
@@ -579,7 +611,299 @@ class TestVideoroom(unittest.TestCase):
 
         self.destroyVideoroom(token, session, control_handle, room)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
+            testIOJanus(
+                self,
+                {
+                    "janus": "message",
+                    "body": {
+                        "request": "exists",
+                        "room": room,
+                    },
+                    "handle_id": control_handle,
+                    "session_id": session,
+                    "token": token,
+                },
+            )
+        )
+        self.assertEqual(
+            self._res,
+            {
+                "janus": "success",
+                "session_id": session,
+                "sender": control_handle,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {
+                        "videoroom": "success",
+                        "room": room,
+                        "exists": False,
+                    },
+                },
+            },
+        )
+
+    def testVideoroomWebRTCAlt(self):
+        # alternative usage: publisher == controller, no extra feed_id, no room specified
+
+        (token, session, control_handle, room) = self.startVideoroom()
+
+        # timeout test
+        eventloop.run_until_complete(asyncio.sleep(3))
+
+        eventloop.run_until_complete(
+            testIOJanus(
+                self,
+                {
+                    "janus": "message",
+                    "body": {
+                        "request": "exists",
+                        "room": room,
+                    },
+                    "handle_id": control_handle,
+                    "session_id": session,
+                    "token": token,
+                },
+            )
+        )
+        self.assertEqual(
+            self._res,
+            {
+                "janus": "success",
+                "session_id": session,
+                "sender": control_handle,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {
+                        "videoroom": "success",
+                        "room": room,
+                        "exists": True,
+                    },
+                },
+            },
+        )
+
+        pub_handle = control_handle
+
+        feed = self.createPublisher(token, session, room, pub_handle)
+        self.assertNotEqual(feed, control_handle)
+
+        # publish as plain RTP
+        eventloop.run_until_complete(
+            testIOJanus(
+                self,
+                {
+                    "janus": "message",
+                    "body": {
+                        "request": "configure",
+                        "audio": True,
+                        "video": True,
+                    },
+                    "jsep": {
+                        "type": "offer",
+                        "sdp": (
+                            "v=0\r\n"
+                            "o=x 123 123 IN IP4 203.0.113.3\r\n"
+                            "c=IN IP4 203.0.113.2\r\n"
+                            "s=foobar\r\n"
+                            "t=0 0\r\n"
+                            "m=audio 8000 RTP/AVP 8 0\r\n"
+                            "a=sendonly\r\n"
+                        ),
+                    },
+                    "handle_id": pub_handle,
+                    "session_id": session,
+                    "token": token,
+                },
+            )
+        )
+        # ack is received first
+        self.assertEqual(self._res, {"janus": "ack", "session_id": session})
+        # followed by the event notification
+        eventloop.run_until_complete(testIJanus(self))
+        sdp = self._res["jsep"]["sdp"]
+        self.assertIsInstance(sdp, str)
+        self.assertRegex(
+            sdp,
+            re.compile(
+                "^v=0\r\n"
+                "o=- \d+ \d+ IN IP4 203.0.113.1\r\n"
+                "s=rtpengine.*?\r\n"
+                "t=0 0\r\n"
+                "m=audio \d+ RTP/AVP 8\r\n"
+                "c=IN IP4 203.0.113.1\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=recvonly\r\n"
+                "a=rtcp:\d+\r\n$",
+                re.DOTALL,
+            ),
+        )
+        self.assertEqual(
+            self._res,
+            {
+                "janus": "event",
+                "session_id": session,
+                "sender": pub_handle,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {
+                        "videoroom": "event",
+                        "room": room,
+                        "configured": "ok",
+                        "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": None,
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
+                    },
+                },
+                "jsep": {"type": "answer", "sdp": sdp},
+            },
+        )
+
+        sub_handle = self.createHandle(token, session)
+        self.assertNotEqual(sub_handle, pub_handle)
+        self.assertNotEqual(sub_handle, control_handle)
+
+        # subscriber expects full WebRTC attributes
+        eventloop.run_until_complete(
+            testIOJanus(
+                self,
+                {
+                    "janus": "message",
+                    "body": {
+                        "request": "join",
+                        "ptype": "subscriber",
+                        "room": room,
+                        "streams": [
+                            { "feed": feed },
+                        ],
+                    },
+                    "handle_id": sub_handle,
+                    "session_id": session,
+                    "token": token,
+                },
+            )
+        )
+        # ack is received first
+        self.assertEqual(self._res, {"janus": "ack", "session_id": session})
+        # followed by the attached event
+        eventloop.run_until_complete(testIJanus(self))
+        self.assertEqual(len(self._res["plugindata"]["data"]["streams"]), 1)
+        self.assertEqual(feed, self._res["plugindata"]["data"]["streams"][0]["feed_id"])
+        self.assertNotEqual(feed, control_handle)
+        self.assertNotEqual(feed, session)
+        self.assertNotEqual(feed, room)
+        self.assertNotEqual(feed, pub_handle)
+        self.assertNotEqual(feed, sub_handle)
+        sdp = self._res["jsep"]["sdp"]
+        self.assertIsInstance(sdp, str)
+        self.assertRegex(
+            sdp,
+            re.compile(
+                "^v=0\r\n"
+                "o=x 123 123 IN IP4 203.0.113.3\r\n"
+                "c=IN IP4 203.0.113.1\r\n"
+                "s=foobar\r\n"
+                "t=0 0\r\n"
+                "m=audio \d+ UDP/TLS/RTP/SAVPF 8\r\n"
+                "a=mid:1\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=sendonly\r\n"
+                "a=rtcp-mux\r\n"
+                "a=setup:actpass\r\n"
+                "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
+                "a=ice-ufrag:.{8}\r\n"
+                "a=ice-pwd:.{26}\r\n"
+                "a=ice-options:trickle\r\n"
+                "a=candidate:.{16} 1 UDP 2130706431 203.0.113.1 \d+ typ host\r\n"
+                "a=end-of-candidates\r\n$",
+                re.DOTALL,
+            ),
+        )
+        self.assertEqual(
+            self._res,
+            {
+                "janus": "event",
+                "session_id": session,
+                "sender": sub_handle,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {
+                        "videoroom": "attached",
+                        "room": room,
+                        "streams": [
+                            {
+                                "mindex": 0,
+                                "feed_id": feed,
+                            },
+                        ],
+                    },
+                },
+                "jsep": {"type": "offer", "sdp": sdp},
+            },
+        )
+
+        # subscriber #1 answer
+        eventloop.run_until_complete(
+            testIOJanus(
+                self,
+                {
+                    "janus": "message",
+                    "body": {"request": "start", "room": room, "feed": feed},
+                    "jsep": {
+                        "type": "answer",
+                        "sdp": (
+                            "v=0\r\n"
+                            "o=x 123 123 IN IP4 203.0.113.2\r\n"
+                            "c=IN IP4 0.0.0.0\r\n"
+                            "s=foobar\r\n"
+                            "t=0 0\r\n"
+                            "m=audio 9 RTP/AVP 8\r\n"
+                            "a=mid:audio\r\n"
+                            "a=ice-ufrag:abcd\r\n"
+                            "a=ice-pwd:WD1pLsdgsdfsdWuEBb0vjyZr\r\n"
+                            "a=ice-options:trickle\r\n"
+                            "a=rtcp-mux\r\n"
+                            "a=recvonly\r\n"
+                        ),
+                    },
+                    "handle_id": sub_handle,
+                    "session_id": session,
+                    "token": token,
+                },
+            )
+        )
+        # ack is received first
+        self.assertEqual(self._res, {"janus": "ack", "session_id": session})
+        # followed by the attached event
+        eventloop.run_until_complete(testIJanus(self))
+        self.assertEqual(
+            self._res,
+            {
+                "janus": "event",
+                "session_id": session,
+                "sender": sub_handle,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {
+                        "videoroom": "event",
+                        "started": "ok",
+                        "room": room,
+                    },
+                },
+            },
+        )
+
+        self.destroyVideoroom(token, session, control_handle, room)
+
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -620,7 +944,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -661,7 +985,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -677,7 +1001,8 @@ class TestVideoroom(unittest.TestCase):
                 "a=recvonly\r\n"
                 "a=rtcp:\d+\r\n"
                 "a=setup:active\r\n"
-                "a=fingerprint:sha-256 .{95}\r\n$",
+                "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n$",
                 re.DOTALL,
             ),
         )
@@ -694,6 +1019,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": None,
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -711,7 +1045,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -750,7 +1084,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -782,6 +1116,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": None,
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -799,7 +1142,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -837,7 +1180,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -854,7 +1197,8 @@ class TestVideoroom(unittest.TestCase):
                 "a=recvonly\r\n"
                 "a=rtcp:\d+\r\n"
                 "a=setup:active\r\n"
-                "a=fingerprint:sha-256 .{95}\r\n$",
+                "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n$",
                 re.DOTALL,
             ),
         )
@@ -871,6 +1215,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": "audio",
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -888,7 +1241,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -924,7 +1277,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         match_re = re.compile(
@@ -942,7 +1295,7 @@ class TestVideoroom(unittest.TestCase):
         )
         self.assertRegex(sdp, match_re)
         matches = match_re.search(sdp)
-        port = int(matches[1])
+        port = int(matches.group(1))
         self.assertEqual(
             self._res,
             {
@@ -956,6 +1309,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": "audio",
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -973,10 +1335,17 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # wait for webrtcup event
-        self._eventloop.run_until_complete(testIJson(self))
+        eventloop.run_until_complete(testIJson(self))
         self.assertEqual(
             self._res,
             {"janus": "webrtcup", "session_id": session, "sender": pub_handle},
+        )
+
+        # wait for media event
+        eventloop.run_until_complete(testIJson(self))
+        self.assertEqual(
+            self._res,
+            {"janus": "media", "session_id": session, "sender": pub_handle, "type": "audio", "mid": "audio", "receiving": True},
         )
 
         self.destroyVideoroom(token, session, control_handle, room)
@@ -991,7 +1360,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1169,7 +1538,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -1190,6 +1559,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:active\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -1209,6 +1579,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:active\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -1231,6 +1602,20 @@ class TestVideoroom(unittest.TestCase):
                         "configured": "ok",
                         "audio_codec": "opus",
                         "video_codec": "VP8",
+                        "streams": [
+                            {
+                                "codec": "opus",
+                                "mid": "0",
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                            {
+                                "codec": "VP8",
+                                "mid": "1",
+                                "mindex": 1,
+                                "type": "video",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -1239,7 +1624,7 @@ class TestVideoroom(unittest.TestCase):
 
         # subscriber
         sub_handle = self.createHandle(token, session)
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1258,7 +1643,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -1291,6 +1676,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:actpass\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -1331,6 +1717,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:actpass\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -1368,7 +1755,7 @@ class TestVideoroom(unittest.TestCase):
         feed = self.createPublisher(token, session, room, pub_handle)
         self.assertNotEqual(feed, control_handle)
 
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1408,7 +1795,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         self.assertRegex(
@@ -1446,6 +1833,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": "audio",
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -1457,7 +1853,7 @@ class TestVideoroom(unittest.TestCase):
         pub_sock.bind(("203.0.113.2", 30000))
 
         # trickle update
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1488,7 +1884,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertNotEqual(sub_handle, control_handle)
 
         # subscriber #1 joins publisher #1
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1508,7 +1904,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(feed, self._res["plugindata"]["data"]["id"])
         self.assertNotEqual(feed, control_handle)
         self.assertNotEqual(feed, session)
@@ -1532,6 +1928,7 @@ class TestVideoroom(unittest.TestCase):
                 "a=rtcp-mux\r\n"
                 "a=setup:actpass\r\n"
                 "a=fingerprint:sha-256 .{95}\r\n"
+                "a=tls-id:[0-9a-f]{32}\r\n"
                 "a=ice-ufrag:.{8}\r\n"
                 "a=ice-pwd:.{26}\r\n"
                 "a=ice-options:trickle\r\n"
@@ -1559,7 +1956,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # subscriber #1 answer
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1591,7 +1988,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(
             self._res,
             {
@@ -1614,7 +2011,7 @@ class TestVideoroom(unittest.TestCase):
         sub_sock.bind(("203.0.113.2", 30002))
 
         # trickle update
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1642,7 +2039,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # TCP trickle test
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1677,7 +2074,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertNotEqual(feed_1, control_handle)
 
         # configure publisher feed #1 w broken SDP
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1703,7 +2100,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(
             self._res,
             {
@@ -1716,7 +2113,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # configure publisher feed #1
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1751,7 +2148,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the event notification
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         # XXX check SDP
@@ -1768,6 +2165,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "opus",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "opus",
+                                "mid": None,
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -1779,7 +2185,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertNotEqual(handle_s_1, control_handle)
 
         # subscriber #1 joins publisher #1
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1799,7 +2205,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(feed_1, self._res["plugindata"]["data"]["id"])
         self.assertNotEqual(feed_1, control_handle)
         self.assertNotEqual(feed_1, session)
@@ -1828,7 +2234,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # subscriber #1 answer
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1856,7 +2262,7 @@ class TestVideoroom(unittest.TestCase):
         # ack is received first
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
         # followed by the attached event
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(
             self._res,
             {
@@ -1882,7 +2288,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # configure publisher feed #2
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testIOJanus(
                 self,
                 {
@@ -1919,7 +2325,7 @@ class TestVideoroom(unittest.TestCase):
         self.assertEqual(self._res, {"janus": "ack", "session_id": session})
 
         # followed by the notification for publisher #1
-        self._eventloop.run_until_complete(testIJson(self))
+        eventloop.run_until_complete(testIJson(self))
         self.assertEqual(
             self._res,
             {
@@ -1938,7 +2344,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # followed by the "ok" event for publisher #2
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         sdp = self._res["jsep"]["sdp"]
         self.assertIsInstance(sdp, str)
         # XXX check SDP
@@ -1955,6 +2361,15 @@ class TestVideoroom(unittest.TestCase):
                         "room": room,
                         "configured": "ok",
                         "audio_codec": "PCMA",
+                        "video_codec": None,
+                        "streams": [
+                            {
+                                "codec": "PCMA",
+                                "mid": "audio",
+                                "mindex": 0,
+                                "type": "audio",
+                            },
+                        ],
                     },
                 },
                 "jsep": {"type": "answer", "sdp": sdp},
@@ -1962,7 +2377,7 @@ class TestVideoroom(unittest.TestCase):
         )
 
         # detach publisher #1
-        self._eventloop.run_until_complete(
+        eventloop.run_until_complete(
             testOJanus(
                 self,
                 {
@@ -1974,7 +2389,7 @@ class TestVideoroom(unittest.TestCase):
             )
         )
         # unpublished event is received first
-        self._eventloop.run_until_complete(testIJson(self))
+        eventloop.run_until_complete(testIJson(self))
         self.assertEqual(
             self._res,
             {
@@ -1992,7 +2407,7 @@ class TestVideoroom(unittest.TestCase):
             },
         )
         # followed by leaving event is received first
-        self._eventloop.run_until_complete(testIJson(self))
+        eventloop.run_until_complete(testIJson(self))
         self.assertEqual(
             self._res,
             {
@@ -2010,7 +2425,7 @@ class TestVideoroom(unittest.TestCase):
             },
         )
         # and finally the success
-        self._eventloop.run_until_complete(testIJanus(self))
+        eventloop.run_until_complete(testIJanus(self))
         self.assertEqual(
             self._res,
             {
@@ -2024,6 +2439,8 @@ class TestVideoroom(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    eventloop = asyncio.new_event_loop();
+
     so = tempfile.NamedTemporaryFile(mode="wb", delete=False)
     se = tempfile.NamedTemporaryFile(mode="wb", delete=False)
     os.environ["GLIB_SLICE"] = "debug-blocks"
@@ -2067,9 +2484,11 @@ if __name__ == "__main__":
     so.close()
     se.close()
 
+    eventloop.close()
+
     if code == 0:
         os.unlink(so.name)
         os.unlink(se.name)
     else:
-        print(f"HINT: Stdout and stderr are {so.name} and {se.name}")
+        print("HINT: Stdout and stderr are {} and {}".format(so.name, se.name))
         sys.exit(code)

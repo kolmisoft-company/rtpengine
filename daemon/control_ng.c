@@ -26,7 +26,6 @@ mutex_t rtpe_cngs_lock;
 mutex_t tcp_connections_lock;
 GHashTable *rtpe_cngs_hash;
 GHashTable *tcp_connections_hash;
-struct control_ng *rtpe_control_ng;
 static struct cookie_cache ng_cookie_cache;
 
 const char magic_load_limit_strings[__LOAD_LIMIT_MAX][64] = {
@@ -36,16 +35,18 @@ const char magic_load_limit_strings[__LOAD_LIMIT_MAX][64] = {
 	[LOAD_LIMIT_BW] = "Bandwidth limit exceeded",
 };
 const char *ng_command_strings[NGC_COUNT] = {
-	"ping", "offer", "answer", "delete", "query", "list", "start recording",
-	"stop recording", "start forwarding", "stop forwarding", "block DTMF",
+	"ping", "offer", "answer", "delete", "query", "list",
+	"start recording", "stop recording", "pause recording",
+	"start forwarding", "stop forwarding", "block DTMF",
 	"unblock DTMF", "block media", "unblock media", "play media", "stop media",
 	"play DTMF", "statistics", "silence media", "unsilence media",
 	"publish", "subscribe request",
 	"subscribe answer", "unsubscribe",
 };
 const char *ng_command_strings_short[NGC_COUNT] = {
-	"Ping", "Offer", "Answer", "Delete", "Query", "List", "StartRec",
-	"StopRec", "StartFwd", "StopFwd", "BlkDTMF",
+	"Ping", "Offer", "Answer", "Delete", "Query", "List",
+	"StartRec", "StopRec", "PauseRec",
+	"StartFwd", "StopFwd", "BlkDTMF",
 	"UnblkDTMF", "BlkMedia", "UnblkMedia", "PlayMedia", "StopMedia",
 	"PlayDTMF", "Stats", "SlnMedia", "UnslnMedia",
 	"Pub", "SubReq", "SubAns", "Unsub",
@@ -258,6 +259,10 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 			errstr = call_stop_recording_ng(dict, resp);
 			command = NGC_STOP_RECORDING;
 			break;
+		case CSH_LOOKUP("pause recording"):
+			errstr = call_pause_recording_ng(dict, resp);
+			command = NGC_PAUSE_RECORDING;
+			break;
 		case CSH_LOOKUP("start forwarding"):
 			errstr = call_start_forwarding_ng(dict, resp);
 			command = NGC_START_FORWARDING;
@@ -345,7 +350,7 @@ int control_ng_process(str *buf, const endpoint_t *sin, char *addr,
 
 	// update interval statistics
 	RTPE_STATS_INC(ng_commands[command]);
-	RTPE_GAUGE_SET(ng_command_times[command], timeval_us(&cmd_process_time));
+	RTPE_STATS_SAMPLE(ng_command_times[command], timeval_us(&cmd_process_time));
 
 	goto send_resp;
 
@@ -399,7 +404,8 @@ send_only:
 
 out:
 	ng_buffer_release(ngbuf);
-	log_info_clear();
+	release_closed_sockets();
+	log_info_pop_until(&callid);
 	return funcret;
 }
 
@@ -516,12 +522,9 @@ void control_ng_free(void *p) {
 		g_hash_table_destroy(rtpe_cngs_hash);
 		rtpe_cngs_hash = NULL;
 	}
-	poller_del_item(c->poller, c->udp_listeners[0].fd);
-	poller_del_item(c->poller, c->udp_listeners[1].fd);
-	close_socket(&c->udp_listeners[0]);
-	close_socket(&c->udp_listeners[1]);
-	streambuf_listener_shutdown(&c->tcp_listeners[0]);
-	streambuf_listener_shutdown(&c->tcp_listeners[1]);
+	poller_del_item(c->poller, c->udp_listener.fd);
+	close_socket(&c->udp_listener);
+	streambuf_listener_shutdown(&c->tcp_listener);
 	if (tcp_connections_hash)
 		g_hash_table_destroy(tcp_connections_hash);
 }
@@ -534,20 +537,13 @@ struct control_ng *control_ng_new(struct poller *p, endpoint_t *ep, unsigned cha
 
 	c = obj_alloc0("control_ng", sizeof(*c), control_ng_free);
 
-	c->udp_listeners[0].fd = -1;
-	c->udp_listeners[1].fd = -1;
+	c->udp_listener.fd = -1;
 	c->poller = p;
 
-	if (udp_listener_init(&c->udp_listeners[0], p, ep, control_ng_incoming, &c->obj))
+	if (udp_listener_init(&c->udp_listener, p, ep, control_ng_incoming, &c->obj))
 		goto fail2;
 	if (tos)
-		set_tos(&c->udp_listeners[0],tos);
-	if (ipv46_any_convert(ep)) {
-		if (udp_listener_init(&c->udp_listeners[1], p, ep, control_ng_incoming, &c->obj))
-			goto fail2;
-		if (tos)
-			set_tos(&c->udp_listeners[1],tos);
-	}
+		set_tos(&c->udp_listener, tos);
 	return c;
 
 fail2:
@@ -555,35 +551,22 @@ fail2:
 	return NULL;
 }
 
-struct control_ng *control_ng_tcp_new(struct poller *p, endpoint_t *ep, struct control_ng *ctrl_ng) {
+struct control_ng *control_ng_tcp_new(struct poller *p, endpoint_t *ep) {
 	if (!p)
 		return NULL;
 
-	if (!ctrl_ng) {
-		ctrl_ng = obj_alloc0("control_ng", sizeof(*ctrl_ng), NULL);
-		ctrl_ng->udp_listeners[0].fd = -1;
-		ctrl_ng->udp_listeners[1].fd = -1;
-	}
+	struct control_ng * ctrl_ng = obj_alloc0("control_ng", sizeof(*ctrl_ng), NULL);
+	ctrl_ng->udp_listener.fd = -1;
 
 	ctrl_ng->poller = p;
 
-	if (streambuf_listener_init(&ctrl_ng->tcp_listeners[0], p, ep,
+	if (streambuf_listener_init(&ctrl_ng->tcp_listener, p, ep,
 								control_incoming, control_stream_readable,
 								control_closed,
 								NULL,
 								&ctrl_ng->obj)) {
 		ilog(LOG_ERR, "Failed to open TCP control port: %s", strerror(errno));
 		goto fail;
-	}
-	if (ipv46_any_convert(ep)) {
-		if (streambuf_listener_init(&ctrl_ng->tcp_listeners[1], p, ep,
-									control_incoming, control_stream_readable,
-									control_closed,
-									NULL,
-									&ctrl_ng->obj)) {
-			ilog(LOG_ERR, "Failed to open TCP control port: %s", strerror(errno));
-			goto fail;
-		}
 	}
 
 	tcp_connections_hash = g_hash_table_new(g_str_hash, g_str_equal);
@@ -613,7 +596,7 @@ void notify_ng_tcp_clients(str *data) {
 
 void control_ng_init() {
 	mutex_init(&rtpe_cngs_lock);
-	rtpe_cngs_hash = g_hash_table_new(g_sockaddr_hash, g_sockaddr_eq);
+	rtpe_cngs_hash = g_hash_table_new(sockaddr_t_hash, sockaddr_t_eq);
 	cookie_cache_init(&ng_cookie_cache);
 }
 void control_ng_cleanup() {

@@ -10,17 +10,19 @@
 #include "log.h"
 #include "db.h"
 #include "main.h"
+#include "recaux.h"
+#include "notify.h"
 
 
 //static int output_codec_id;
-static const codec_def_t *output_codec;
+static codec_def_t *output_codec;
 static const char *output_file_format;
 
 int mp3_bitrate;
 
 
 
-static int output_shutdown(output_t *output);
+static bool output_shutdown(output_t *output);
 
 
 
@@ -91,11 +93,12 @@ static output_t *output_alloc(const char *path, const char *name) {
 	ret->channel_mult = 1;
 	ret->requested_format.format = -1;
 	ret->actual_format.format = -1;
+	ret->start_time = now_double();
 
 	return ret;
 }
 
-output_t *output_new(const char *path, const char *call, const char *type, const char *label) {
+output_t *output_new(const char *path, const char *call, const char *type, const char *kind, const char *label) {
 	// construct output file name
 	struct timeval now;
 	struct tm tm;
@@ -177,15 +180,17 @@ output_t *output_new(const char *path, const char *call, const char *type, const
 done:;
 	output_t *ret = output_alloc(path, f->str);
 	create_parent_dirs(ret->full_filename);
+	ret->kind = kind;
 
 	g_string_free(f, TRUE);
 
 	return ret;
 }
 
-output_t *output_new_from_full_path(const char *path, char *name) {
+output_t *output_new_from_full_path(const char *path, char *name, const char *kind) {
 	output_t *ret = output_alloc(path, name);
 	create_parent_dirs(ret->full_filename);
+	ret->kind = kind;
 
 	return ret;
 }
@@ -279,6 +284,7 @@ got_fn:
 		goto err;
 
 	db_config_stream(output);
+	ilog(LOG_INFO, "Opened output media file '%s' for writing", full_fn);
 done:
 	if (actual_format)
 		*actual_format = output->actual_format;
@@ -293,17 +299,19 @@ err:
 }
 
 
-static int output_shutdown(output_t *output) {
+static bool output_shutdown(output_t *output) {
 	if (!output)
-		return 0;
+		return false;
 	if (!output->fmtctx)
-		return 0;
+		return false;
 
-	int ret = 0;
+	ilog(LOG_INFO, "Closing output media file '%s'", output->filename);
+
+	bool ret = false;
 	if (output->fmtctx->pb) {
 		av_write_trailer(output->fmtctx);
 		avio_closep(&output->fmtctx->pb);
-		ret = 1;
+		ret = true;
 		if (output_chmod)
 			if (chmod(output->filename, output_chmod))
 				ilog(LOG_WARN, "Failed to change file mode of '%s%s%s': %s",
@@ -329,13 +337,15 @@ static int output_shutdown(output_t *output) {
 }
 
 
-void output_close(output_t *output) {
+void output_close(metafile_t *mf, output_t *output, tag_t *tag) {
 	if (!output)
 		return;
-	if (output_shutdown(output))
+	if (output_shutdown(output)) {
 		db_close_stream(output);
+		notify_push_output(output, mf, tag);
+	}
 	else
-		db_delete_stream(output);
+		db_delete_stream(mf, output);
 	encoder_free(output->encoder);
 	g_clear_pointer(&output->full_filename, g_free);
 	g_clear_pointer(&output->file_path, g_free);

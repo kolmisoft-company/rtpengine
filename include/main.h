@@ -49,19 +49,21 @@ struct rtpengine_config {
 	enum log_format		log_format;
 	endpoint_t		graphite_ep;
 	int			graphite_interval;
+	int			graphite_timeout;
 	int			redis_num_threads;
 	GQueue			interfaces;
-	endpoint_t		tcp_listen_ep;
-	endpoint_t		udp_listen_ep;
-	endpoint_t		ng_listen_ep;
-	endpoint_t		ng_tcp_listen_ep;
-	endpoint_t		cli_listen_ep;
+	endpoint_t		tcp_listen_ep[2];
+	endpoint_t		udp_listen_ep[2];
+	endpoint_t		ng_listen_ep[2];
+	endpoint_t		ng_tcp_listen_ep[2];
+	endpoint_t		cli_listen_ep[2];
 	endpoint_t		redis_ep;
 	endpoint_t		redis_write_ep;
 	endpoint_t		homer_ep;
 	int			homer_protocol;
 	int			homer_id;
 	int			no_fallback;
+	int			reject_invalid_sdp;
 	int			save_interface_ports;
 	int			port_min;
 	int			port_max;
@@ -99,13 +101,21 @@ struct rtpengine_config {
 	endpoint_t		dtmf_udp_ep;
 	int			dtmf_via_ng;
 	int			dtmf_no_suppress;
+	int			dtmf_digit_delay;
 	enum endpoint_learning	endpoint_learning;
 	int                     jb_length;
 	int                     jb_clock_drift;
+	enum {
+		DCC_EC_PRIME256v1 = 0,
+		DCC_RSA,
+	}			dtls_cert_cipher;
 	int			dtls_rsa_key_size;
 	int			dtls_mtu;
 	char			*dtls_ciphers;
-	int			dtls_signature;
+	enum {
+		DSIG_SHA256 = 0,
+		DSIG_SHA1,
+	}			dtls_signature;
 	char			**http_ifs;
 	char			**https_ifs;
 	char			*https_cert;
@@ -121,11 +131,12 @@ struct rtpengine_config {
 	double			silence_detect_double;
 	uint32_t		silence_detect_int;
 	str			cn_payload;
-	int			reorder_codecs;
+	int			player_cache;
 	char			*software_id;
 	int			poller_per_thread;
 	char			*mqtt_host;
 	int			mqtt_port;
+	char			*mqtt_tls_alpn;
 	char			*mqtt_id;
 	int			mqtt_keepalive;
 	char			*mqtt_user;
@@ -142,11 +153,13 @@ struct rtpengine_config {
 		MPS_GLOBAL = 0,
 		MPS_CALL,
 		MPS_MEDIA,
+		MPS_SUMMARY,
 	}			mqtt_publish_scope;
 	enum {
 		MOS_CQ = 0,
 		MOS_LQ,
 	}			mos;
+	int			measure_rtp;
 	int			cpu_affinity;
 	char			*janus_secret;
 };
@@ -155,11 +168,21 @@ struct rtpengine_config {
 struct poller;
 struct poller_map;
 
-extern struct poller *rtpe_poller; // main global poller instance XXX convert to struct instead of pointer?
+/**
+ * Main global poller instance.
+ * This object is responsible for maintaining and holding the entry-point references.
+ *
+ *  TODO: convert to struct instead of pointer?
+ */
+extern struct poller *rtpe_poller;
+/* Used when the poller-per-thread option is set */
 extern struct poller_map *rtpe_poller_map;
 
 extern struct rtpengine_config rtpe_config;
 extern struct rtpengine_config initial_rtpe_config;
+
+extern struct control_ng *rtpe_control_ng[2];
+extern struct control_ng *rtpe_control_ng_tcp[2];
 
 
 

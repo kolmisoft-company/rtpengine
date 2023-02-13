@@ -13,6 +13,7 @@
 #include "aux.h"
 #include "log.h"
 #include "ice.h"
+#include "ssllib.h"
 
 
 
@@ -29,6 +30,7 @@
 #define STUN_FINGERPRINT 0x8028
 #define STUN_ICE_CONTROLLED 0x8029
 #define STUN_ICE_CONTROLLING 0x802a
+#define STUN_GOOG_NETWORK_INFO 0xc057
 
 #define STUN_CLASS_REQUEST 0x00
 #define STUN_CLASS_INDICATION 0x01
@@ -112,6 +114,12 @@ struct software {
 /* XXX add const in functions */
 
 
+static uint64_t be64toh_unaligned(const char *s) {
+	uint64_t u;
+	memcpy(&u, s, sizeof(u));
+	return be64toh(u);
+}
+
 static int stun_attributes(struct stun_attrs *out, str *s, uint16_t *unknowns, struct header *req) {
 	struct tlv *tlv;
 	int len, type, uc;
@@ -169,7 +177,7 @@ static int stun_attributes(struct stun_attrs *out, str *s, uint16_t *unknowns, s
 					return -1;
 				if (attr.len != 8)
 					return -1;
-				out->tiebreaker = be64toh(*((uint64_t *) attr.s));
+				out->tiebreaker = be64toh_unaligned(attr.s);
 				out->controlled = 1;
 				break;
 
@@ -178,7 +186,7 @@ static int stun_attributes(struct stun_attrs *out, str *s, uint16_t *unknowns, s
 					return -1;
 				if (attr.len != 8)
 					return -1;
-				out->tiebreaker = be64toh(*((uint64_t *) attr.s));
+				out->tiebreaker = be64toh_unaligned(attr.s);
 				out->controlling = 1;
 				break;
 
@@ -189,6 +197,7 @@ static int stun_attributes(struct stun_attrs *out, str *s, uint16_t *unknowns, s
 				break;
 
 			case STUN_SOFTWARE:
+			case STUN_GOOG_NETWORK_INFO:
 				break; /* ignore but suppress warning message */
 
 			case STUN_XOR_MAPPED_ADDRESS:
@@ -331,6 +340,20 @@ static void fingerprint(struct msghdr *mh, struct fingerprint *fp) {
 
 static void __integrity(struct iovec *iov, int iov_cnt, str *pwd, char *digest) {
 	int i;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MAC_CTX *ctx;
+
+	ctx = EVP_MAC_CTX_dup(rtpe_hmac_sha1_base);
+	EVP_MAC_init(ctx, (unsigned char *) pwd->s, pwd->len, NULL);
+
+	for (i = 0; i < iov_cnt; i++)
+		EVP_MAC_update(ctx, iov[i].iov_base, iov[i].iov_len);
+
+	size_t outsize = 20;
+	EVP_MAC_final(ctx, (unsigned char *) digest, &outsize, outsize);
+	EVP_MAC_CTX_free(ctx);
+#else // <3.0
 	HMAC_CTX *ctx;
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
@@ -351,6 +374,7 @@ static void __integrity(struct iovec *iov, int iov_cnt, str *pwd, char *digest) 
 	HMAC_CTX_free(ctx);
 #else
 	HMAC_CTX_cleanup(ctx);
+#endif
 #endif
 }
 

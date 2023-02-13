@@ -4,6 +4,7 @@
 #include "log.h"
 #include "main.h"
 #include "ssrc.h"
+#include "aux.h"
 
 int _log_facility_rtcp;
 int _log_facility_cdr;
@@ -13,6 +14,7 @@ struct rtpengine_config initial_rtpe_config;
 struct poller *rtpe_poller;
 struct poller_map *rtpe_poller_map;
 GString *dtmf_logs;
+struct control_ng *rtpe_control_ng[2];
 
 static str *sdup(char *s) {
 	str r;
@@ -67,10 +69,18 @@ static void __cleanup(void) {
 static void __init(void) {
 	__cleanup();
 	codec_store_init(&rtp_types_sp.codecs, NULL);
+	rtp_types_sp.rtp_endpoint.port = 9;
 	flags.codec_except = g_hash_table_new_full(str_case_hash, str_case_equal, free, NULL);
 	flags.codec_set = g_hash_table_new_full(str_case_hash, str_case_equal, free, free);
 	ml_A.ssrc_hash = create_ssrc_hash_call();
 	ml_B.ssrc_hash = create_ssrc_hash_call();
+}
+static struct packet_stream *ps_new(struct call *c) {
+	struct packet_stream *ps = malloc(sizeof(*ps));
+	assert(ps != NULL);
+	memset(ps, 0, sizeof(*ps));
+	ps->endpoint.port = 12345;
+	return ps;
 }
 static void __start(const char *file, int line) {
 	printf("running test %s:%i\n", file, line);
@@ -85,6 +95,8 @@ static void __start(const char *file, int line) {
 	bencode_buffer_init(&call.buffer);
 	media_A = call_media_new(&call); // originator
 	media_B = call_media_new(&call); // output destination
+	g_queue_push_tail(&media_A->streams, ps_new(&call));
+	g_queue_push_tail(&media_B->streams, ps_new(&call));
 	ZERO(ml_A);
 	ZERO(ml_B);
 	str_init(&ml_A.tag, "tag_A");
@@ -125,11 +137,14 @@ static void codec_set(char *c) {
 //}
 //#define ht_set(ht, s) __ht_set(flags.ht, #s)
 
-#define sdp_pt_fmt(num, codec, clockrate, fmt) \
-	__sdp_pt_fmt(num, (str) STR_CONST_INIT(#codec), clockrate, (str) STR_CONST_INIT(#codec "/" #clockrate), \
-			(str) STR_CONST_INIT(#codec "/" #clockrate "/1"), (str) STR_CONST_INIT(fmt))
+#define sdp_pt_fmt_ch(num, codec, clockrate, channels, fmt) \
+	__sdp_pt_fmt(num, (str) STR_CONST_INIT(#codec), clockrate, channels, (str) STR_CONST_INIT(#codec "/" #clockrate), \
+			(str) STR_CONST_INIT(#codec "/" #clockrate "/" #channels), (str) STR_CONST_INIT(fmt))
 
-static void __sdp_pt_fmt(int num, str codec, int clockrate, str full_codec, str full_full, str fmt) {
+#define sdp_pt_fmt(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 1, fmt)
+#define sdp_pt_fmt_s(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 2, fmt)
+
+static void __sdp_pt_fmt(int num, str codec, int clockrate, int channels, str full_codec, str full_full, str fmt) {
 	struct rtp_payload_type pt = (struct rtp_payload_type) {
 		.payload_type = num,
 		.encoding_with_params = full_codec,
@@ -137,7 +152,7 @@ static void __sdp_pt_fmt(int num, str codec, int clockrate, str full_codec, str 
 		.encoding = codec,
 		.clock_rate = clockrate,
 		.encoding_parameters = STR_CONST_INIT(""),
-		.channels = 1,
+		.channels = channels,
 		.format_parameters = fmt,
 		.codec_opts = STR_NULL,
 		.rtcp_fb = G_QUEUE_INIT,
@@ -149,6 +164,7 @@ static void __sdp_pt_fmt(int num, str codec, int clockrate, str full_codec, str 
 }
 
 #define sdp_pt(num, codec, clockrate) sdp_pt_fmt(num, codec, clockrate, "")
+#define sdp_pt_s(num, codec, clockrate) sdp_pt_fmt_s(num, codec, clockrate, "")
 
 static void offer(void) {
 	printf("offer\n");
@@ -223,16 +239,21 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 		other_media = media_A;
 	else
 		abort();
-	struct codec_handler *h = codec_handler_get(media, pt_in & 0x7f, other_media);
+	struct codec_handler *h = codec_handler_get(media, pt_in & 0x7f, other_media, NULL);
 	str pl = pload;
 	str pl_exp = pload_exp;
 
 	// from media_packet_rtp()
+	struct local_intf lif = { };
+	struct stream_fd sfd = {
+		.local_intf = &lif,
+	};
 	struct media_packet mp = {
 		.call = &call,
 		.media = media,
 		.media_out = other_media,
 		.ssrc_in = get_ssrc_ctx(ssrc, media->monologue->ssrc_hash, SSRC_DIR_INPUT, NULL),
+		.sfd = &sfd,
 	};
 	// from __stream_ssrc()
 	if (!MEDIA_ISSET(media, TRANSCODE))
@@ -264,7 +285,7 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 	}
 	printf("\n");
 
-	h->func(h, &mp);
+	h->handler_func(h, &mp);
 
 	if (pt_out == -1) {
 		if (mp.packets_out.length != 0) {
@@ -344,6 +365,8 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 static void end(void) {
 	g_hash_table_destroy(rtp_ts_ht);
 	g_hash_table_destroy(rtp_seq_ht);
+	g_queue_clear_full(&media_A->streams, free);
+	g_queue_clear_full(&media_B->streams, free);
 	call_media_free(&media_A);
 	call_media_free(&media_B);
 	bencode_buffer_free(&call.buffer);
@@ -508,7 +531,7 @@ int main(void) {
 #ifdef WITH_AMR_TESTS
 	{
 		str codec_name = STR_CONST_INIT("AMR-WB");
-		const codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
+		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
 			// forward AMR-WB
@@ -578,7 +601,7 @@ int main(void) {
 
 	{
 		str codec_name = STR_CONST_INIT("AMR");
-		const codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
+		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
 			// default bitrate
@@ -946,7 +969,7 @@ int main(void) {
 	packet_seq(A, 8, PCMA_payload, 1000960, 206, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 1001120, 207, 8, PCMA_payload);
 	// enable blocking
-	call.block_dtmf = 1;
+	call.block_dtmf = BLOCK_DTMF_DROP;
 	// start with marker
 	packet_seq_exp(A, 101 | 0x80, "\x05\x0a\x00\xa0", 1001280, 208, -1, "", 0);
 	dtmf("");
@@ -1011,7 +1034,7 @@ int main(void) {
 	packet_seq(A, 8, PCMA_payload, 1000960, 206, 0, PCMU_payload);
 	packet_seq(A, 8, PCMA_payload, 1001120, 207, 0, PCMU_payload);
 	// enable blocking
-	call.block_dtmf = 1;
+	call.block_dtmf = BLOCK_DTMF_DROP;
 	// start with marker
 	packet_seq_exp(A, 101 | 0x80, "\x05\x0a\x00\xa0", 1001280, 208, -1, "", 0);
 	dtmf("");
@@ -1075,7 +1098,7 @@ int main(void) {
 	packet_seq(A, 0, PCMU_payload, 1000960, 206, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 1001120, 207, 0, PCMU_payload);
 	// enable blocking
-	call.block_dtmf = 1;
+	call.block_dtmf = BLOCK_DTMF_DROP;
 	// start with marker
 	packet_seq_exp(A, 101 | 0x80, "\x05\x0a\x00\xa0", 1001280, 208, -1, "", 0);
 	dtmf("");
@@ -1472,7 +1495,7 @@ int main(void) {
 	sdp_pt(0, PCMU, 8000);
 	sdp_pt(8, PCMA, 8000);
 	answer();
-	expect(B, "7/PCMA/8000 0/PCMU/8000 8/PCMA/8000");
+	expect(B, "0/PCMU/8000 8/PCMA/8000");
 	sdp_pt(0, PCMU, 8000);
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(9, PCMA, 8000);
@@ -1482,7 +1505,7 @@ int main(void) {
 	sdp_pt(0, PCMU, 8000);
 	sdp_pt(8, PCMA, 8000);
 	answer();
-	expect(B, "7/PCMA/8000 0/PCMU/8000 8/PCMA/8000");
+	expect(B, "0/PCMU/8000 8/PCMA/8000");
 	end();
 
 	start();
@@ -1668,6 +1691,58 @@ int main(void) {
 	packet_seq(B, 0, PCMU_payload, 1920, 12, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 2080, 13, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 2080, 13, 0, PCMU_payload);
+	end();
+
+	start();
+	sdp_pt_s(96, opus, 48000);
+	sdp_pt(8, PCMA, 8000);
+	c_accept(opus/48000/2);
+	offer();
+	expect(A, "96/opus/48000/2 8/PCMA/8000");
+	expect(B, "96/opus/48000/2 8/PCMA/8000");
+	sdp_pt(8, PCMA, 8000);
+	answer();
+	expect(A, "96/opus/48000/2");
+	expect(B, "8/PCMA/8000");
+	end();
+
+	start();
+	sdp_pt(96, opus, 48000);
+	sdp_pt(8, PCMA, 8000);
+	c_accept(opus/48000);
+	offer();
+	expect(A, "96/opus/48000 8/PCMA/8000");
+	expect(B, "96/opus/48000 8/PCMA/8000");
+	sdp_pt(8, PCMA, 8000);
+	answer();
+	expect(A, "96/opus/48000");
+	expect(B, "8/PCMA/8000");
+	end();
+
+	start();
+	sdp_pt(96, opus, 48000);
+	sdp_pt(8, PCMA, 8000);
+	c_accept(opus);
+	offer();
+	expect(A, "96/opus/48000 8/PCMA/8000");
+	expect(B, "96/opus/48000 8/PCMA/8000");
+	sdp_pt(8, PCMA, 8000);
+	answer();
+	expect(A, "96/opus/48000");
+	expect(B, "8/PCMA/8000");
+	end();
+
+	start();
+	sdp_pt_s(96, opus, 48000);
+	sdp_pt(8, PCMA, 8000);
+	c_accept(opus);
+	offer();
+	expect(A, "96/opus/48000/2 8/PCMA/8000");
+	expect(B, "96/opus/48000/2 8/PCMA/8000");
+	sdp_pt(8, PCMA, 8000);
+	answer();
+	expect(A, "96/opus/48000/2");
+	expect(B, "8/PCMA/8000");
 	end();
 
 	return 0;

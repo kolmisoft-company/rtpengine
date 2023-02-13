@@ -232,6 +232,7 @@ static void __ice_agent_initialize(struct ice_agent *ag) {
 	struct call *call = ag->call;
 
 	ag->candidate_hash = g_hash_table_new(__cand_hash, __cand_equal);
+	ag->cand_prio_hash = g_hash_table_new(g_direct_hash, g_direct_equal);
 	ag->pair_hash = g_hash_table_new(__pair_hash, __pair_equal);
 	ag->transaction_hash = g_hash_table_new(__trans_hash, __trans_equal);
 	ag->foundation_hash = g_hash_table_new(__found_hash, __found_equal);
@@ -295,22 +296,26 @@ static void __ice_reset(struct ice_agent *ag) {
 
 /* if the other side did a restart */
 static void __ice_restart(struct ice_agent *ag) {
-	ilogs(ice, LOG_DEBUG, "ICE restart, resetting ICE agent");
+	ilogs(ice, LOG_DEBUG, "ICE restart detected, resetting ICE agent");
 
 	ag->ufrag[0] = STR_NULL;
 	ag->pwd[0] = STR_NULL;
+	ag->ufrag[1] = STR_NULL;
+	ag->pwd[1] = STR_NULL;
 	__ice_reset(ag);
 }
 
 /* if we're doing a restart */
 void ice_restart(struct ice_agent *ag) {
+	ilogs(ice, LOG_DEBUG, "Restarting ICE and resetting ICE agent");
+
 	ag->ufrag[1] = STR_NULL;
 	ag->pwd[1] = STR_NULL;
 	__ice_reset(ag);
 }
 
 /* called with the call lock held in W, hence agent doesn't need to be locked */
-void ice_update(struct ice_agent *ag, struct stream_params *sp) {
+void ice_update(struct ice_agent *ag, struct stream_params *sp, bool allow_reset) {
 	GList *l, *k;
 	struct ice_candidate *cand, *dup;
 	struct call_media *media;
@@ -331,13 +336,12 @@ void ice_update(struct ice_agent *ag, struct stream_params *sp) {
 	__role_change(ag, MEDIA_ISSET(media, ICE_CONTROLLING));
 
 	if (sp) {
-		/* check for ICE restarts */
-		if (ag->ufrag[0].s && sp->ice_ufrag.s && str_cmp_str(&ag->ufrag[0], &sp->ice_ufrag))
-			__ice_restart(ag);
-		else if (ag->pwd[0].s && sp->ice_pwd.s && str_cmp_str(&ag->pwd[0], &sp->ice_pwd))
-			__ice_restart(ag);
-		else if (ag->logical_intf != media->logical_intf)
-			__ice_restart(ag);
+		if (ice_is_restart(ag, sp)) {
+			if (!allow_reset)
+				ilog(LOG_WARN, "ICE restart detected, but reset not allowed at this point");
+			else
+				__ice_restart(ag);
+		}
 
 		/* update remote info */
 		if (sp->ice_ufrag.s)
@@ -417,6 +421,7 @@ void ice_update(struct ice_agent *ag, struct stream_params *sp) {
 			dup = g_slice_alloc(sizeof(*dup));
 			__copy_cand(call, dup, cand);
 			g_hash_table_insert(ag->candidate_hash, dup, dup);
+			g_hash_table_insert(ag->cand_prio_hash, GUINT_TO_POINTER(dup->priority), dup);
 			g_queue_push_tail(&ag->remote_candidates, dup);
 		}
 
@@ -498,6 +503,7 @@ static void __ice_agent_free_components(struct ice_agent *ag) {
 
 	g_queue_clear(&ag->triggered);
 	g_hash_table_destroy(ag->candidate_hash);
+	g_hash_table_destroy(ag->cand_prio_hash);
 	g_hash_table_destroy(ag->pair_hash);
 	g_hash_table_destroy(ag->transaction_hash);
 	g_hash_table_destroy(ag->foundation_hash);
@@ -854,7 +860,27 @@ static struct ice_candidate_pair *__learned_candidate(struct ice_agent *ag, stru
 	cand->priority = priority;
 	cand->endpoint = *src;
 	cand->type = ICT_PRFLX;
-	__cand_ice_foundation(call, cand);
+
+	// check if we've already learned another candidate that belongs to this one. use the priority number
+	// together with the component to guess a matching other candidate.
+	unsigned long prio_base = priority + ps->component;
+	struct ice_candidate *known_cand = NULL;
+	for (unsigned int comp = 1; comp <= ag->active_components; comp++) {
+		if (comp == ps->component)
+			continue;
+		unsigned long prio = prio_base - comp;
+		known_cand = g_hash_table_lookup(ag->cand_prio_hash, GUINT_TO_POINTER(prio));
+		if (known_cand)
+			break;
+	}
+	if (known_cand) {
+		// got one. use the previously learned generated ICE foundation string also for this one:
+		cand->foundation = known_cand->foundation;
+	}
+	else {
+		// make new:
+		__cand_ice_foundation(call, cand);
+	}
 
 	old_cand = __foundation_lookup(ag, &cand->foundation, ps->component);
 	if (old_cand && old_cand->priority > priority) {
@@ -871,6 +897,7 @@ static struct ice_candidate_pair *__learned_candidate(struct ice_agent *ag, stru
 
 	g_queue_push_tail(&ag->remote_candidates, cand);
 	g_hash_table_insert(ag->candidate_hash, cand, cand);
+	g_hash_table_insert(ag->cand_prio_hash, GUINT_TO_POINTER(cand->priority), cand);
 	g_hash_table_insert(ag->foundation_hash, cand, cand);
 
 pair:
@@ -1032,11 +1059,14 @@ static int __check_valid(struct ice_agent *ag) {
 
 		mutex_lock(&ps->out_lock);
 		if (memcmp(&ps->endpoint, &pair->remote_candidate->endpoint, sizeof(ps->endpoint))) {
-			ilogs(ice, LOG_INFO, "ICE negotiated: peer for component %u is %s%s%s", ps->component,
+			ilogs(ice, LOG_INFO, "ICE negotiated: new peer for component %u is %s%s%s", ps->component,
 					FMT_M(endpoint_print_buf(&pair->remote_candidate->endpoint)));
 			ps->endpoint = pair->remote_candidate->endpoint;
 			PS_SET(ps, FILLED);
 		}
+		else
+			ilogs(ice, LOG_INFO, "ICE negotiated: peer for component %u is %s%s%s", ps->component,
+					FMT_M(endpoint_print_buf(&pair->remote_candidate->endpoint)));
 		mutex_unlock(&ps->out_lock);
 
 		for (m = ps->sfds.head; m; m = m->next) {
@@ -1323,7 +1353,7 @@ static void ice_agents_timer_run(void *ptr) {
 	__do_ice_checks(ag);
 
 	/* finally, release our reference and start over */
-	log_info_clear();
+	log_info_pop();
 	rwlock_unlock_r(&call->master_lock);
 }
 

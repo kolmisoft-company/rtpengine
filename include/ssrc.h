@@ -19,6 +19,7 @@ struct rtp_payload_type;
 struct ssrc_entry;
 struct ssrc_entry_call;
 enum ssrc_dir;
+struct stream_fd;
 
 
 
@@ -108,7 +109,7 @@ struct ssrc_entry_call {
 				average_mos; // contains a running tally of all stats blocks
 	uint16_t no_mos_count; // how many time we where not able to compute MOS due to missing RTT
 	unsigned int last_rtt; // last calculated raw rtt without rtt from opposide side
-	unsigned int last_rtt_xr; // last rtt for both legs retreived from RTCP-XR BT-7
+	unsigned int last_rtt_xr; // last rtt for both legs retrieved from RTCP-XR BT-7
 
 	// input only - tracking for passthrough handling
 	uint32_t last_seq_tracked;
@@ -118,7 +119,7 @@ struct ssrc_entry_call {
 
 	// for transcoding
 	// input only
-	packet_sequencer_t sequencer;
+	GHashTable *sequencers;
 	uint32_t jitter, transit;
 	// output only
 	uint16_t seq_diff;
@@ -217,7 +218,7 @@ struct ssrc_ctx *get_ssrc_ctx(uint32_t, struct ssrc_hash *, enum ssrc_dir, void 
 
 
 void ssrc_sender_report(struct call_media *, const struct ssrc_sender_report *, const struct timeval *);
-void ssrc_receiver_report(struct call_media *, const struct ssrc_receiver_report *,
+void ssrc_receiver_report(struct call_media *, struct stream_fd *, const struct ssrc_receiver_report *,
 		const struct timeval *);
 void ssrc_receiver_rr_time(struct call_media *m, const struct ssrc_xr_rr_time *rr,
 		const struct timeval *);
@@ -225,6 +226,9 @@ void ssrc_receiver_dlrr(struct call_media *m, const struct ssrc_xr_dlrr *dlrr,
 		const struct timeval *);
 void ssrc_voip_metrics(struct call_media *m, const struct ssrc_xr_voip_metrics *vm,
 		const struct timeval *);
+
+
+void ssrc_collect_metrics(struct call_media *);
 
 
 void payload_tracker_init(struct payload_tracker *t);
