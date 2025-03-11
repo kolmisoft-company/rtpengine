@@ -15,6 +15,7 @@
 #include <mysql.h>
 #include <pwd.h>
 #include <grp.h>
+#include <curl/curl.h>
 #include "log.h"
 #include "epoll.h"
 #include "inotify.h"
@@ -38,17 +39,17 @@ enum output_storage_enum output_storage = OUTPUT_STORAGE_FILE;
 char *spool_dir = NULL;
 char *output_dir = NULL;
 static char *output_format = NULL;
-int output_mixed;
+gboolean output_mixed;
 enum mix_method mix_method;
 int mix_num_inputs = MIX_MAX_INPUTS;
-int output_single;
-int output_enabled = 1;
+gboolean output_single;
+gboolean output_enabled = 1;
 mode_t output_chmod;
 mode_t output_chmod_dir;
 uid_t output_chown = -1;
 gid_t output_chgrp = -1;
 char *output_pattern = NULL;
-int decoding_enabled;
+gboolean decoding_enabled;
 char *c_mysql_host,
       *c_mysql_user,
       *c_mysql_pass,
@@ -58,11 +59,16 @@ char *forward_to = NULL;
 static char *tls_send_to = NULL;
 endpoint_t tls_send_to_ep;
 int tls_resample = 8000;
+bool tls_disable = false;
 char *notify_uri;
-int notify_post;
-int notify_nverify;
+gboolean notify_post;
+gboolean notify_nverify;
 int notify_threads = 5;
 int notify_retries = 10;
+gboolean notify_record;
+gboolean notify_purge;
+gboolean mix_output_per_media = 0;
+gboolean flush_packets = 0;
 
 static GQueue threads = G_QUEUE_INIT; // only accessed from main thread
 
@@ -180,16 +186,17 @@ static mode_t chmod_parse(const char *s) {
 
 
 static void options(int *argc, char ***argv) {
-	AUTO_CLEANUP_GBUF(os_str);
-	AUTO_CLEANUP_GBUF(chmod_mode);
-	AUTO_CLEANUP_GBUF(chmod_dir_mode);
-	AUTO_CLEANUP_GBUF(user_uid);
-	AUTO_CLEANUP_GBUF(group_gid);
-	AUTO_CLEANUP_GBUF(mix_method_str);
+	g_autoptr(char) os_str = NULL;
+	g_autoptr(char) chmod_mode = NULL;
+	g_autoptr(char) chmod_dir_mode = NULL;
+	g_autoptr(char) user_uid = NULL;
+	g_autoptr(char) group_gid = NULL;
+	g_autoptr(char) mix_method_str = NULL;
+	g_autoptr(char) tcp_send_to = NULL;
 
 	GOptionEntry e[] = {
 		{ "table",		't', 0, G_OPTION_ARG_INT,	&ktable,	"Kernel table rtpengine uses",		"INT"		},
-		{ "spool-dir",		0,   0, G_OPTION_ARG_STRING,	&spool_dir,	"Directory containing rtpengine metadata files", "PATH" },
+		{ "spool-dir",		0,   0, G_OPTION_ARG_FILENAME,	&spool_dir,	"Directory containing rtpengine metadata files", "PATH" },
 		{ "num-threads",	0,   0, G_OPTION_ARG_INT,	&num_threads,	"Number of worker threads",		"INT"		},
 		{ "output-storage",	0,   0, G_OPTION_ARG_STRING,	&os_str,	"Where to store audio streams",	        "file|db|both"	},
 		{ "output-dir",		0,   0, G_OPTION_ARG_STRING,	&output_dir,	"Where to write media files to",	"PATH"		},
@@ -210,14 +217,22 @@ static void options(int *argc, char ***argv) {
 		{ "mysql-user",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_user,	"MySQL connection credentials",		"USERNAME"	},
 		{ "mysql-pass",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_pass,	"MySQL connection credentials",		"PASSWORD"	},
 		{ "mysql-db",		0,   0,	G_OPTION_ARG_STRING,	&c_mysql_db,	"MySQL database name",			"STRING"	},
-		{ "forward-to", 	0,   0, G_OPTION_ARG_STRING,	&forward_to,	"Where to forward to (unix socket)",	"PATH"		},
+		{ "forward-to", 	0,   0, G_OPTION_ARG_FILENAME,	&forward_to,	"Where to forward to (unix socket)",	"PATH"		},
+		{ "tcp-send-to", 	0,   0, G_OPTION_ARG_STRING,	&tcp_send_to,	"Where to send to (TCP destination)",	"IP:PORT"	},
 		{ "tls-send-to", 	0,   0, G_OPTION_ARG_STRING,	&tls_send_to,	"Where to send to (TLS destination)",	"IP:PORT"	},
-		{ "tls-resample", 	0,   0, G_OPTION_ARG_INT,	&tls_resample,	"Sampling rate for TLS PCM output",	"INT"		},
+		{ "tcp-resample", 	0,   0, G_OPTION_ARG_INT,	&tls_resample,	"Sampling rate for TCP/TLS PCM output",	"INT"		},
+		{ "tls-resample", 	0,   0, G_OPTION_ARG_INT,	&tls_resample,	"Sampling rate for TCP/TLS PCM output",	"INT"		},
 		{ "notify-uri", 	0,   0, G_OPTION_ARG_STRING,	&notify_uri,	"Notify destination for finished outputs","URI"		},
 		{ "notify-post", 	0,   0, G_OPTION_ARG_NONE,	&notify_post,	"Use POST instead of GET",		NULL		},
 		{ "notify-no-verify", 	0,   0, G_OPTION_ARG_NONE,	&notify_nverify,"Don't verify HTTPS peer certificate",	NULL		},
 		{ "notify-concurrency",	0,   0, G_OPTION_ARG_INT,	&notify_threads,"How many simultaneous requests",	"INT"		},
 		{ "notify-retries",	0,   0, G_OPTION_ARG_INT,	&notify_retries,"How many times to retry failed requesets","INT"	},
+		{ "output-mixed-per-media",0,0,	G_OPTION_ARG_NONE,	&mix_output_per_media,"Mix participating sources into a single output", NULL },
+#if CURL_AT_LEAST_VERSION(7,56,0)
+		{ "notify-record", 	0,   0, G_OPTION_ARG_NONE,	&notify_record, "Also attach recorded file to request", NULL		},
+		{ "notify-purge", 	0,   0, G_OPTION_ARG_NONE,	&notify_purge,	"Remove the local file if notify success", NULL		},
+		{ "flush-packets", 	0,   0, G_OPTION_ARG_NONE,	&flush_packets,	"Output buffer will be flushed after every packet", NULL },
+#endif
 		{ NULL, }
 	};
 
@@ -234,9 +249,16 @@ static void options(int *argc, char ***argv) {
 	if (output_format == NULL)
 		output_format = g_strdup("wav");
 
+	if (tcp_send_to) {
+		if (tls_send_to)
+			die("Cannot have both 'tcp-send-to' and 'tls-send-to' active at the same time");
+		tls_send_to = tcp_send_to;
+		tls_disable = true;
+	}
+
 	if (tls_send_to) {
-		if (endpoint_parse_any_getaddrinfo_full(&tls_send_to_ep, tls_send_to))
-			die("Failed to parse 'tls-send-to' option");
+		if (!endpoint_parse_any_getaddrinfo_full(&tls_send_to_ep, tls_send_to))
+			die("Failed to parse 'tcp-send-to' or 'tls-send-to' option");
 	}
 
 	if (!strcmp(output_format, "none")) {
@@ -250,10 +272,10 @@ static void options(int *argc, char ***argv) {
 		g_free(output_format);
 		output_format = NULL;
 	} else if (!output_mixed && !output_single)
-		output_mixed = output_single = 1;
+		output_mixed = output_single = true;
 
 	if (output_enabled || tls_send_to_ep.port)
-		decoding_enabled = 1;
+		decoding_enabled = true;
 
 	if (!os_str || !strcmp(os_str, "file"))
 		output_storage = OUTPUT_STORAGE_FILE;
@@ -310,7 +332,7 @@ static void options(int *argc, char ***argv) {
 		num_threads = num_cpu_cores(8);
 
 	if (!output_pattern)
-		output_pattern = g_strdup("%c-%t");
+		output_pattern = g_strdup("%c-%r-%t");
 	if (!strstr(output_pattern, "%c"))
 		die("Invalid output pattern '%s' (no '%%c' format present)", output_pattern);
 	if (!strstr(output_pattern, "%t"))

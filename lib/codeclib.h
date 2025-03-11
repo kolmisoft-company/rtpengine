@@ -14,7 +14,11 @@ enum media_type {
 	MT_VIDEO,
 	MT_IMAGE,
 	MT_MESSAGE,
+	MT_TEXT,
+	MT_APPLICATION,
 	MT_OTHER,
+
+	__MT_MAX
 };
 
 
@@ -32,6 +36,10 @@ INLINE enum media_type codec_get_type(const str *type) {
 		return MT_IMAGE;
 	if (!str_cmp(type, "message"))
 		return MT_MESSAGE;
+	if (!str_cmp(type, "text"))
+		return MT_TEXT;
+	if (!str_cmp(type, "application"))
+		return MT_APPLICATION;
 	return MT_OTHER;
 }
 
@@ -40,7 +48,7 @@ INLINE enum media_type codec_get_type(const str *type) {
 // 1:  a is compatible with b (not necessarily the other way around)
 // -1: a is not compatible with b
 typedef int format_cmp_f(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
-typedef bool format_print_f(GString *, const struct rtp_payload_type *);
+typedef GString *format_print_f(const struct rtp_payload_type *);
 
 
 #ifndef WITHOUT_CODECLIB
@@ -58,6 +66,17 @@ typedef bool format_print_f(GString *, const struct rtp_payload_type *);
 #include <opus.h>
 
 #define AMR_FT_TYPES 14
+
+
+
+enum rtpe_cpu_flag {
+	RTPE_CPU_FLAG_AVX2 = 0,
+	RTPE_CPU_FLAG_AVX512BW,
+	RTPE_CPU_FLAG_AVX512F,
+	RTPE_CPU_FLAG_SSE2,
+
+	__NUM_RTPE_CPU_FLAGS
+};
 
 
 
@@ -82,16 +101,18 @@ typedef struct seq_packet_s seq_packet_t;
 typedef union codec_options_u codec_options_t;
 typedef struct encoder_callback_s encoder_callback_t;
 typedef struct dtx_method_s dtx_method_t;
+typedef struct codec_cc_s codec_cc_t;
 
 typedef int packetizer_f(AVPacket *, GString *, str *, encoder_t *);
 typedef void format_init_f(struct rtp_payload_type *);
 typedef void set_enc_options_f(encoder_t *, const str *);
 typedef void set_dec_options_f(decoder_t *, const str *);
-typedef void select_encoder_format_f(encoder_t *, format_t *requested_format, const format_t *input_format);
-typedef void select_decoder_format_f(decoder_t *);
+typedef void select_encoder_format_f(encoder_t *, format_t *requested_format, const format_t *input_format,
+		const struct rtp_codec_format *fmtp);
+typedef void select_decoder_format_f(decoder_t *, const struct rtp_codec_format *fmtp);
 
 typedef int format_parse_f(struct rtp_codec_format *, const str *fmtp);
-typedef void format_answer_f(struct rtp_payload_type *);
+typedef void format_answer_f(struct rtp_payload_type *, const struct rtp_payload_type *);
 
 
 
@@ -183,6 +204,13 @@ struct codec_def_s {
 	const int bits_per_sample;
 	const enum media_type media_type;
 	const str silence_pattern;
+	enum {
+		MOS_NB = 0, // default
+		MOS_FB,
+		MOS_LEGACY,
+
+		__MOS_TYPES
+	} mos_type;
 
 	// codec-specific callbacks
 	format_init_f *init;
@@ -199,6 +227,8 @@ struct codec_def_s {
 	// flags
 	unsigned int supplemental:1,
 	             dtmf:1, // special case
+		     fixed_sizes:1, // hint for `block-short` feature
+		     evs:1,
 		     amr:1;
 
 	const codec_type_t *codec_type;
@@ -237,7 +267,7 @@ struct dtx_method_s {
 			decoder_t *cn_dec;
 			const str *cn_payload;
 		} cn;
-	} u;
+	};
 };
 
 struct decoder_s {
@@ -257,6 +287,7 @@ struct decoder_s {
 		struct {
 			AVCodecContext *avcctx;
 			AVPacket *avpkt;
+			const enum AVSampleFormat *sample_fmts;
 
 			union {
 				struct {
@@ -264,7 +295,7 @@ struct decoder_s {
 					struct timeval tracker_end;
 					struct timeval last_cmr;
 				} amr;
-			} u;
+			};
 		} avc;
 #ifdef HAVE_BCG729
 		bcg729DecoderChannelContextStruct *bcg729;
@@ -276,7 +307,7 @@ struct decoder_s {
 		} dtmf;
 		void *evs;
 		OpusDecoder *opus;
-	} u;
+	};
 
 	unsigned long rtp_ts;
 	uint64_t pts;
@@ -297,10 +328,13 @@ struct encoder_s {
 	encoder_callback_t callback;
 	union codec_format_options format_options;
 
+	resample_t resampler;
+
 	union {
 		struct {
 			const AVCodec *codec;
 			AVCodecContext *avcctx;
+			const enum AVSampleFormat *sample_fmts;
 
 			union {
 				struct {
@@ -309,7 +343,7 @@ struct encoder_s {
 					unsigned int cmr_out_seq;
 					uint64_t pkt_seq;
 				} amr;
-			} u;
+			};
 		} avc;
 #ifdef HAVE_BCG729
 		bcg729EncoderChannelContextStruct *bcg729;
@@ -320,7 +354,7 @@ struct encoder_s {
 			struct timeval cmr_in_ts;
 		} evs;
 		OpusEncoder *opus;
-	} u;
+	};
 	AVPacket *avpkt;
 	AVAudioFifo *fifo;
 	int64_t fifo_pts; // pts of first data in fifo
@@ -349,9 +383,15 @@ struct packet_sequencer_s {
 extern const GQueue * const codec_supplemental_codecs;
 
 
+// must be set before calling codeclib_init
+extern void (*codeclib_thread_init)(void);
+extern void (*codeclib_thread_cleanup)(void);
+extern void (*codeclib_thread_loop)(void);
+
 void codeclib_init(int);
 void codeclib_free(void);
 
+bool rtpe_has_cpu_flag(enum rtpe_cpu_flag flag);
 
 codec_def_t *codec_find(const str *name, enum media_type);
 codec_def_t *codec_find_by_av(enum AVCodecID);
@@ -399,11 +439,36 @@ int packet_sequencer_next_ok(packet_sequencer_t *ps);
 void *packet_sequencer_force_next_packet(packet_sequencer_t *ps);
 int packet_sequencer_insert(packet_sequencer_t *ps, seq_packet_t *);
 
+packetizer_f packetizer_passthrough; // pass frames as they arrive in AVPackets
+
 
 void frame_fill_tone_samples(enum AVSampleFormat fmt, void *samples, unsigned int offset, unsigned int num,
 		unsigned int freq, unsigned int volume, unsigned int sample_rate, unsigned int channels);
 void frame_fill_dtmf_samples(enum AVSampleFormat fmt, void *samples, unsigned int offset, unsigned int num,
 		unsigned int event, unsigned int volume, unsigned int sample_rate, unsigned int channels);
+
+
+#ifdef HAVE_CODEC_CHAIN
+
+extern codec_cc_t *(*codec_cc_new)(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*init_async)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *));
+void codec_cc_stop(codec_cc_t *);
+void codec_cc_free(codec_cc_t **);
+
+#else
+
+INLINE codec_cc_t *codec_cc_new(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*init_async)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *)) { return NULL; }
+INLINE void codec_cc_stop(codec_cc_t *c) { }
+INLINE void codec_cc_free(codec_cc_t **c) { }
+
+#endif
+
+AVPacket *codec_cc_input_data(codec_cc_t *c, const str *data, unsigned long ts, void *, void *, void *);
 
 
 #include "auxlib.h"
@@ -441,6 +506,11 @@ INLINE int decoder_event(decoder_t *dec, enum codec_event event, void *ptr) {
 		return 0;
 	return dec->event_func(event, ptr, dec->event_data);
 }
+INLINE bool codec_def_supported(codec_def_t *def) {
+	if (!def)
+		return false;
+	return def->support_encoding && def->support_decoding;
+}
 
 
 #else
@@ -450,6 +520,7 @@ INLINE int decoder_event(decoder_t *dec, enum codec_event event, void *ptr) {
 struct codec_def_s {
 	int dtmf;
 	int supplemental;
+	int fixed_sizes;
 	format_cmp_f * const format_cmp;
 	format_print_f * const format_print;
 	const str silence_pattern;
@@ -470,6 +541,9 @@ INLINE codec_def_t *codec_find(const str *name, enum media_type type) {
 }
 INLINE void packet_sequencer_destroy(packet_sequencer_t *p) {
 	return;
+}
+INLINE bool codec_def_supported(codec_def_t *def) {
+	return false;
 }
 
 

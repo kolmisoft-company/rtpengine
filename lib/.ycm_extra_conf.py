@@ -24,6 +24,7 @@ flags = [
     '-g',
     '-Wall',
     '-Wstrict-prototypes',
+    '-Wshadow',
     '-pthread',
     '-fno-strict-aliasing',
     '-I/usr/include/glib-2.0',
@@ -37,11 +38,12 @@ flags = [
     '-I../include',
     '-I../lib',
     '-I../kernel-module',
-    '-I/home/dfx/src/bcg729/include',
     '-DRTPENGINE_VERSION="dummy"',
     '-DRE_PLUGIN_DIR="/usr/lib/rtpengine"',
     '-DWITH_IPTABLES_OPTION',
     '-DHAVE_BCG729',
+    '-DHAVE_CODEC_CHAIN',
+    '-DHAVE_LIBURING',
     '-D__csh_lookup(x)=str_hash(x)',
     '-DCSH_LOOKUP(x)=' + csh_lookup_str,
      '-O2',
@@ -57,7 +59,7 @@ flags = [
     # a "-std=<something>".
     # For a C project, you would set this to something like 'c99' instead of
     # 'c++11'.
-    '-std=c99',
+    '-std=c11',
     # ...and the same thing goes for the magic -x option which specifies the
     # language that the files to be compiled are written in. This is mostly
     # relevant for c++ headers.
@@ -65,6 +67,10 @@ flags = [
     '-x',
     'c',
 ]
+
+if 'CODEC_CHAIN_HOME' in os.environ:
+    flags.append('-I' + os.environ['CODEC_CHAIN_HOME'] + '/usr/include')
+
 
 if compilation_database_folder:
     database = ycm_core.CompilationDatabase(compilation_database_folder)

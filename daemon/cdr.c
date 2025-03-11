@@ -1,6 +1,8 @@
-#include <inttypes.h>
-#include "rtplib.h"
 #include "cdr.h"
+
+#include <inttypes.h>
+
+#include "rtplib.h"
 #include "call.h"
 #include "poller.h"
 #include "str.h"
@@ -19,31 +21,24 @@ static const char * const __tag_type_texts[] = {
 	[FROM_TAG] = "FROM_TAG",
 	[TO_TAG] = "TO_TAG",
 };
-static const char *const __opmode_texts[] = {
-	[OP_OFFER] = "offer",
-	[OP_ANSWER] = "answer",
-};
-
 const char * get_tag_type_text(enum tag_type t) {
 	return get_enum_array_text(__tag_type_texts, t, "UNKNOWN");
 }
-const char *get_opmode_text(enum call_opmode m) {
-	return get_enum_array_text(__opmode_texts, m, "other");
+const char *get_opmode_text(enum ng_opmode m) {
+	return get_enum_array_text(ng_command_strings, m, "other");
 }
 
 static const char * get_term_reason_text(enum termination_reason t) {
 	return get_enum_array_text(__term_reason_texts, t, "UNKNOWN");
 }
 
-void cdr_update_entry(struct call* c) {
-	GList *l;
+void cdr_update_entry(call_t * c) {
 	struct call_monologue *ml;
 	struct timeval tim_result_duration;
 	int cdrlinecnt = 0;
-	AUTO_CLEANUP_INIT(GString *cdr, __g_string_free, g_string_new(""));
+	g_autoptr(GString) cdr = g_string_new("");
 	struct call_media *md;
-	GList *k, *o;
-	const struct rtp_payload_type *rtp_pt;
+	const rtp_payload_type *rtp_pt;
 	struct packet_stream *ps=0;
 
 	if (!IS_OWN_CALL(c))
@@ -57,7 +52,7 @@ void cdr_update_entry(struct call* c) {
 		g_string_append_printf(cdr, "tos=%u, ", (unsigned int)c->tos);
 	}
 
-	for (l = c->monologues.head; l; l = l->next) {
+	for (__auto_type l = c->monologues.head; l; l = l->next) {
 		ml = l->data;
 
 		if (!ml->terminated.tv_sec) {
@@ -65,7 +60,7 @@ void cdr_update_entry(struct call* c) {
 			ml->term_reason = UNKNOWN;
 		}
 
-		timeval_subtract(&tim_result_duration,&ml->terminated,&ml->started);
+		tim_result_duration = timeval_subtract(&ml->terminated, &ml->started);
 
 		if (_log_facility_cdr) {
 			g_string_append_printf(cdr,
@@ -82,16 +77,28 @@ void cdr_update_entry(struct call* c) {
 				cdrlinecnt, ml->tag.s,
 				cdrlinecnt, get_tag_type_text(ml->tagtype));
 
-			for (k = ml->subscriptions.head; k; k = k->next) {
-				struct call_subscription *cs = k->data;
-				g_string_append_printf(cdr,
-					"ml%i_remote_tag=%s, ",
-					cdrlinecnt, cs->monologue->tag.s);
+			g_auto(GQueue) mls = G_QUEUE_INIT; /* to avoid duplications */
+			for (int i = 0; i < ml->medias->len; i++)
+			{
+				struct call_media * media = ml->medias->pdata[i];
+				if (!media)
+					continue;
+
+				for (__auto_type sub = media->media_subscriptions.head; sub; sub = sub->next)
+				{
+					struct media_subscription * ms = sub->data;
+					if (!g_queue_find(&mls, ms->monologue)) {
+						g_string_append_printf(cdr, "ml%i_remote_tag=%s, ", cdrlinecnt, ms->monologue->tag.s);
+						g_queue_push_tail(&mls, ms->monologue);
+					}
+				}
 			}
 		}
 
-		for (k = ml->medias.head; k; k = k->next) {
-			md = k->data;
+		for (unsigned int i = 0; i < ml->medias->len; i++) {
+			md = ml->medias->pdata[i];
+			if (!md)
+				continue;
 
 			rtp_pt = __rtp_stats_codec(md);
 
@@ -102,7 +109,7 @@ void cdr_update_entry(struct call* c) {
 				g_string_append_printf(cdr, "payload_type=unknown, ");
 			}
 
-			for (o = md->streams.head; o; o = o->next) {
+			for (__auto_type o = md->streams.head; o; o = o->next) {
 				ps = o->data;
 
 				if (PS_ISSET(ps, FALLBACK_RTCP))
@@ -130,48 +137,16 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol, local_addr,
 						cdrlinecnt, md->index, protocol, ps->last_local_endpoint.port,
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.packets),
+						atomic64_get_na(&ps->stats_in->packets),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.bytes),
+						atomic64_get_na(&ps->stats_in->bytes),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.errors),
+						atomic64_get_na(&ps->stats_in->errors),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->last_packet),
+						packet_stream_last_packet(ps),
 						cdrlinecnt, md->index, protocol,
-						ps->in_tos_tclass);
+						atomic_get_na(&ps->stats_in->tos));
 				    } else {
-#if (RE_HAS_MEASUREDELAY)
-					g_string_append_printf(cdr,
-						"ml%i_midx%u_%s_endpoint_ip=%s, "
-						"ml%i_midx%u_%s_endpoint_port=%u, "
-						"ml%i_midx%u_%s_local_relay_ip=%s, "
-						"ml%i_midx%u_%s_local_relay_port=%u, "
-						"ml%i_midx%u_%s_relayed_packets="UINT64F", "
-						"ml%i_midx%u_%s_relayed_bytes="UINT64F", "
-						"ml%i_midx%u_%s_relayed_errors="UINT64F", "
-						"ml%i_midx%u_%s_last_packet="UINT64F", "
-						"ml%i_midx%u_%s_in_tos_tclass=%" PRIu8 ", "
-						"ml%i_midx%u_%s_delay_min=%.9f, "
-						"ml%i_midx%u_%s_delay_avg=%.9f, "
-						"ml%i_midx%u_%s_delay_max=%.9f, ",
-						cdrlinecnt, md->index, protocol, addr,
-						cdrlinecnt, md->index, protocol, ps->endpoint.port,
-						cdrlinecnt, md->index, protocol, local_addr,
-						cdrlinecnt, md->index, protocol, ps->last_local_endpoint.port,
-						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.packets),
-						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.bytes),
-						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.errors),
-						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->last_packet),
-						cdrlinecnt, md->index, protocol,
-						ps->in_tos_tclass,
-						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_min / 1000000,
-						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_avg / 1000000,
-						cdrlinecnt, md->index, protocol, (double) ps->stats.delay_max / 1000000);
-#else
 					g_string_append_printf(cdr,
 						"ml%i_midx%u_%s_endpoint_ip=%s, "
 						"ml%i_midx%u_%s_endpoint_port=%u, "
@@ -187,16 +162,15 @@ void cdr_update_entry(struct call* c) {
 						cdrlinecnt, md->index, protocol, local_addr,
 						cdrlinecnt, md->index, protocol, ps->last_local_endpoint.port,
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.packets),
+						atomic64_get_na(&ps->stats_in->packets),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.bytes),
+						atomic64_get_na(&ps->stats_in->bytes),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->stats_in.errors),
+						atomic64_get_na(&ps->stats_in->errors),
 						cdrlinecnt, md->index, protocol,
-						atomic64_get(&ps->last_packet),
+						packet_stream_last_packet(ps),
 						cdrlinecnt, md->index, protocol,
-						ps->in_tos_tclass);
-#endif
+						atomic_get_na(&ps->stats_in->tos));
 				    }
 				}
 

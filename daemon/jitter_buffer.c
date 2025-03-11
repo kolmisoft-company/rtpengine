@@ -1,12 +1,15 @@
 #include "jitter_buffer.h"
+
+#include <math.h>
+#include <errno.h>
+
 #include "timerthread.h"
 #include "media_socket.h"
 #include "call.h"
 #include "codec.h"
 #include "main.h"
 #include "rtcplib.h"
-#include <math.h>
-#include <errno.h>
+#include "bufferpool.h"
 
 #define INITIAL_PACKETS 0x1E
 #define CONT_SEQ_COUNT 0x1F4
@@ -21,7 +24,8 @@ static struct timerthread jitter_buffer_thread;
 
 void jitter_buffer_init(void) {
 	//ilog(LOG_DEBUG, "jitter_buffer_init");
-	timerthread_init(&jitter_buffer_thread, timerthread_queue_run);
+	unsigned int num_threads = rtpe_config.jb_length > 0 ? rtpe_config.media_num_threads : 0;
+	timerthread_init(&jitter_buffer_thread, num_threads, timerthread_queue_run);
 }
 
 void jitter_buffer_init_free(void) {
@@ -64,8 +68,8 @@ static void reset_jitter_buffer(struct jitter_buffer *jb) {
 		jb->disabled = 1;
 }
 
-static struct rtp_payload_type *get_rtp_payload_type(struct media_packet *mp, int payload_type) {
-	struct rtp_payload_type *rtp_pt = NULL;
+static rtp_payload_type *codec_rtp_pt(struct media_packet *mp, int payload_type) {
+	rtp_payload_type *rtp_pt = NULL;
 	struct codec_handler *transcoder = codec_handler_get(mp->media, payload_type, mp->media_out, NULL);
 	if(transcoder) {
 		if(transcoder->source_pt.payload_type == payload_type)
@@ -83,7 +87,7 @@ static int get_clock_rate(struct media_packet *mp, int payload_type) {
 	if(jb->clock_rate && jb->payload_type == payload_type)
 		return jb->clock_rate;
 
-	const struct rtp_payload_type *rtp_pt = get_rtp_payload_type(mp, payload_type);
+	const rtp_payload_type *rtp_pt = codec_rtp_pt(mp, payload_type);
 	if(rtp_pt) {
 		if(rtp_pt->codec_def && !rtp_pt->codec_def->dtmf) {
 			clock_rate = jb->clock_rate = rtp_pt->clock_rate;
@@ -99,10 +103,10 @@ static int get_clock_rate(struct media_packet *mp, int payload_type) {
 }
 
 static struct jb_packet* get_jb_packet(struct media_packet *mp, const str *s) {
-	if (rtp_payload(&mp->rtp, &mp->payload, &mp->raw))
+	if (rtp_payload(&mp->rtp, &mp->payload, s))
 		return NULL;
 
-	char *buf = malloc(s->len + RTP_BUFFER_HEAD_ROOM + RTP_BUFFER_TAIL_ROOM);
+	char *buf = bufferpool_alloc(media_bufferpool, s->len + RTP_BUFFER_HEAD_ROOM + RTP_BUFFER_TAIL_ROOM);
 	if (!buf) {
 		ilog(LOG_ERROR, "Failed to allocate memory: %s", strerror(errno));
 		return NULL;
@@ -113,7 +117,7 @@ static struct jb_packet* get_jb_packet(struct media_packet *mp, const str *s) {
 	p->buf = buf;
 	media_packet_copy(&p->mp, mp);
 
-	str_init_len(&p->mp.raw, buf + RTP_BUFFER_HEAD_ROOM, s->len);
+	p->mp.raw = STR_LEN(buf + RTP_BUFFER_HEAD_ROOM, s->len);
 	memcpy(p->mp.raw.s, s->s, s->len);
 
 	return p;
@@ -225,7 +229,7 @@ int buffer_packet(struct media_packet *mp, const str *s) {
 	int ret = 1; // must call stream_packet
 
 	mp->call = mp->sfd->call;
-	struct call *call = mp->call;
+	call_t *call = mp->call;
 
 	rwlock_lock_r(&call->master_lock);
 
@@ -261,7 +265,7 @@ int buffer_packet(struct media_packet *mp, const str *s) {
 	int seq = ntohs(mp->rtp->seq_num);
 	int marker = (mp->rtp->m_pt & 0x80) ? 1 : 0;
 	int dtmf = 0;
-	const struct rtp_payload_type *rtp_pt = get_rtp_payload_type(mp, payload_type);
+	const rtp_payload_type *rtp_pt = codec_rtp_pt(mp, payload_type);
 	if(rtp_pt) {
 		if(rtp_pt->codec_def && rtp_pt->codec_def->dtmf)
 			dtmf = 1;
@@ -294,7 +298,7 @@ int buffer_packet(struct media_packet *mp, const str *s) {
 	else {
 		// store data from first packet and use for successive packets and queue the first packet
 		unsigned long ts = ntohl(mp->rtp->timestamp);
-		int payload_type =  (mp->rtp->m_pt & 0x7f);
+		payload_type =  (mp->rtp->m_pt & 0x7f);
 		int clockrate = get_clock_rate(mp, payload_type);
 		if(!clockrate){
 			if(jb->rtptime_delta &&  payload_type != COMFORT_NOISE) { //ignore CN
@@ -346,13 +350,13 @@ static void set_jitter_values(struct media_packet *mp) {
 	int curr_seq = ntohs(mp->rtp->seq_num); 
 	int payload_type = (mp->rtp->m_pt & 0x7f);
 	int dtmf = 0;
-	const struct rtp_payload_type *rtp_pt = get_rtp_payload_type(mp, payload_type);
+	const rtp_payload_type *rtp_pt = codec_rtp_pt(mp, payload_type);
 	if(rtp_pt) {
 		if(rtp_pt->codec_def && rtp_pt->codec_def->dtmf)
 			dtmf = 1;
 	}
+	mutex_lock(&jb->lock);
 	if(jb->next_exp_seq && !dtmf) {
-		mutex_lock(&jb->lock);
 		if(curr_seq > jb->next_exp_seq) {
 			int marker = (mp->rtp->m_pt & 0x80) ? 1 : 0;
 			if(!marker) {
@@ -378,10 +382,10 @@ static void set_jitter_values(struct media_packet *mp) {
 
 		if(jb->cont_miss >= CONT_MISS_COUNT)
 			reset_jitter_buffer(jb);
-		mutex_unlock(&jb->lock);
 	}
 	if(curr_seq >= jb->next_exp_seq)
 		jb->next_exp_seq = curr_seq + 1;
+	mutex_unlock(&jb->lock);
 }
 
 static void __jb_send_later(struct timerthread_queue *ttq, void *p) {
@@ -410,12 +414,11 @@ void __jb_packet_free(void *p) {
 	jb_packet_free(&jbp);
 }
 
-void jitter_buffer_loop(void *p) {
-	ilog(LOG_DEBUG, "jitter_buffer_loop");
-	timerthread_run(&jitter_buffer_thread);
+void jitter_buffer_launch(void) {
+	timerthread_launch(&jitter_buffer_thread, rtpe_config.scheduling, rtpe_config.priority, "jitter buffer");
 }
 
-struct jitter_buffer *jitter_buffer_new(struct call *c) {
+struct jitter_buffer *jitter_buffer_new(call_t *c) {
 	ilog(LOG_DEBUG, "creating jitter_buffer");
 
 	struct jitter_buffer *jb = timerthread_queue_new("jitter_buffer", sizeof(*jb),
@@ -443,7 +446,7 @@ void jb_packet_free(struct jb_packet **jbp) {
 	if (!jbp || !*jbp)
 		return;
 
-	free((*jbp)->buf);
+	bufferpool_unref((*jbp)->buf);
 	media_packet_release(&(*jbp)->mp);
 	g_slice_free1(sizeof(**jbp), *jbp);
 	*jbp = NULL;

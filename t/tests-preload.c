@@ -502,9 +502,9 @@ do_connect:;
 	return ret;
 }
 
-int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
 	const char *err;
-	int (*real_accept)(int, struct sockaddr *, socklen_t *) = dlsym(RTLD_NEXT, "accept");
+	int (*real_accept4)(int, struct sockaddr *, socklen_t *, int) = dlsym(RTLD_NEXT, "accept4");
 
 	err = "fd out of bounds";
 	if (fd < 0 || fd >= MAX_SOCKETS)
@@ -523,7 +523,7 @@ do_accept_warn:
 do_accept:;
 	struct sockaddr_un sun;
 	socklen_t sun_len = sizeof(sun);
-	int new_fd = real_accept(fd, (struct sockaddr *) &sun, &sun_len);
+	int new_fd = real_accept4(fd, (struct sockaddr *) &sun, &sun_len, flags);
 	if (new_fd == -1)
 		return -1;
 	if (new_fd < 0 || new_fd >= MAX_SOCKETS || real_sockets[new_fd].open) {
@@ -554,6 +554,10 @@ do_accept:;
 	return new_fd;
 }
 
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+	return accept4(fd, addr, addrlen, 0);
+}
+
 int dup(int fd) {
 	int (*real_dup)(int) = dlsym(RTLD_NEXT, "dup");
 	int ret = real_dup(fd);
@@ -578,6 +582,47 @@ int dup2(int oldfd, int newfd) {
 	}
 	real_sockets[newfd] = real_sockets[oldfd];
 	return ret;
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *addr, socklen_t *socklen) {
+	const char *err;
+	ssize_t (*real_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *)
+		= dlsym(RTLD_NEXT, "recvfrom");
+	err = "fd out of bounds";
+	if (fd < 0 || fd >= MAX_SOCKETS)
+		goto do_recvfrom_warn;
+	socket_t *s = &real_sockets[fd];
+	err = "fd not open";
+	if (!s->open)
+		goto do_recvfrom_warn;
+	if (s->used_domain != AF_UNIX || s->wanted_domain == AF_UNIX)
+		goto do_recvfrom;
+
+	struct sockaddr_un sun;
+	socklen_t sl = sizeof(sun);
+	ssize_t ret = real_recvfrom(fd, buf, len, flags, (struct sockaddr *) &sun, &sl);
+
+	if (ret <= 0)
+		goto out;
+
+	if (addr) {
+		struct sockaddr_storage sst;
+		socklen_t addrlen;
+		addr_translate_reverse(&sst, &addrlen, s->wanted_domain, &sun);
+		assert(addrlen <= *socklen);
+		memcpy(addr, &sst, addrlen);
+		*socklen = addrlen;
+	}
+
+	goto out;
+
+out:
+	return ret;
+
+do_recvfrom_warn:
+	fprintf(stderr, "preload recvfrom(): %s (fd %i)\n", err, fd);
+do_recvfrom:
+	return real_recvfrom(fd, buf, len, flags, addr, socklen);
 }
 
 ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {

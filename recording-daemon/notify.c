@@ -9,6 +9,7 @@
 struct notif_req {
 	char *name; // just for logging
 	struct curl_slist *headers;
+	char *full_filename_path;
 
 	time_t retry_time;
 	unsigned int retries;
@@ -38,81 +39,99 @@ static void do_notify(void *p, void *u) {
 
 	ilog(LOG_DEBUG, "Launching HTTP notification for '%s%s%s'", FMT_M(req->name));
 
-	// set up the CURL request
+	/* set up the CURL request */
 
+#if CURL_AT_LEAST_VERSION(7,56,0)
+	curl_mime *mime = NULL;
+#endif
 	CURL *c = curl_easy_init();
 	if (!c)
 		goto fail;
 
 	err = "setting CURLOPT_URL";
-	ret = curl_easy_setopt(c, CURLOPT_URL, notify_uri);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_URL, notify_uri)) != CURLE_OK)
 		goto fail;
 
-	// no output
+	/* no output */
 	err = "setting CURLOPT_WRITEFUNCTION";
-	ret = curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, dummy_write);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, dummy_write)) != CURLE_OK)
 		goto fail;
 
-	// no input
+	/* no input */
 	err = "setting CURLOPT_READFUNCTION";
-	ret = curl_easy_setopt(c, CURLOPT_READFUNCTION, dummy_read);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_READFUNCTION, dummy_read)) != CURLE_OK)
 		goto fail;
 
-	// allow redirects
+	/* allow redirects */
 	err = "setting CURLOPT_FOLLOWLOCATION";
-	ret = curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1)) != CURLE_OK)
 		goto fail;
 
-	// max 5 redirects
+	/* max 5 redirects */
 	err = "setting CURLOPT_MAXREDIRS";
-	ret = curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5)) != CURLE_OK)
 		goto fail;
 
-	// add headers
+	/* add headers */
 	err = "setting CURLOPT_HTTPHEADER";
-	ret = curl_easy_setopt(c, CURLOPT_HTTPHEADER, req->headers);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_setopt(c, CURLOPT_HTTPHEADER, req->headers)) != CURLE_OK)
 		goto fail;
 
-	// POST vs GET
+	/* POST vs GET */
 	if (notify_post) {
 		err = "setting CURLOPT_POST";
-		ret = curl_easy_setopt(c, CURLOPT_POST, 1);
-		if (ret != CURLE_OK)
+		if ((ret = curl_easy_setopt(c, CURLOPT_POST, 1)) != CURLE_OK)
 			goto fail;
 	}
 
-	// cert verify (enabled by default)
+	/* cert verify (enabled by default) */
 	if (notify_nverify) {
 		err = "setting CURLOPT_SSL_VERIFYPEER";
-		ret = curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0);
-		if (ret != CURLE_OK)
+		if ((ret = curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0)) != CURLE_OK)
 			goto fail;
 	}
 
+#if CURL_AT_LEAST_VERSION(7,56,0)
+	if (notify_record) {
+		err = "initializing curl mime&part";
+		curl_mimepart *part;
+		mime = curl_mime_init(c);
+		part = curl_mime_addpart(mime);
+
+		if ((ret = curl_mime_name(part, "ngfile")) != CURLE_OK)
+			goto fail;
+
+		if ((ret = curl_mime_filedata(part, req->full_filename_path)) != CURLE_OK)
+			goto fail;
+
+		if ((ret = curl_easy_setopt(c, CURLOPT_MIMEPOST, mime)) != CURLE_OK)
+			goto fail;
+	}
+#endif
+
 	err = "performing request";
-	ret = curl_easy_perform(c);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_perform(c)) != CURLE_OK)
 		goto fail;
 
 	long code;
 	err = "getting CURLINFO_RESPONSE_CODE";
-	ret = curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-	if (ret != CURLE_OK)
+	if ((ret = curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code)) != CURLE_OK)
 		goto fail;
 
 	err = "checking response code (not 2xx)";
 	if (code < 200 || code >= 300)
 		goto fail;
 
-	// success
+	/* success */
 
 	ilog(LOG_NOTICE, "HTTP notification for '%s%s%s' was successful", FMT_M(req->name));
+
+	if (notify_record && notify_purge) {
+		if (unlink(req->full_filename_path) == 0)
+			ilog(LOG_NOTICE, "File '%s%s%s' deleted successfully.", FMT_M(req->full_filename_path));
+		else
+			ilog(LOG_ERR, "File '%s%s%s' could not be deleted.", FMT_M(req->full_filename_path));
+	}
 	goto cleanup;
 
 fail:
@@ -120,7 +139,7 @@ fail:
 		curl_easy_cleanup(c);
 
 	if (notify_retries >= 0 && req->retries < notify_retries) {
-		// schedule retry
+		/* schedule retry */
 		req->retries++;
 		if (c)
 			ilog(LOG_DEBUG, "Failed to perform HTTP notification for '%s%s%s': "
@@ -161,8 +180,15 @@ fail:
 cleanup:
 	if (c)
 		curl_easy_cleanup(c);
+
+#if CURL_AT_LEAST_VERSION(7,56,0)
+	if (mime)
+		curl_mime_free(mime);
+#endif
+
 	curl_slist_free_all(req->headers);
 	g_free(req->name);
+	g_free(req->full_filename_path);
 	g_slice_free1(sizeof(*req), req);
 }
 
@@ -264,6 +290,7 @@ void notify_push_output(output_t *o, metafile_t *mf, tag_t *tag) {
 	struct notif_req *req = g_slice_alloc0(sizeof(*req));
 
 	req->name = g_strdup(o->file_name);
+	req->full_filename_path = g_strdup_printf("%s.%s", o->full_filename, o->file_format);
 	double now = now_double();
 
 	notify_add_header(req, "X-Recording-Call-ID: %s", mf->call_id);
@@ -282,8 +309,8 @@ void notify_push_output(output_t *o, metafile_t *mf, tag_t *tag) {
 		notify_add_header(req, "X-Recording-Stream-DB-ID: %llu", o->db_id);
 	if (mf->metadata)
 		notify_add_header(req, "X-Recording-Call-Metadata: %s", mf->metadata);
-	if (mf->metadata_db)
-		notify_add_header(req, "X-Recording-DB-Metadata: %s", mf->metadata_db);
+	if (mf->metadata)
+		notify_add_header(req, "X-Recording-DB-Metadata: %s", mf->metadata);
 
 	if (tag) {
 		notify_add_header(req, "X-Recording-Tag: %s", tag->name);

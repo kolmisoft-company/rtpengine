@@ -45,6 +45,8 @@ int output_add(output_t *output, AVFrame *frame) {
 		return -1;
 	if (!output->encoder) // not ready - not configured
 		return -1;
+	if (!output->fmtctx) // output not open
+		return -1;
 	return encoder_input_fifo(output->encoder, frame, output_got_packet, output, NULL);
 }
 
@@ -98,17 +100,37 @@ static output_t *output_alloc(const char *path, const char *name) {
 	return ret;
 }
 
-output_t *output_new(const char *path, const char *call, const char *type, const char *kind, const char *label) {
+static void output_append_str_from_ht(GString *f, metadata_ht ht, const str *s) {
+	str_q *q = t_hash_table_lookup(ht, s);
+	if (!q || q->length == 0) {
+		ilog(LOG_WARN, "Key '{" STR_FORMAT "}' used in file name pattern not present in metadata",
+				STR_FMT(s));
+		return;
+	}
+	if (q->length > 1)
+		ilog(LOG_WARN, "Key '{" STR_FORMAT "}' used in file name pattern present in metadata %u times, "
+				"only using first occurrence",
+				STR_FMT(s), q->length);
+	g_autoptr(char) esc = g_uri_escape_string(q->head->data->s, NULL, false);
+	g_string_append(f, esc);
+}
+
+static output_t *output_new(const char *path, const metafile_t *mf, const char *type, const char *kind,
+		const char *label)
+{
 	// construct output file name
 	struct timeval now;
 	struct tm tm;
-	const char *ax = call;
+	g_autoptr(char) escaped_callid = g_uri_escape_string(mf->call_id, NULL, false);
+	const char *ax = escaped_callid;
 
 	gettimeofday(&now, NULL);
 	localtime_r(&now.tv_sec, &tm);
 
-	GString *f = g_string_new("");
-	for (const char *p = output_pattern; *p; p++) {
+	g_autoptr(GString) f = g_string_new("");
+	const char *pattern = mf->output_pattern ?: output_pattern;
+
+	for (const char *p = pattern; *p; p++) {
 		if (*p != '%') {
 			g_string_append_c(f, *p);
 			continue;
@@ -122,7 +144,10 @@ output_t *output_new(const char *path, const char *call, const char *type, const
 				g_string_append_c(f, '%');
 				break;
 			case 'c':
-				g_string_append(f, call);
+				g_string_append(f, escaped_callid);
+				break;
+			case 'r':
+				g_string_append(f, mf->random_tag);
 				break;
 			case 't':
 				g_string_append(f, type);
@@ -171,6 +196,18 @@ output_t *output_new(const char *path, const char *call, const char *type, const
 					g_string_append_c(f, *ax++);
 				p = end - 1; // will be advanced +1 in the next loop
 				break;
+			case '{':
+				// find matching end '}'
+				p++;
+				end = strchr(p, '}');
+				if (!end) {
+					ilog(LOG_ERR, "Missing ending brace '}' in file name pattern");
+					break;
+				}
+				str fmt = STR_LEN((char *) p, end - p);
+				p = end; // skip over {...}
+				output_append_str_from_ht(f, mf->metadata_parsed, &fmt);
+				break;
 			default:
 				ilog(LOG_ERR, "Invalid output pattern (unknown format character '%c')", *p);
 				break;
@@ -182,15 +219,36 @@ done:;
 	create_parent_dirs(ret->full_filename);
 	ret->kind = kind;
 
-	g_string_free(f, TRUE);
+	return ret;
+}
+
+static output_t *output_new_from_full_path(const char *path, char *name, const char *kind) {
+	output_t *ret = output_alloc(path, name);
+	create_parent_dirs(ret->full_filename);
+	ret->kind = kind;
 
 	return ret;
 }
 
-output_t *output_new_from_full_path(const char *path, char *name, const char *kind) {
-	output_t *ret = output_alloc(path, name);
-	create_parent_dirs(ret->full_filename);
-	ret->kind = kind;
+output_t *output_new_ext(metafile_t *mf, const char *type, const char *kind, const char *label) {
+	const char *output_path = mf->output_path ?: output_dir;
+	output_t *ret;
+	dbg("Metadata %s, output destination %s", mf->metadata, mf->output_dest);
+	if (mf->output_dest) {
+		char *path = g_strdup(mf->output_dest);
+		char *sep = strrchr(path, '/');
+		if (sep) {
+			char *filename = sep + 1;
+			*sep = 0;
+			ret = output_new_from_full_path(path, filename, kind);
+			ret->skip_filename_extension = TRUE;
+		}
+		else
+			ret = output_new_from_full_path(output_path, path, kind);
+		g_free(path);
+	}
+	else
+		ret = output_new(output_path, mf, type, kind, label);
 
 	return ret;
 }
@@ -235,10 +293,10 @@ int output_config(output_t *output, const format_t *requested_format, format_t *
 		output->requested_format.format = output->actual_format.format;
 
 	err = "failed to alloc output stream";
-	output->avst = avformat_new_stream(output->fmtctx, output->encoder->u.avc.codec);
+	output->avst = avformat_new_stream(output->fmtctx, output->encoder->avc.codec);
 	if (!output->avst)
 		goto err;
-	output->avst->time_base = output->encoder->u.avc.avcctx->time_base;
+	output->avst->time_base = output->encoder->avc.avcctx->time_base;
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57, 0, 0)
 	// move the avcctx to avst as we already have an initialized avcctx
@@ -246,11 +304,11 @@ int output_config(output_t *output, const format_t *requested_format, format_t *
 		avcodec_close(output->avst->codec);
 		avcodec_free_context(&output->avst->codec);
 	}
-	output->avst->codec = output->encoder->u.avc.avcctx;
+	output->avst->codec = output->encoder->avc.avcctx;
 #endif
 
 #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 26, 0) // exact version? present in 57.56
-	avcodec_parameters_from_context(output->avst->codecpar, output->encoder->u.avc.avcctx);
+	avcodec_parameters_from_context(output->avst->codecpar, output->encoder->avc.avcctx);
 #endif
 
 	char *full_fn = NULL;
@@ -283,6 +341,20 @@ got_fn:
 	if (av_ret)
 		goto err;
 
+	if (output_chmod)
+		if (chmod(output->filename, output_chmod))
+			ilog(LOG_WARN, "Failed to change file mode of '%s%s%s': %s",
+					FMT_M(output->filename), strerror(errno));
+
+	if (output_chown != -1 || output_chgrp != -1)
+		if (chown(output->filename, output_chown, output_chgrp))
+			ilog(LOG_WARN, "Failed to change file owner/group of '%s%s%s': %s",
+					FMT_M(output->filename), strerror(errno));
+
+	if (flush_packets) {
+		output->fmtctx->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+	}
+
 	db_config_stream(output);
 	ilog(LOG_INFO, "Opened output media file '%s' for writing", full_fn);
 done:
@@ -312,20 +384,12 @@ static bool output_shutdown(output_t *output) {
 		av_write_trailer(output->fmtctx);
 		avio_closep(&output->fmtctx->pb);
 		ret = true;
-		if (output_chmod)
-			if (chmod(output->filename, output_chmod))
-				ilog(LOG_WARN, "Failed to change file mode of '%s%s%s': %s",
-						FMT_M(output->filename), strerror(errno));
-		if (output_chown != -1 || output_chgrp != -1)
-			if (chown(output->filename, output_chown, output_chgrp))
-				ilog(LOG_WARN, "Failed to change file owner/group of '%s%s%s': %s",
-						FMT_M(output->filename), strerror(errno));
 	}
 	avformat_free_context(output->fmtctx);
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57, 0, 0)
 	// avoid double free - avcctx already freed
-	output->encoder->u.avc.avcctx = NULL;
+	output->encoder->avc.avcctx = NULL;
 #endif
 
 	encoder_close(output->encoder);
@@ -337,15 +401,24 @@ static bool output_shutdown(output_t *output) {
 }
 
 
-void output_close(metafile_t *mf, output_t *output, tag_t *tag) {
+void output_close(metafile_t *mf, output_t *output, tag_t *tag, bool discard) {
 	if (!output)
 		return;
-	if (output_shutdown(output)) {
-		db_close_stream(output);
-		notify_push_output(output, mf, tag);
+	if (!discard) {
+		if (output_shutdown(output)) {
+			db_close_stream(output);
+			notify_push_output(output, mf, tag);
+		}
+		else
+			db_delete_stream(mf, output);
 	}
-	else
+	else {
+		output_shutdown(output);
+		if (output->filename && unlink(output->filename))
+			ilog(LOG_WARN, "Failed to unlink '%s%s%s': %s",
+					FMT_M(output->filename), strerror(errno));
 		db_delete_stream(mf, output);
+	}
 	encoder_free(output->encoder);
 	g_clear_pointer(&output->full_filename, g_free);
 	g_clear_pointer(&output->file_path, g_free);
@@ -359,11 +432,11 @@ void output_init(const char *format) {
 	str codec;
 
 	if (!strcmp(format, "wav")) {
-		str_init(&codec, "PCM-S16LE");
+		codec = STR("PCM-S16LE");
 		output_file_format = "wav";
 	}
 	else if (!strcmp(format, "mp3")) {
-		str_init(&codec, "MP3");
+		codec = STR("MP3");
 		output_file_format = "mp3";
 	}
 	else

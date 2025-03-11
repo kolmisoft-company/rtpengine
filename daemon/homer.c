@@ -10,16 +10,13 @@
 #include <sys/time.h>
 
 #include "log.h"
-#include "aux.h"
+#include "helpers.h"
 #include "str.h"
-
-
-
+#include "types.h"
 
 #define SEND_QUEUE_LIMIT 200
 
-
-
+TYPED_GQUEUE(gstring, GString)
 
 struct homer_sender {
 	mutex_t		lock;
@@ -30,7 +27,7 @@ struct homer_sender {
 	socket_t	socket;
 	time_t		retry;
 
-	GQueue		send_queue;
+	gstring_q	send_queue;
 	GString		*partial;
 
 	int		(*state)(struct homer_sender *);
@@ -44,7 +41,7 @@ static struct homer_sender *main_homer_sender;
 
 
 static int send_hepv3 (GString *s, const str *id, int, const endpoint_t *src, const endpoint_t *dst,
-		const struct timeval *);
+		const struct timeval *, int hep_capture_proto);
 
 // state handlers
 static int __established(struct homer_sender *hs);
@@ -120,7 +117,7 @@ static int __established(struct homer_sender *hs) {
 	}
 
 	// unqueue as much as we can
-	while ((gs = g_queue_pop_head(&hs->send_queue))) {
+	while ((gs = t_queue_pop_head(&hs->send_queue))) {
 		ilog(LOG_DEBUG, "dequeue send queue to Homer");
 		ret = __attempt_send(hs, gs);
 		if (ret == 0) // everything sent OK
@@ -129,7 +126,7 @@ static int __established(struct homer_sender *hs) {
 			hs->partial = gs;
 			return 0;
 		}
-		g_queue_push_head(&hs->send_queue, gs);
+		t_queue_push_head(&hs->send_queue, gs);
 		if (ret == 1) // write error
 			return -1;
 		// ret == 2 -> blocked
@@ -206,7 +203,7 @@ void homer_sender_init(const endpoint_t *ep, int protocol, int capture_id) {
 
 // takes over the GString
 int homer_send(GString *s, const str *id, const endpoint_t *src,
-		const endpoint_t *dst, const struct timeval *tv)
+		const endpoint_t *dst, const struct timeval *tv, int hep_capture_proto)
 {
 	if (!main_homer_sender)
 		goto out;
@@ -217,12 +214,12 @@ int homer_send(GString *s, const str *id, const endpoint_t *src,
 
 	ilog(LOG_DEBUG, "JSON to send to Homer: '"STR_FORMAT"'", G_STR_FMT(s));
 
-	if (send_hepv3(s, id, main_homer_sender->capture_id, src, dst, tv))
+	if (send_hepv3(s, id, main_homer_sender->capture_id, src, dst, tv, hep_capture_proto))
 		goto out;
 
 	mutex_lock(&main_homer_sender->lock);
 	if (main_homer_sender->send_queue.length < SEND_QUEUE_LIMIT) {
-		g_queue_push_tail(&main_homer_sender->send_queue, s);
+		t_queue_push_tail(&main_homer_sender->send_queue, s);
 		s = NULL;
 	}
 	else
@@ -321,11 +318,9 @@ struct hep_generic {
 
 typedef struct hep_generic hep_generic_t;
 
-#define PROTO_RTCP_JSON   0x05
-
 // modifies the GString in place
 static int send_hepv3 (GString *s, const str *id, int capt_id, const endpoint_t *src, const endpoint_t *dst,
-		const struct timeval *tv)
+		const struct timeval *tv, int hep_capture_proto)
 {
 
     struct hep_generic *hg=NULL;
@@ -363,13 +358,13 @@ static int send_hepv3 (GString *s, const str *id, int capt_id, const endpoint_t 
         /* SRC IP */
         src_ip4.chunk.vendor_id = htons(0x0000);
         src_ip4.chunk.type_id   = htons(0x0003);
-	src_ip4.data = src->address.u.ipv4;
+	src_ip4.data = src->address.ipv4;
         src_ip4.chunk.length = htons(sizeof(src_ip4));
 
         /* DST IP */
         dst_ip4.chunk.vendor_id = htons(0x0000);
         dst_ip4.chunk.type_id   = htons(0x0004);
-	dst_ip4.data = dst->address.u.ipv4;
+	dst_ip4.data = dst->address.ipv4;
         dst_ip4.chunk.length = htons(sizeof(dst_ip4));
 
         iplen = sizeof(dst_ip4) + sizeof(src_ip4);
@@ -379,13 +374,13 @@ static int send_hepv3 (GString *s, const str *id, int capt_id, const endpoint_t 
         /* SRC IPv6 */
         src_ip6.chunk.vendor_id = htons(0x0000);
         src_ip6.chunk.type_id   = htons(0x0005);
-	src_ip6.data = src->address.u.ipv6;
+	src_ip6.data = src->address.ipv6;
         src_ip6.chunk.length = htons(sizeof(src_ip6));
 
         /* DST IPv6 */
         dst_ip6.chunk.vendor_id = htons(0x0000);
         dst_ip6.chunk.type_id   = htons(0x0006);
-	dst_ip6.data = dst->address.u.ipv6;
+	dst_ip6.data = dst->address.ipv6;
         dst_ip6.chunk.length = htons(sizeof(dst_ip6));
 
         iplen = sizeof(dst_ip6) + sizeof(src_ip6);
@@ -420,7 +415,7 @@ static int send_hepv3 (GString *s, const str *id, int capt_id, const endpoint_t 
     /* Protocol TYPE */
     hg->proto_t.chunk.vendor_id = htons(0x0000);
     hg->proto_t.chunk.type_id   = htons(0x000b);
-    hg->proto_t.data = PROTO_RTCP_JSON;
+    hg->proto_t.data = hep_capture_proto;
     hg->proto_t.chunk.length = htons(sizeof(hg->proto_t));
 
     /* Capture ID */
@@ -565,6 +560,6 @@ static int send_hepv3 (GString *s, const str *id, int capt_id, const endpoint_t 
     return 0;
 }
 
-int has_homer() {
+int has_homer(void) {
 	return main_homer_sender ? 1 : 0;
 }

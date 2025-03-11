@@ -16,6 +16,7 @@
 #include "codeclib.h"
 #include "poller.h"
 #include "socket.h"
+#include "containers.h"
 
 
 struct iphdr;
@@ -56,6 +57,8 @@ struct stream_s {
 	handler_t handler;
 	unsigned int forwarding_on:1;
 	double start_time;
+	unsigned int media_sdp_id;
+	unsigned int channel_slot;
 };
 typedef struct stream_s stream_t;
 
@@ -87,6 +90,8 @@ struct ssrc_s {
 	format_t tls_fwd_format;
 	resample_t tls_fwd_resampler;
 	socket_t tls_fwd_sock;
+	uint64_t tls_in_pts;
+	AVFrame *tls_silence_frame;
 	//BIO *bio;
 	SSL_CTX *ssl_ctx;
 	SSL *ssl;
@@ -106,14 +111,24 @@ struct tag_s {
 typedef struct tag_s tag_t;
 
 
+INLINE void str_q_free(str_q *q) {
+	t_queue_clear_full(q, str_free);
+	t_queue_free(q);
+}
+TYPED_GHASHTABLE(metadata_ht, str, str_q, str_hash, str_equal, str_free, str_q_free)
+
+
 struct metafile_s {
 	pthread_mutex_t lock;
 	char *name;
 	char *parent;
 	char *call_id;
+	char *random_tag;
 	char *metadata;
-	char *metadata_db;
+	metadata_ht metadata_parsed;
 	char *output_dest;
+	char *output_path;
+	char *output_pattern;
 	off_t pos;
 	unsigned long long db_id;
 	unsigned int db_streams;
@@ -141,6 +156,9 @@ struct metafile_s {
 
 	unsigned int recording_on:1;
 	unsigned int forwarding_on:1;
+	unsigned int discard:1;
+	unsigned int db_metadata_done:1;
+	unsigned int skip_db:1;
 };
 
 

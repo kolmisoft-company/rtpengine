@@ -6,9 +6,9 @@ use NGCP::Rtpengine::Test;
 use NGCP::Rtpclient::SRTP;
 use NGCP::Rtpengine::AutoTest;
 use Test::More;
-use Test2::Tools::Compare qw(like);
+use Test2::Tools::Compare qw();
 use Socket qw(AF_INET SOCK_STREAM sockaddr_in pack_sockaddr_in inet_aton);
-use JSON;
+use Bencode;
 use Data::Dumper;
 
 $Data::Dumper::Sortkeys = 1;
@@ -63,8 +63,8 @@ autotest_start(qw(--config-file=none -t -1 -i foo/203.0.113.1 -i foo/2001:db8:43
 my $json_exp;
 $NGCP::Rtpengine::req_cb = sub {
 	redis_io("*1\r\n\$4\r\nPING\r\n", "+PONG\r\n", "req PING");
-	redis_i("*3\r\n\$3\r\nSET\r\n\$" . length(cid()) . "\r\n" . cid() . "\r\n\$", "req intro");
-	# dumbly expect 4-digit number
+	redis_i("*5\r\n\$3\r\nSET\r\n\$" . length(cid()) . "\r\n" . cid() . "\r\n\$", "req intro");
+	# dumbly expect 4-digit number as length
 	my $buf;
 	alarm(1);
 	recv($redis_fd, $buf, 6, 0) or die;
@@ -74,12 +74,12 @@ $NGCP::Rtpengine::req_cb = sub {
 	alarm(1);
 	recv($redis_fd, $buf, $len, 0) or die;
 	alarm(0);
-	my $json = decode_json($buf);
+	my $json = Bencode::bdecode($buf, 1);
 	#print Dumper($json);
-	like($json, $json_exp, "JSON");
-	redis_io("\r\n*3\r\n\$6\r\nEXPIRE\r\n\$" . length(cid()) . "\r\n" . cid() . "\r\n\$5\r\n86400\r\n",
-		"+OK\r\n+OK\r\n",
-		"req EXPIRE");
+	Test2::Tools::Compare::like($json, $json_exp, "JSON");
+	redis_io("\r\n\$2\r\nEX\r\n\$5\r\n86400\r\n",
+		"+OK\r\n",
+		"req outro");
 };
 
 
@@ -95,7 +95,7 @@ $json_exp = {
 			 ],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 65536,
 	      'created' => qr/^\d+$/,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -136,13 +136,13 @@ $json_exp = {
 		    '2',
 		    '3'
 		  ],
-  'maps-0' => [
+  'maps-1' => [
 		'0'
 	      ],
-  'maps-1' => [
+  'maps-0' => [
 		'1'
 	      ],
-  'media-0' => {
+  'media-1' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -153,7 +153,7 @@ $json_exp = {
 		 'tag' => '1',
 		 'type' => 'audio'
 	       },
-  'media-1' => {
+  'media-0' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -164,10 +164,10 @@ $json_exp = {
 		 'tag' => '0',
 		 'type' => 'audio'
 	       },
-  'medias-0' => [
+  'medias-1' => [
 		  '1'
 		],
-  'medias-1' => [
+  'medias-0' => [
 		  '0'
 		],
   'payload_types-0' => [
@@ -233,7 +233,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '65536',
 		  'rtcp_sibling' => '1',
 		  'sfd' => '0',
@@ -246,7 +246,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '131072',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
@@ -259,7 +259,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.1:3000',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '68222976',
 		  'rtcp_sibling' => '3',
 		  'sfd' => '2',
@@ -272,8 +272,8 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.1:3001',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
-		  'ps_flags' => '68288513',
+		  'media' => '0',
+		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '3',
 		  'stats-bytes' => '0',
@@ -292,34 +292,36 @@ $json_exp = {
   'stream_sfds-3' => [
 		       '3'
 		     ],
-  'streams-0' => [
+  'streams-1' => [
 		   '0',
 		   '1'
 		 ],
-  'streams-1' => [
+  'streams-0' => [
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [
-			 '1/0/1/0/0'
+  'media-subscriptions-0' => [
+			 '1/1/0/0'
 		       ],
-  'subscriptions-1' => [
-			 '0/0/1/0/0'
+  'media-subscriptions-1' => [
+			 '0/1/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
+	       'desired_family' => 'IP4',
 	       'deleted' => '0',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
+	       'desired_family' => 'IP4',
 	       'deleted' => '0',
-	       'logical_intf' => 'foo'
+	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	     }
 };
 
@@ -345,6 +347,8 @@ a=rtcp:PORT
 SDP
 
 $json_exp = {
+          'tag_aliases-0' => [],
+          'tag_aliases-1' => [],
   'associated_tags-0' => [
 			   '1'
 			 ],
@@ -353,7 +357,7 @@ $json_exp = {
 			 ],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 1376256,
 	      'created' => qr/^\d+$/,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -394,13 +398,13 @@ $json_exp = {
 		    '2',
 		    '3'
 		  ],
-  'maps-0' => [
+  'maps-1' => [
 		'0'
 	      ],
-  'maps-1' => [
+  'maps-0' => [
 		'1'
 	      ],
-  'media-0' => {
+  'media-1' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '8',
 		 'index' => '1',
@@ -411,7 +415,7 @@ $json_exp = {
 		 'tag' => '1',
 		 'type' => 'audio'
 	       },
-  'media-1' => {
+  'media-0' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '8',
 		 'index' => '1',
@@ -422,10 +426,10 @@ $json_exp = {
 		 'tag' => '0',
 		 'type' => 'audio'
 	       },
-  'medias-0' => [
+  'medias-1' => [
 		  '1'
 		],
-  'medias-1' => [
+  'medias-0' => [
 		  '0'
 		],
   'payload_types-0' => [
@@ -489,7 +493,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.4:3000',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '1114112',
 		  'rtcp_sibling' => '1',
 		  'sfd' => '0',
@@ -502,7 +506,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.4:3001',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
@@ -515,7 +519,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.1:3000',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '1114112',
 		  'rtcp_sibling' => '3',
 		  'sfd' => '2',
@@ -528,7 +532,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.1:3001',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '3',
@@ -548,39 +552,306 @@ $json_exp = {
   'stream_sfds-3' => [
 		       '3'
 		     ],
-  'streams-0' => [
+  'streams-1' => [
 		   '0',
 		   '1'
 		 ],
-  'streams-1' => [
+  'streams-0' => [
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [
-			 '1/0/1/0/0'
+  'media-subscriptions-0' => [
+			 '1/1/0/0'
 		       ],
-  'subscriptions-1' => [
-			 '0/0/1/0/0'
+  'media-subscriptions-1' => [
+			 '0/1/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => tt()
 	     }
 };
 
 answer('simple call',
+	{ }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.101.40
+s=tester
+t=0 0
+m=audio 3000 RTP/AVP 8
+c=IN IP4 198.51.100.4
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.101.40
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+my $old_tt = tt();
+new_tt();
+
+$json_exp = {
+          'tag_aliases-0' => [],
+          'tag_aliases-1' => [
+		            $old_tt
+	                 ],
+  'associated_tags-0' => [
+			   '1'
+			 ],
+  'associated_tags-1' => [
+			   '0'
+			 ],
+  'json' => {
+	      'block_dtmf' => '0',
+	      'call_flags' => 1376256,
+	      'created' => qr/^\d+$/,
+	      'created_from' => qr//,
+	      'created_from_addr' => qr//,
+	      'deleted' => '0',
+	      'destroyed' => '0',
+	      'last_signal' => qr/^\d+$/,
+	      'ml_deleted' => '0',
+	      'num_maps' => '2',
+	      'num_medias' => '2',
+	      'num_sfds' => '4',
+	      'num_streams' => '4',
+	      'num_tags' => '2',
+	      'recording_metadata' => '',
+	      'redis_hosted_db' => '2',
+	      'tos' => '0'
+	    },
+  'map-0' => {
+	       'endpoint' => '198.51.100.1:3000',
+	       'intf_preferred_family' => 'IP4',
+	       'logical_intf' => 'foo',
+	       'num_ports' => '2',
+	       'wildcard' => '0'
+	     },
+  'map-1' => {
+	       'endpoint' => '198.51.100.4:3000',
+	       'intf_preferred_family' => 'IP4',
+	       'logical_intf' => 'foo',
+	       'num_ports' => '2',
+	       'wildcard' => '0'
+	     },
+  'map_sfds-0' => [
+		    'loc-0',
+		    '0',
+		    '1'
+		  ],
+  'map_sfds-1' => [
+		    'loc-0',
+		    '2',
+		    '3'
+		  ],
+  'maps-1' => [
+		'0'
+	      ],
+  'maps-0' => [
+		'1'
+	      ],
+  'media-1' => {
+		 'desired_family' => 'IP4',
+		 'format_str' => '8',
+		 'index' => '1',
+		 'logical_intf' => 'foo',
+		 'media_flags' => '2293772',
+		 'protocol' => 'RTP/AVP',
+		 'ptime' => '0',
+		 'tag' => '1',
+		 'type' => 'audio'
+	       },
+  'media-0' => {
+		 'desired_family' => 'IP4',
+		 'format_str' => '8',
+		 'index' => '1',
+		 'logical_intf' => 'foo',
+		 'media_flags' => '65548',
+		 'protocol' => 'RTP/AVP',
+		 'ptime' => '0',
+		 'tag' => '0',
+		 'type' => 'audio'
+	       },
+  'medias-1' => [
+		  '1'
+		],
+  'medias-0' => [
+		  '0'
+		],
+  'payload_types-0' => [
+			 '8/PCMA/8000///0/20'
+		       ],
+  'payload_types-1' => [
+			 '8/PCMA/8000///0/20'
+		       ],
+  'rtcp_sinks-0' => [],
+  'rtcp_sinks-1' => [
+		      '3'
+		    ],
+  'rtcp_sinks-2' => [],
+  'rtcp_sinks-3' => [
+		      '1'
+		    ],
+  'rtp_sinks-0' => [
+		     '2'
+		   ],
+  'rtp_sinks-1' => [],
+  'rtp_sinks-2' => [
+		     '0'
+		   ],
+  'rtp_sinks-3' => [],
+  'sfd-0' => {
+	       'fd' => qr/^\d+$/,
+	       'local_intf_uid' => '0',
+	       'localport' => qr/^\d+$/,
+	       'logical_intf' => 'foo',
+	       'pref_family' => 'IP4',
+	       'stream' => '0'
+	     },
+  'sfd-1' => {
+	       'fd' => qr/^\d+$/,
+	       'local_intf_uid' => '0',
+	       'localport' => qr/^\d+$/,
+	       'logical_intf' => 'foo',
+	       'pref_family' => 'IP4',
+	       'stream' => '1'
+	     },
+  'sfd-2' => {
+	       'fd' => qr/^\d+$/,
+	       'local_intf_uid' => '0',
+	       'localport' => qr/^\d+$/,
+	       'logical_intf' => 'foo',
+	       'pref_family' => 'IP4',
+	       'stream' => '2'
+	     },
+  'sfd-3' => {
+	       'fd' => qr/^\d+$/,
+	       'local_intf_uid' => '0',
+	       'localport' => qr/^\d+$/,
+	       'logical_intf' => 'foo',
+	       'pref_family' => 'IP4',
+	       'stream' => '3'
+	     },
+  'ssrc_table-0' => [],
+  'ssrc_table-1' => [],
+  'stream-0' => {
+		  'advertised_endpoint' => '198.51.100.4:3000',
+		  'component' => '1',
+		  'endpoint' => '198.51.100.4:3000',
+		  'last_packet' => qr/^\d+$/,
+		  'media' => '1',
+		  'ps_flags' => '1114112',
+		  'rtcp_sibling' => '1',
+		  'sfd' => '0',
+		  'stats-bytes' => '0',
+		  'stats-errors' => '0',
+		  'stats-packets' => '0'
+		},
+  'stream-1' => {
+		  'advertised_endpoint' => '198.51.100.4:3001',
+		  'component' => '2',
+		  'endpoint' => '198.51.100.4:3001',
+		  'last_packet' => qr/^\d+$/,
+		  'media' => '1',
+		  'ps_flags' => '1179649',
+		  'rtcp_sibling' => '4294967295',
+		  'sfd' => '1',
+		  'stats-bytes' => '0',
+		  'stats-errors' => '0',
+		  'stats-packets' => '0'
+		},
+  'stream-2' => {
+		  'advertised_endpoint' => '198.51.100.1:3000',
+		  'component' => '1',
+		  'endpoint' => '198.51.100.1:3000',
+		  'last_packet' => qr/^\d+$/,
+		  'media' => '0',
+		  'ps_flags' => '1114112',
+		  'rtcp_sibling' => '3',
+		  'sfd' => '2',
+		  'stats-bytes' => '0',
+		  'stats-errors' => '0',
+		  'stats-packets' => '0'
+		},
+  'stream-3' => {
+		  'advertised_endpoint' => '198.51.100.1:3001',
+		  'component' => '2',
+		  'endpoint' => '198.51.100.1:3001',
+		  'last_packet' => qr/^\d+$/,
+		  'media' => '0',
+		  'ps_flags' => '1179649',
+		  'rtcp_sibling' => '4294967295',
+		  'sfd' => '3',
+		  'stats-bytes' => '0',
+		  'stats-errors' => '0',
+		  'stats-packets' => '0'
+		},
+  'stream_sfds-0' => [
+		       '0'
+		     ],
+  'stream_sfds-1' => [
+		       '1'
+		     ],
+  'stream_sfds-2' => [
+		       '2'
+		     ],
+  'stream_sfds-3' => [
+		       '3'
+		     ],
+  'streams-1' => [
+		   '0',
+		   '1'
+		 ],
+  'streams-0' => [
+		   '2',
+		   '3'
+		 ],
+  'media-subscriptions-0' => [
+			 '1/1/0/0'
+		       ],
+  'media-subscriptions-1' => [
+			 '0/1/0/0'
+		       ],
+  'tag-0' => {
+	       'block_dtmf' => '0',
+	       'created' => qr/^\d+$/,
+	       'deleted' => '0',
+	       'desired_family' => 'IP4',
+	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
+	       'tag' => ft()
+	     },
+  'tag-1' => {
+	       'block_dtmf' => '0',
+	       'created' => qr/^\d+$/,
+	       'deleted' => '0',
+	       'desired_family' => 'IP4',
+	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
+	       'tag' => tt()
+	     }
+};
+
+answer('alias to-tag',
 	{ }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.101.40
@@ -616,7 +887,7 @@ $json_exp = {
 			 ],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 65536,
 	      'created' => qr/^\d+$/,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -657,13 +928,13 @@ $json_exp = {
 		    '2',
 		    '3'
 		  ],
-  'maps-0' => [
+  'maps-1' => [
 		'0'
 	      ],
-  'maps-1' => [
+  'maps-0' => [
 		'1'
 	      ],
-  'media-0' => {
+  'media-1' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -674,7 +945,7 @@ $json_exp = {
 		 'tag' => '1',
 		 'type' => 'audio'
 	       },
-  'media-1' => {
+  'media-0' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -685,10 +956,10 @@ $json_exp = {
 		 'tag' => '0',
 		 'type' => 'audio'
 	       },
-  'medias-0' => [
+  'medias-1' => [
 		  '1'
 		],
-  'medias-1' => [
+  'medias-0' => [
 		  '0'
 		],
   'payload_types-0' => [
@@ -754,7 +1025,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '65536',
 		  'rtcp_sibling' => '1',
 		  'sfd' => '0',
@@ -767,7 +1038,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '131072',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
@@ -780,7 +1051,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.14:6088',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '68222976',
 		  'rtcp_sibling' => '3',
 		  'sfd' => '2',
@@ -793,8 +1064,8 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.14:6089',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
-		  'ps_flags' => '68288513',
+		  'media' => '0',
+		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '3',
 		  'stats-bytes' => '0',
@@ -813,34 +1084,36 @@ $json_exp = {
   'stream_sfds-3' => [
 		       '3'
 		     ],
-  'streams-0' => [
+  'streams-1' => [
 		   '0',
 		   '1'
 		 ],
-  'streams-1' => [
+  'streams-0' => [
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [
-			 '1/0/1/0/0'
+  'media-subscriptions-0' => [
+			 '1/1/0/0'
 		       ],
-  'subscriptions-1' => [
-			 '0/0/1/0/0'
+  'media-subscriptions-1' => [
+			 '0/1/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
-	       'logical_intf' => 'foo'
+	       'desired_family' => 'IP4',
+	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	     }
 };
 
@@ -875,7 +1148,7 @@ $json_exp = {
 			 ],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 1376256,
 	      'created' => qr/^\d+$/,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -916,13 +1189,13 @@ $json_exp = {
 		    '2',
 		    '3'
 		  ],
-  'maps-0' => [
+  'maps-1' => [
 		'0'
 	      ],
-  'maps-1' => [
+  'maps-0' => [
 		'1'
 	      ],
-  'media-0' => {
+  'media-1' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -933,7 +1206,7 @@ $json_exp = {
 		 'tag' => '1',
 		 'type' => 'audio'
 	       },
-  'media-1' => {
+  'media-0' => {
 		 'desired_family' => 'IP4',
 		 'format_str' => '0 8',
 		 'index' => '1',
@@ -944,10 +1217,10 @@ $json_exp = {
 		 'tag' => '0',
 		 'type' => 'audio'
 	       },
-  'medias-0' => [
+  'medias-1' => [
 		  '1'
 		],
-  'medias-1' => [
+  'medias-0' => [
 		  '0'
 		],
   'payload_types-0' => [
@@ -1013,7 +1286,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.14:6090',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '1114112',
 		  'rtcp_sibling' => '1',
 		  'sfd' => '0',
@@ -1026,7 +1299,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.14:6091',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '0',
+		  'media' => '1',
 		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
@@ -1039,7 +1312,7 @@ $json_exp = {
 		  'component' => '1',
 		  'endpoint' => '198.51.100.14:6088',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '1114112',
 		  'rtcp_sibling' => '3',
 		  'sfd' => '2',
@@ -1052,7 +1325,7 @@ $json_exp = {
 		  'component' => '2',
 		  'endpoint' => '198.51.100.14:6089',
 		  'last_packet' => qr/^\d+$/,
-		  'media' => '1',
+		  'media' => '0',
 		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '3',
@@ -1072,34 +1345,36 @@ $json_exp = {
   'stream_sfds-3' => [
 		       '3'
 		     ],
-  'streams-0' => [
+  'streams-1' => [
 		   '0',
 		   '1'
 		 ],
-  'streams-1' => [
+  'streams-0' => [
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [
-			 '1/0/1/0/0'
+  'media-subscriptions-0' => [
+			 '1/1/0/0'
 		       ],
-  'subscriptions-1' => [
-			 '0/0/1/0/0'
+  'media-subscriptions-1' => [
+			 '0/1/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr/^\d+$/,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => tt()
 	     }
 };
@@ -1136,7 +1411,7 @@ $json_exp = {
           'associated_tags-2' => [],
           'json' => {
                       'block_dtmf' => '0',
-                      'block_media' => '0',
+		      'call_flags' => 1376256,
                       'created' => qr/^\d+$/,
                       'created_from' => qr//,
                       'created_from_addr' => qr//,
@@ -1201,10 +1476,10 @@ $json_exp = {
                             '6',
                             '7'
                           ],
-          'maps-0' => [
+          'maps-1' => [
                         '0'
                       ],
-          'maps-1' => [
+          'maps-0' => [
                         '1'
                       ],
           'maps-2' => [
@@ -1213,7 +1488,7 @@ $json_exp = {
           'maps-3' => [
                         '3'
                       ],
-          'media-0' => {
+          'media-1' => {
                          'desired_family' => 'IP4',
                          'format_str' => '0 8',
                          'index' => '1',
@@ -1224,7 +1499,7 @@ $json_exp = {
                          'tag' => '1',
                          'type' => 'audio'
                        },
-          'media-1' => {
+          'media-0' => {
                          'desired_family' => 'IP4',
                          'format_str' => '0 8',
                          'index' => '1',
@@ -1240,7 +1515,7 @@ $json_exp = {
                          'format_str' => '0 8',
                          'index' => '1',
                          'logical_intf' => 'foo',
-                         'media_flags' => '4',
+                         'media_flags' => '2097156',
                          'protocol' => 'RTP/AVP',
                          'ptime' => '0',
                          'tag' => '2',
@@ -1251,16 +1526,16 @@ $json_exp = {
                          'format_str' => '0 8',
                          'index' => '2',
                          'logical_intf' => 'foo',
-                         'media_flags' => '4',
+                         'media_flags' => '2097156',
                          'protocol' => 'RTP/AVP',
                          'ptime' => '0',
                          'tag' => '2',
                          'type' => 'audio'
                        },
-          'medias-0' => [
+          'medias-1' => [
                           '1'
                         ],
-          'medias-1' => [
+          'medias-0' => [
                           '0'
                         ],
           'medias-2' => [
@@ -1383,7 +1658,7 @@ $json_exp = {
                           'component' => '1',
                           'endpoint' => '198.51.100.14:6090',
                           'last_packet' => qr/^\d+$/,
-                          'media' => '0',
+                          'media' => '1',
                           'ps_flags' => '1114112',
                           'rtcp_sibling' => '1',
                           'sfd' => '0',
@@ -1396,8 +1671,8 @@ $json_exp = {
                           'component' => '2',
                           'endpoint' => '198.51.100.14:6091',
                           'last_packet' => qr/^\d+$/,
-                          'media' => '0',
-                          'ps_flags' => '68288513',
+                          'media' => '1',
+                          'ps_flags' => '1179649',
                           'rtcp_sibling' => '4294967295',
                           'sfd' => '1',
                           'stats-bytes' => '0',
@@ -1409,7 +1684,7 @@ $json_exp = {
                           'component' => '1',
                           'endpoint' => '198.51.100.14:6088',
                           'last_packet' => qr/^\d+$/,
-                          'media' => '1',
+                          'media' => '0',
                           'ps_flags' => '1114112',
                           'rtcp_sibling' => '3',
                           'sfd' => '2',
@@ -1422,8 +1697,8 @@ $json_exp = {
                           'component' => '2',
                           'endpoint' => '198.51.100.14:6089',
                           'last_packet' => qr/^\d+$/,
-                          'media' => '1',
-                          'ps_flags' => '68288513',
+                          'media' => '0',
+                          'ps_flags' => '1179649',
                           'rtcp_sibling' => '4294967295',
                           'sfd' => '3',
                           'stats-bytes' => '0',
@@ -1506,11 +1781,11 @@ $json_exp = {
           'stream_sfds-7' => [
                                '7'
                              ],
-          'streams-0' => [
+          'streams-1' => [
                            '0',
                            '1'
                          ],
-          'streams-1' => [
+          'streams-0' => [
                            '2',
                            '3'
                          ],
@@ -1522,38 +1797,40 @@ $json_exp = {
                            '6',
                            '7'
                          ],
-          'subscriptions-0' => [
-                                 '1/0/1/0/0'
+          'media-subscriptions-0' => [
+                                 '1/1/0/0'
                                ],
-          'subscriptions-1' => [
-                                 '0/0/1/0/0'
+          'media-subscriptions-1' => [
+                                 '0/1/0/0'
                                ],
-          'subscriptions-2' => [
-                                 '0/0/0/0/0',
-                                 '1/1/0/0/0'
+          'media-subscriptions-2' => [
+                                 '0/0/0/0'
                                ],
           'tag-0' => {
                        'block_dtmf' => '0',
-                       'block_media' => '0',
                        'created' => qr/^\d+$/,
                        'deleted' => '0',
+		       'desired_family' => 'IP4',
                        'logical_intf' => 'foo',
+		       'ml_flags' => 0,
                        'tag' => ft()
                      },
           'tag-1' => {
                        'block_dtmf' => '0',
-                       'block_media' => '0',
                        'created' => qr/^\d+$/,
                        'deleted' => '0',
+		       'desired_family' => 'IP4',
                        'logical_intf' => 'foo',
+		       'ml_flags' => 0,
                        'tag' => tt()
                      },
           'tag-2' => {
                        'block_dtmf' => '0',
-                       'block_media' => '0',
                        'created' => qr/^\d+$/,
                        'deleted' => '0',
+		       'desired_family' => 'IP4',
                        'logical_intf' => 'foo',
+		       'ml_flags' => 0,
                        'tag' => qr//
                      }
         };
@@ -1561,8 +1838,8 @@ $json_exp = {
 my ($ftr, $ttr, $fts) = subscribe_request('sub to multiple tags',
 	{ 'from-tags' => [ft(), tt()] }, <<SDP);
 v=0
-o=- SDP_VERSION IN IP4 203.0.113.1
-s=RTPE_VERSION
+o=- SDP_VERSION IN IP4 198.51.100.1
+s=tester
 t=0 0
 m=audio PORT RTP/AVP 0 8
 c=IN IP4 203.0.113.1
@@ -1579,12 +1856,12 @@ a=rtcp:PORT
 SDP
 
 
-$json_exp->{'media-0'}{media_flags} = '10682380';
-$json_exp->{'media-1'}{media_flags} = '8454156';
+$json_exp->{'media-1'}{media_flags} = '2293772';
+$json_exp->{'media-0'}{media_flags} = '65548';
 $json_exp->{'media-2'}{format_str} = '8';
-$json_exp->{'media-2'}{media_flags} = '65540';
+$json_exp->{'media-2'}{media_flags} = '2162692';
 $json_exp->{'media-3'}{format_str} = '8';
-$json_exp->{'media-3'}{media_flags} = '65540';
+$json_exp->{'media-3'}{media_flags} = '2162692';
 $json_exp->{'payload_types-2'}[0] = '8/PCMA/8000///0/20';
 $#{$json_exp->{'payload_types-2'}} = 0;
 $json_exp->{'payload_types-3'}[0] = '8/PCMA/8000///0/20';
@@ -1622,14 +1899,13 @@ SDP
 
 
 
-
 new_call;
 
 $json_exp = {
   'associated_tags-0' => [],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 0,
 	      'created' => qr//,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -1735,13 +2011,14 @@ $json_exp = {
 		   '0',
 		   '1'
 		 ],
-  'subscriptions-0' => [],
+  'media-subscriptions-0' => [],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     }
 };
@@ -1772,7 +2049,7 @@ $json_exp = {
   'associated_tags-1' => [],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 0,
 	      'created' => qr//,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -1835,7 +2112,7 @@ $json_exp = {
 		 'format_str' => '0 8 9',
 		 'index' => '1',
 		 'logical_intf' => 'foo',
-		 'media_flags' => '4',
+		 'media_flags' => '2097156',
 		 'protocol' => 'RTP/AVP',
 		 'ptime' => '0',
 		 'tag' => '1',
@@ -1918,7 +2195,7 @@ $json_exp = {
 		  'endpoint' => '198.51.100.14:6043',
 		  'last_packet' => qr//,
 		  'media' => '0',
-		  'ps_flags' => '68288513',
+		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
 		  'stats-bytes' => '0',
@@ -1971,24 +2248,26 @@ $json_exp = {
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [],
-  'subscriptions-1' => [
-			 '0/0/0/0/0'
+  'media-subscriptions-0' => [],
+  'media-subscriptions-1' => [
+			 '0/0/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => qr//,
 	     }
 };
@@ -2011,7 +2290,7 @@ $json_exp = {
   'associated_tags-1' => [],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 0,
 	      'created' => qr//,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -2074,7 +2353,7 @@ $json_exp = {
 		 'format_str' => '0',
 		 'index' => '1',
 		 'logical_intf' => 'foo',
-		 'media_flags' => '65540',
+		 'media_flags' => '2162692',
 		 'protocol' => 'RTP/AVP',
 		 'ptime' => '0',
 		 'tag' => '1',
@@ -2210,24 +2489,26 @@ $json_exp = {
 		   '2',
 		   '3'
 		 ],
-  'subscriptions-0' => [],
-  'subscriptions-1' => [
-			 '0/0/0/0/0'
+  'media-subscriptions-0' => [],
+  'media-subscriptions-1' => [
+			 '0/0/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => qr//,
 	     }
 };
@@ -2249,7 +2530,7 @@ $json_exp = {
   'associated_tags-2' => [],
   'json' => {
 	      'block_dtmf' => '0',
-	      'block_media' => '0',
+	      'call_flags' => 0,
 	      'created' => qr//,
 	      'created_from' => qr//,
 	      'created_from_addr' => qr//,
@@ -2327,7 +2608,7 @@ $json_exp = {
 		 'format_str' => '0',
 		 'index' => '1',
 		 'logical_intf' => 'foo',
-		 'media_flags' => '65540',
+		 'media_flags' => '2162692',
 		 'protocol' => 'RTP/AVP',
 		 'ptime' => '0',
 		 'tag' => '1',
@@ -2338,7 +2619,7 @@ $json_exp = {
 		 'format_str' => '0 8 9',
 		 'index' => '1',
 		 'logical_intf' => 'foo',
-		 'media_flags' => '4',
+		 'media_flags' => '2097156',
 		 'protocol' => 'RTP/AVP',
 		 'ptime' => '0',
 		 'tag' => '2',
@@ -2450,7 +2731,7 @@ $json_exp = {
 		  'endpoint' => '198.51.100.14:6043',
 		  'last_packet' => qr//,
 		  'media' => '0',
-		  'ps_flags' => '68288513',
+		  'ps_flags' => '1179649',
 		  'rtcp_sibling' => '4294967295',
 		  'sfd' => '1',
 		  'stats-bytes' => '0',
@@ -2539,35 +2820,38 @@ $json_exp = {
 		   '4',
 		   '5'
 		 ],
-  'subscriptions-0' => [],
-  'subscriptions-1' => [
-			 '0/0/0/0/0'
+  'media-subscriptions-0' => [],
+  'media-subscriptions-1' => [
+			 '0/0/0/0'
 		       ],
-  'subscriptions-2' => [
-			 '0/0/0/0/0'
+  'media-subscriptions-2' => [
+			 '0/0/0/0'
 		       ],
   'tag-0' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => ft()
 	     },
   'tag-1' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => qr//,
 	     },
   'tag-2' => {
 	       'block_dtmf' => '0',
-	       'block_media' => '0',
 	       'created' => qr//,
 	       'deleted' => '0',
+	       'desired_family' => 'IP4',
 	       'logical_intf' => 'foo',
+	       'ml_flags' => 0,
 	       'tag' => qr//,
 	     }
 };
@@ -2586,7 +2870,7 @@ a=rtcp:PORT
 SDP
 
 $json_exp->{'media-2'}{format_str} = '0';
-$json_exp->{'media-2'}{media_flags} = '65540';
+$json_exp->{'media-2'}{media_flags} = '2162692';
 $json_exp->{'stream-1'}{ps_flags}  = '1179649';
 $json_exp->{'stream-4'}{advertised_endpoint} = '198.51.100.14:6046';
 $json_exp->{'stream-4'}{endpoint}  = '198.51.100.14:6046';

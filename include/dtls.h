@@ -1,8 +1,6 @@
 #ifndef _DTLS_H_
 #define _DTLS_H_
 
-
-
 #include <time.h>
 #include <openssl/x509.h>
 #include <openssl/ssl.h>
@@ -12,21 +10,13 @@
 #include "str.h"
 #include "obj.h"
 #include "socket.h"
-
-
-
+#include "types.h"
 
 #define DTLS_MAX_DIGEST_LEN 64
-
-
-
+#define DTLS_MTU_OVERHEAD 48 // 40 bytes IPv6 + 8 bytes UDP
 
 struct packet_stream;
 struct sockaddr_in6;
-struct poller;
-struct stream_fd;
-
-
 
 struct dtls_hash_func {
 	const char *name;
@@ -63,7 +53,7 @@ struct dtls_connection {
 
 
 int dtls_init(void);
-void dtls_timer(struct poller *);
+void dtls_timer(void);
 
 int dtls_verify_cert(struct packet_stream *ps);
 const struct dtls_hash_func *dtls_find_hash_func(const str *);
@@ -71,7 +61,7 @@ struct dtls_cert *dtls_cert(void);
 void dtls_cert_free(void);
 
 int dtls_connection_init(struct dtls_connection *, struct packet_stream *, int active, struct dtls_cert *cert);
-int dtls(struct stream_fd *, const str *s, const endpoint_t *sin);
+int dtls(stream_fd *, const str *s, const endpoint_t *sin);
 void dtls_connection_cleanup(struct dtls_connection *);
 void dtls_shutdown(struct packet_stream *ps);
 
@@ -117,7 +107,7 @@ INLINE int dtls_is_active(const struct dtls_connection *d) {
 }
 
 
-struct dtls_connection *dtls_ptr(struct stream_fd *sfd);
+struct dtls_connection *dtls_ptr(stream_fd *sfd);
 
 
 

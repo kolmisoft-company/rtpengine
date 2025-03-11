@@ -1,6 +1,9 @@
 #include "timerthread.h"
-#include "aux.h"
+
+#include "helpers.h"
 #include "log_funcs.h"
+#include "poller.h"
+#include "main.h"
 
 
 static int tt_obj_cmp(const void *a, const void *b) {
@@ -8,11 +11,21 @@ static int tt_obj_cmp(const void *a, const void *b) {
 	return timeval_cmp_ptr(&A->next_check, &B->next_check);
 }
 
-void timerthread_init(struct timerthread *tt, void (*func)(void *)) {
+static void timerthread_thread_init(struct timerthread_thread *tt, struct timerthread *parent) {
 	tt->tree = g_tree_new(tt_obj_cmp);
 	mutex_init(&tt->lock);
 	cond_init(&tt->cond);
+	tt->parent = parent;
+	ZERO(tt->next_wake);
+	tt->obj = NULL;
+}
+
+void timerthread_init(struct timerthread *tt, unsigned int num, void (*func)(void *)) {
 	tt->func = func;
+	tt->num_threads = num;
+	tt->threads = g_malloc(sizeof(*tt->threads) * num);
+	for (unsigned int i = 0; i < num; i++)
+		timerthread_thread_init(&tt->threads[i], tt);
 }
 
 static int __tt_put_all(void *k, void *d, void *p) {
@@ -22,56 +35,80 @@ static int __tt_put_all(void *k, void *d, void *p) {
 	return FALSE;
 }
 
-void timerthread_free(struct timerthread *tt) {
+static void timerthread_thread_destroy(struct timerthread_thread *tt) {
 	g_tree_foreach(tt->tree, __tt_put_all, tt);
 	g_tree_destroy(tt->tree);
+	if (tt->obj)
+		obj_put(tt->obj);
 	mutex_destroy(&tt->lock);
 }
 
-void timerthread_run(void *p) {
-	struct timerthread *tt = p;
+void timerthread_free(struct timerthread *tt) {
+	for (unsigned int i = 0; i < tt->num_threads; i++)
+		timerthread_thread_destroy(&tt->threads[i]);
+	g_free(tt->threads);
+}
+
+static void timerthread_run(void *p) {
+	struct timerthread_thread *tt = p;
+	struct timerthread *parent = tt->parent;
 
 	struct thread_waker waker = { .lock = &tt->lock, .cond = &tt->cond };
 	thread_waker_add(&waker);
+
+	long long accuracy = rtpe_config.timer_accuracy;
 
 	mutex_lock(&tt->lock);
 
 	while (!rtpe_shutdown) {
 		gettimeofday(&rtpe_now, NULL);
 
-		/* lock our list and get the first element */
-		struct timerthread_obj *tt_obj = g_tree_find_first(tt->tree, NULL, NULL);
-		/* scheduled to run? if not, we just go to sleep, otherwise we remove it from the tree,
-		 * steal the reference and run it */
 		long long sleeptime = 10000000;
-		if (!tt_obj)
-			goto sleep;
-		sleeptime = timeval_diff(&tt_obj->next_check, &rtpe_now);
-		if (sleeptime > 0)
-			goto sleep;
+		// find the first element if we haven't determined it yet
+		struct timerthread_obj *tt_obj = tt->obj;
+		if (!tt_obj) {
+			tt_obj = g_tree_find_first(tt->tree, NULL, NULL);
+			if (!tt_obj)
+				goto sleep_now;
 
-		// steal reference
-		g_tree_remove(tt->tree, tt_obj);
+			// immediately steal reference
+			// XXX ideally we would have a tree_steal_first() function
+			g_tree_remove(tt->tree, tt_obj);
+		}
+
+		// scheduled to run? if not, then we remember this object/reference and go to sleep
+		sleeptime = timeval_diff(&tt_obj->next_check, &rtpe_now);
+
+		if (sleeptime > accuracy) {
+			tt->obj = tt_obj;
+			goto sleep;
+		}
+
 		// pretend we're running exactly at the scheduled time
 		rtpe_now = tt_obj->next_check;
 		ZERO(tt_obj->next_check);
 		tt_obj->last_run = rtpe_now;
+		ZERO(tt->next_wake);
+		tt->obj = NULL;
 		mutex_unlock(&tt->lock);
 
 		// run and release
-		tt->func(tt_obj);
+		parent->func(tt_obj);
 		obj_put(tt_obj);
 
 		log_info_reset();
+		uring_thread_loop();
 
 		mutex_lock(&tt->lock);
 		continue;
 
-sleep:;
+sleep:
 		/* figure out how long we should sleep */
-		sleeptime = MIN(10000000, sleeptime); /* 100 ms at the most */
+		sleeptime = MIN(10000000, sleeptime);
+sleep_now:;
 		struct timeval tv = rtpe_now;
 		timeval_add_usec(&tv, sleeptime);
+		tt->next_wake = tv;
 		cond_timedwait(&tt->cond, &tt->lock, &tv);
 	}
 
@@ -79,32 +116,58 @@ sleep:;
 	thread_waker_del(&waker);
 }
 
+void timerthread_launch(struct timerthread *tt, const char *scheduler, int prio, const char *name) {
+	for (unsigned int i = 0; i < tt->num_threads; i++)
+		thread_create_detach_prio(timerthread_run, &tt->threads[i], scheduler, prio, name);
+}
+
 void timerthread_obj_schedule_abs_nl(struct timerthread_obj *tt_obj, const struct timeval *tv) {
 	if (!tt_obj)
 		return;
+	struct timerthread_thread *tt = tt_obj->thread;
 
 	//ilog(LOG_DEBUG, "scheduling timer object at %llu.%06lu", (unsigned long long) tv->tv_sec,
 			//(unsigned long) tv->tv_usec);
 
-	struct timerthread *tt = tt_obj->tt;
 	if (tt_obj->next_check.tv_sec && timeval_cmp(&tt_obj->next_check, tv) <= 0)
 		return; /* already scheduled sooner */
-	if (!g_tree_remove(tt->tree, tt_obj))
-		obj_hold(tt_obj); /* if it wasn't removed, we make a new reference */
+	if (!g_tree_remove(tt->tree, tt_obj)) {
+		if (tt->obj == tt_obj)
+			tt->obj = NULL;
+		else
+			obj_hold(tt_obj); /* if it wasn't removed, we make a new reference */
+	}
 	tt_obj->next_check = *tv;
 	g_tree_insert(tt->tree, tt_obj, tt_obj);
-	cond_signal(&tt->cond);
+	// need to wake the thread?
+	if (tt->next_wake.tv_sec && timeval_cmp(tv, &tt->next_wake) < 0) {
+		// make sure we can get picked first: move pre-picked object back into tree
+		if (tt->obj && tt->obj != tt_obj) {
+			g_tree_insert(tt->tree, tt->obj, tt->obj);
+			tt->obj = NULL;
+		}
+		cond_signal(&tt->cond);
+	}
 }
 
 void timerthread_obj_deschedule(struct timerthread_obj *tt_obj) {
 	if (!tt_obj)
 		return;
 
-	struct timerthread *tt = tt_obj->tt;
+	struct timerthread_thread *tt = tt_obj->thread;
+	if (!tt)
+		return;
+
 	mutex_lock(&tt->lock);
 	if (!tt_obj->next_check.tv_sec)
 		goto nope; /* already descheduled */
-	int ret = g_tree_remove(tt->tree, tt_obj);
+	gboolean ret = g_tree_remove(tt->tree, tt_obj);
+	if (!ret) {
+		if (tt->obj == tt_obj) {
+			tt->obj = NULL;
+			ret = TRUE;
+		}
+	}
 	ZERO(tt_obj->next_check);
 	if (ret)
 		obj_put(tt_obj);
@@ -194,7 +257,7 @@ void *timerthread_queue_new(const char *type, size_t size,
 		void (*free_func)(void *),
 		void (*entry_free_func)(void *))
 {
-	struct timerthread_queue *ttq = obj_alloc0(type, size, __timerthread_queue_free);
+	struct timerthread_queue *ttq = obj_alloc0_gen(type, size, __timerthread_queue_free);
 	ttq->type = type;
 	ttq->tt_obj.tt = tt;
 	assert(tt->func == timerthread_queue_run);

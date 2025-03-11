@@ -10,12 +10,11 @@
 
 #include "compat.h"
 #include "str.h"
-#include "aux.h"
+#include "helpers.h"
 #include "log.h"
 #include "ice.h"
 #include "ssllib.h"
-
-
+#include "uring.h"
 
 #define STUN_CRC_XOR 0x5354554eUL
 
@@ -206,18 +205,18 @@ static int stun_attributes(struct stun_attrs *out, str *s, uint16_t *unknowns, s
 				out->mapped.port = ntohs(*((uint16_t *) (&attr.s[2]))) ^ (STUN_COOKIE >> 16);
 				if (attr.len == 8 && ntohs(*((uint16_t *) attr.s)) == 1) {
 					out->mapped.address.family = get_socket_family_enum(SF_IP4);
-					out->mapped.address.u.ipv4.s_addr =
+					out->mapped.address.ipv4.s_addr =
 							ntohl(*((uint32_t *) (&attr.s[4]))) ^ STUN_COOKIE;
 				}
 				else if (attr.len == 20 && ntohs(*((uint16_t *) attr.s)) == 1) {
 					out->mapped.address.family = get_socket_family_enum(SF_IP6);
-					out->mapped.address.u.ipv6.s6_addr32[0]
+					out->mapped.address.ipv6.s6_addr32[0]
 						= *((uint32_t *) (&attr.s[4])) ^ htonl(STUN_COOKIE);
-					out->mapped.address.u.ipv6.s6_addr32[1]
+					out->mapped.address.ipv6.s6_addr32[1]
 						= *((uint32_t *) (&attr.s[8])) ^ req->transaction[0];
-					out->mapped.address.u.ipv6.s6_addr32[2]
+					out->mapped.address.ipv6.s6_addr32[2]
 						= *((uint32_t *) (&attr.s[12])) ^ req->transaction[1];
-					out->mapped.address.u.ipv6.s6_addr32[3]
+					out->mapped.address.ipv6.s6_addr32[3]
 						= *((uint32_t *) (&attr.s[16])) ^ req->transaction[2];
 				}
 				break;
@@ -395,7 +394,7 @@ static void integrity(struct msghdr *mh, struct msg_integrity *mi, str *pwd) {
 	hdr->msg_len = ntohs(hdr->msg_len);
 }
 
-static void stun_error_len(struct stream_fd *sfd, const endpoint_t *sin,
+static void stun_error_len(stream_fd *sfd, const endpoint_t *sin,
 		struct header *req,
 		int code, char *reason, int len, uint16_t add_attr, void *attr_cont,
 		int attr_len)
@@ -417,7 +416,7 @@ static void stun_error_len(struct stream_fd *sfd, const endpoint_t *sin,
 	if (attr_cont)
 		output_add_data_wr(&mh, &aa, add_attr, attr_cont, attr_len);
 
-	integrity(&mh, &mi, &sfd->stream->media->ice_agent->pwd[0]);
+	integrity(&mh, &mi, &sfd->stream->media->ice_agent->pwd[1]);
 	fingerprint(&mh, &fp);
 
 	output_finish_src(&mh);
@@ -488,8 +487,7 @@ static int check_auth(const str *msg, struct stun_attrs *attrs, struct call_medi
 	return memcmp(digest, attrs->msg_integrity.s, 20) ? -1 : 0;
 }
 
-/* XXX way too many parameters being passed around here, unify into a struct */
-static int stun_binding_success(struct stream_fd *sfd, struct header *req, struct stun_attrs *attrs,
+static int stun_binding_success(stream_fd *sfd, struct header *req, struct stun_attrs *attrs,
 		const endpoint_t *sin)
 {
 	struct header hdr;
@@ -506,15 +504,15 @@ static int stun_binding_success(struct stream_fd *sfd, struct header *req, struc
 	xma.port = htons(sin->port ^ (STUN_COOKIE >> 16));
 	if (sin->address.family->af == AF_INET) {
 		xma.family = htons(0x01);
-		xma.address[0] = sin->address.u.ipv4.s_addr ^ htonl(STUN_COOKIE);
+		xma.address[0] = sin->address.ipv4.s_addr ^ htonl(STUN_COOKIE);
 		output_add_len(&mh, &xma, STUN_XOR_MAPPED_ADDRESS, 8);
 	}
 	else {
 		xma.family = htons(0x02);
-		xma.address[0] = sin->address.u.ipv6.s6_addr32[0] ^ htonl(STUN_COOKIE);
-		xma.address[1] = sin->address.u.ipv6.s6_addr32[1] ^ req->transaction[0];
-		xma.address[2] = sin->address.u.ipv6.s6_addr32[2] ^ req->transaction[1];
-		xma.address[3] = sin->address.u.ipv6.s6_addr32[3] ^ req->transaction[2];
+		xma.address[0] = sin->address.ipv6.s6_addr32[0] ^ htonl(STUN_COOKIE);
+		xma.address[1] = sin->address.ipv6.s6_addr32[1] ^ req->transaction[0];
+		xma.address[2] = sin->address.ipv6.s6_addr32[2] ^ req->transaction[1];
+		xma.address[3] = sin->address.ipv6.s6_addr32[3] ^ req->transaction[2];
 		output_add(&mh, &xma, STUN_XOR_MAPPED_ADDRESS);
 	}
 
@@ -538,7 +536,7 @@ INLINE int uint16_t_arr_len(uint16_t *arr) {
 
 #define SLF " from %s%s%s"
 #define SLP FMT_M(endpoint_print_buf(sin))
-static int __stun_request(struct stream_fd *sfd, const endpoint_t *sin,
+static int __stun_request(stream_fd *sfd, const endpoint_t *sin,
 		struct header *req, struct stun_attrs *attrs)
 {
 	int ret;
@@ -558,12 +556,12 @@ static int __stun_request(struct stream_fd *sfd, const endpoint_t *sin,
 
 	return ret;
 }
-static int __stun_success(struct stream_fd *sfd, const endpoint_t *sin,
+static int __stun_success(stream_fd *sfd, const endpoint_t *sin,
 		struct header *req, struct stun_attrs *attrs)
 {
 	return ice_response(sfd, sin, attrs, req->transaction);
 }
-static int __stun_error(struct stream_fd *sfd, const endpoint_t *sin,
+static int __stun_error(stream_fd *sfd, const endpoint_t *sin,
 		struct header *req, struct stun_attrs *attrs)
 {
 	return ice_response(sfd, sin, attrs, req->transaction);
@@ -577,7 +575,7 @@ static int __stun_error(struct stream_fd *sfd, const endpoint_t *sin,
  *
  * call is locked in R
  */
-int stun(const str *b, struct stream_fd *sfd, const endpoint_t *sin) {
+int stun(const str *b, stream_fd *sfd, const endpoint_t *sin) {
 	struct header *req = (void *) b->s;
 	int msglen, method, class;
 	str attr_str;
@@ -601,8 +599,7 @@ int stun(const str *b, struct stream_fd *sfd, const endpoint_t *sin) {
 	if (class == STUN_CLASS_INDICATION)
 		return 0;
 
-	attr_str.s = &b->s[20];
-	attr_str.len = b->len - 20;
+	attr_str = STR_LEN(&b->s[20], b->len - 20);
 	if (stun_attributes(&attrs, &attr_str, unknowns, req)) {
 		err = "failed to parse attributes";
 		if (unknowns[0] == 0xffff)
@@ -667,15 +664,12 @@ ignore:
 	return -1;
 }
 
-int stun_binding_request(const endpoint_t *dst, uint32_t transaction[3], str *pwd,
-		str ufrags[2], int controlling, uint64_t tiebreaker, uint32_t priority,
-		socket_t *sock, int to_use)
-{
+struct async_stun_req {
+	struct uring_req req; // must be first
 	struct header hdr;
 	struct msghdr mh;
 	struct iovec iov[10]; /* hdr, username x2, ice_controlled/ing, priority, uc, fp, mi, sw x2 */
 	char username_buf[256];
-	int i;
 	struct generic un_attr;
 	struct controlled_ing cc;
 	struct priority prio;
@@ -683,30 +677,39 @@ int stun_binding_request(const endpoint_t *dst, uint32_t transaction[3], str *pw
 	struct fingerprint fp;
 	struct msg_integrity mi;
 	struct software sw;
+	struct sockaddr_storage sin;
+};
 
-	output_init(&mh, iov, &hdr, STUN_BINDING_REQUEST, transaction);
-	software(&mh, &sw);
+int stun_binding_request(const endpoint_t *dst, uint32_t transaction[3], str *pwd,
+		str ufrags[2], int controlling, uint64_t tiebreaker, uint32_t priority,
+		socket_t *sock, int to_use)
+{
+	struct async_stun_req *r = uring_alloc_buffer_req(sizeof(*r));
+	int i;
 
-	i = snprintf(username_buf, sizeof(username_buf), STR_FORMAT":"STR_FORMAT,
+	output_init(&r->mh, r->iov, &r->hdr, STUN_BINDING_REQUEST, transaction);
+	software(&r->mh, &r->sw);
+
+	i = snprintf(r->username_buf, sizeof(r->username_buf), STR_FORMAT":"STR_FORMAT,
 			STR_FMT(&ufrags[0]), STR_FMT(&ufrags[1]));
-	if (i <= 0 || i >= sizeof(username_buf))
+	if (i <= 0 || i >= sizeof(r->username_buf))
 		return -1;
-	output_add_data_wr(&mh, &un_attr, STUN_USERNAME, username_buf, i);
+	output_add_data_wr(&r->mh, &r->un_attr, STUN_USERNAME, r->username_buf, i);
 
-	cc.tiebreaker = htobe64(tiebreaker);
-	output_add(&mh, &cc, controlling ? STUN_ICE_CONTROLLING : STUN_ICE_CONTROLLED);
+	r->cc.tiebreaker = htobe64(tiebreaker);
+	output_add(&r->mh, &r->cc, controlling ? STUN_ICE_CONTROLLING : STUN_ICE_CONTROLLED);
 
-	prio.priority = htonl(priority);
-	output_add(&mh, &prio, STUN_PRIORITY);
+	r->prio.priority = htonl(priority);
+	output_add(&r->mh, &r->prio, STUN_PRIORITY);
 
 	if (to_use)
-		output_add(&mh, &uc, STUN_USE_CANDIDATE);
+		output_add(&r->mh, &r->uc, STUN_USE_CANDIDATE);
 
-	integrity(&mh, &mi, pwd);
-	fingerprint(&mh, &fp);
+	integrity(&r->mh, &r->mi, pwd);
+	fingerprint(&r->mh, &r->fp);
 
-	output_finish_src(&mh);
-	socket_sendmsg(sock, &mh, dst);
+	output_finish_src(&r->mh);
+	uring_sendmsg(sock, &r->mh, dst, &r->sin, &r->req);
 
 	return 0;
 }

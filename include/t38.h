@@ -1,7 +1,6 @@
 #ifndef _T38_H_
 #define _T38_H_
 
-
 struct t38_gateway;
 
 struct t38_options {
@@ -25,11 +24,7 @@ struct t38_options {
 	unsigned int no_iaf:1;
 };
 
-
-
 #ifdef WITH_TRANSCODING
-
-
 
 #include <inttypes.h>
 #include <sys/types.h>
@@ -40,23 +35,21 @@ struct t38_options {
 #include <spandsp/t38_gateway.h>
 
 #include "rtplib.h"
-#include "aux.h"
+#include "helpers.h"
 #include "obj.h"
 #include "codeclib.h"
-
-
+#include "types.h"
 
 struct call_media;
 struct media_packet;
 struct media_player;
-
 
 struct t38_gateway {
 	struct obj obj; // use refcount as this struct is shared between two medias
 	mutex_t lock;
 	struct call_media *t38_media;
 	struct call_media *pcm_media;
-	struct rtp_payload_type pcm_pt; // PCM input for spandsp
+	rtp_payload_type pcm_pt; // PCM input for spandsp
 	t38_gateway_state_t *gw;
 
 	struct t38_options options;
@@ -73,12 +66,10 @@ struct t38_gateway {
 	unsigned long long pts;
 };
 
-
-
 void t38_init(void);
 
 int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media, const struct t38_options *);
-void t38_gateway_start(struct t38_gateway *);
+void t38_gateway_start(struct t38_gateway *, str_case_value_ht codec_set);
 int t38_gateway_input_samples(struct t38_gateway *, int16_t amp[], int len);
 int t38_gateway_input_udptl(struct t38_gateway *, const str *);
 void t38_gateway_stop(struct t38_gateway *);
@@ -91,17 +82,15 @@ INLINE void t38_gateway_put(struct t38_gateway **tp) {
 	*tp = NULL;
 }
 
-
 #else
 
 #include "compat.h"
 
 // stubs
 INLINE void t38_init(void) { }
-INLINE void t38_gateway_start(struct t38_gateway *tg) { }
+INLINE void t38_gateway_start(struct t38_gateway *tg, str_case_value_ht codec_set) { }
 INLINE void t38_gateway_stop(struct t38_gateway *tg) { }
 INLINE void t38_gateway_put(struct t38_gateway **tp) { }
-
 
 #endif
 

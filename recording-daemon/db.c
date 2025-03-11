@@ -88,12 +88,12 @@ static void reset_conn(void) {
 }
 
 
-INLINE int prep(MYSQL_STMT **st, const char *str) {
+INLINE int prep(MYSQL_STMT **st, const char *s) {
 	*st = mysql_stmt_init(mysql_conn);
 	if (!*st)
 		return -1;
-	if (mysql_stmt_prepare(*st, str, strlen(str))) {
-		ilog(LOG_ERR, "Failed to prepare statement '%s': %s", str, mysql_stmt_error(*st));
+	if (mysql_stmt_prepare(*st, s, strlen(s))) {
+		ilog(LOG_ERR, "Failed to prepare statement '%s': %s", s, mysql_stmt_error(*st));
 		return -1;
 	}
 	return 0;
@@ -255,6 +255,8 @@ static void db_do_call_id(metafile_t *mf) {
 		return;
 	if (!mf->call_id)
 		return;
+	if (mf->skip_db)
+		return;
 
 	MYSQL_BIND b[2];
 	my_cstr(&b[0], mf->call_id);
@@ -263,35 +265,30 @@ static void db_do_call_id(metafile_t *mf) {
 	execute_wrap(&stm_insert_call, b, &mf->db_id);
 }
 static void db_do_call_metadata(metafile_t *mf) {
-	if (!mf->metadata_db)
+	if (mf->db_metadata_done)
 		return;
 	if (mf->db_id == 0)
+		return;
+	if (mf->skip_db)
 		return;
 
 	MYSQL_BIND b[3];
 	my_ull(&b[0], &mf->db_id); // stays persistent
 
-	// XXX offload this parsing to proxy module -> bencode list/dictionary
-	str all_meta;
-	str_init(&all_meta, mf->metadata_db);
-	while (all_meta.len > 1) {
-		str token;
-		if (str_token_sep(&token, &all_meta, '|'))
-			break;
+	metadata_ht_iter iter;
+	t_hash_table_iter_init(&iter, mf->metadata_parsed);
+	str *key;
+	str_q *vals;
+	while (t_hash_table_iter_next(&iter, &key, &vals)) {
+		for (__auto_type l = vals->head; l; l = l->next) {
+			my_str(&b[1], key);
+			my_str(&b[2], l->data);
 
-		str key;
-		if (str_token(&key, &token, ':')) {
-			// key:value separator not found, skip
-			continue;
+			execute_wrap(&stm_insert_metadata, b, NULL);
 		}
-
-		my_str(&b[1], &key);
-		my_str(&b[2], &token);
-
-		execute_wrap(&stm_insert_metadata, b, NULL);
 	}
 
-	mf->metadata_db = NULL;
+	mf->db_metadata_done = 1;
 }
 
 void db_do_call(metafile_t *mf) {
@@ -310,6 +307,8 @@ void db_do_stream(metafile_t *mf, output_t *op, stream_t *stream, unsigned long 
 	if (mf->db_id == 0)
 		return;
 	if (op->db_id > 0)
+		return;
+	if (mf->skip_db)
 		return;
 
 	unsigned long id = stream ? stream->id : 0;
@@ -378,10 +377,8 @@ void db_close_stream(output_t *op) {
 
 	double now = now_double();
 
-	str stream;
-        MYSQL_BIND b[3];
-        stream.s = 0;
-        stream.len = 0;
+	str stream = STR_NULL;
+	MYSQL_BIND b[3];
 
 	if ((output_storage & OUTPUT_STORAGE_DB)) {
 		FILE *f = fopen(op->filename, "rb");

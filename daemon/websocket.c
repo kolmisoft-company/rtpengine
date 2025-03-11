@@ -1,7 +1,9 @@
 #include "websocket.h"
+
 #include <libwebsockets.h>
 #include <assert.h>
 #include <json-glib/json-glib.h>
+
 #include "log.h"
 #include "main.h"
 #include "str.h"
@@ -19,7 +21,16 @@ struct websocket_output {
 	GString *str;
 	size_t str_done;
 	enum lws_write_protocol protocol;
+	int http_status;
+	const char *content_type;
+	ssize_t content_length;
 };
+
+TYPED_DIRECT_FUNCS(janus_session_hash, janus_session_eq, struct janus_session)
+TYPED_GHASHTABLE(janus_sessions_ht, struct janus_session, struct janus_session,
+		janus_session_hash, janus_session_eq, NULL, NULL)
+TYPED_GQUEUE(websocket_message, struct websocket_message)
+TYPED_GQUEUE(websocket_output, struct websocket_output)
 
 struct websocket_conn {
 	// used in the single threaded libwebsockets context
@@ -31,12 +42,12 @@ struct websocket_conn {
 	// multithreaded message processing
 	mutex_t lock;
 	unsigned int jobs;
-	GQueue messages;
+	websocket_message_q messages;
 	cond_t cond;
-	GHashTable *janus_sessions;
+	janus_sessions_ht janus_sessions;
 
 	// output buffer - also protected by lock
-	GQueue output_q;
+	websocket_output_q output_q;
 };
 
 struct websocket_ng_buf {
@@ -51,6 +62,8 @@ struct websocket_ng_buf {
 static GQueue websocket_vhost_configs;
 static struct lws_context *websocket_context;
 static GThreadPool *websocket_threads;
+static mutex_t websocket_callback_lock = MUTEX_STATIC_INIT;
+static mutex_t websocket_service_lock = MUTEX_STATIC_INIT;
 
 
 static struct websocket_message *websocket_message_new(struct websocket_conn *wc) {
@@ -77,8 +90,7 @@ static struct websocket_output *websocket_output_new(void) {
 	return wo;
 }
 
-static void websocket_output_free(void *p) {
-	struct websocket_output *wo = p;
+static void websocket_output_free(struct websocket_output *wo) {
 	if (wo->str)
 		g_string_free(wo->str, TRUE);
 	g_slice_free1(sizeof(*wo), wo);
@@ -87,7 +99,7 @@ static void websocket_output_free(void *p) {
 
 // appends to output buffer without triggering a response - unlocked
 static void __websocket_queue_raw(struct websocket_conn *wc, const char *msg, size_t len) {
-	struct websocket_output *wo = g_queue_peek_tail(&wc->output_q);
+	struct websocket_output *wo = t_queue_peek_tail(&wc->output_q);
 
 	if (!wo->str) {
 		wo->str = g_string_new("");
@@ -103,65 +115,92 @@ static void __websocket_queue_raw(struct websocket_conn *wc, const char *msg, si
 
 // appends to output buffer without triggering a response
 void websocket_queue_raw(struct websocket_conn *wc, const char *msg, size_t len) {
-	mutex_lock(&wc->lock);
+	LOCK(&wc->lock);
 	__websocket_queue_raw(wc, msg, len);
-	mutex_unlock(&wc->lock);
 }
 
 
 // num bytes in output buffer
 size_t websocket_queue_len(struct websocket_conn *wc) {
-	mutex_lock(&wc->lock);
+	LOCK(&wc->lock);
+
 	size_t ret = 0;
-	for (GList *l = wc->output_q.head; l; l = l->next) {
+	for (__auto_type l = wc->output_q.head; l; l = l->next) {
 		struct websocket_output *wo = l->data;
 		ret += (wo->str->len - LWS_PRE);
 	}
-	mutex_unlock(&wc->lock);
+
 	return ret;
 }
 
 
 // adds data to output buffer (can be null) and optionally triggers specified response
-int websocket_write_raw(struct websocket_conn *wc, const char *msg, size_t len,
+void websocket_write_raw(struct websocket_conn *wc, const char *msg, size_t len,
 		enum lws_write_protocol protocol, bool done)
 {
 	mutex_lock(&wc->lock);
 	__websocket_queue_raw(wc, msg, len);
-	struct websocket_output *wo = g_queue_peek_tail(&wc->output_q);
+	struct websocket_output *wo = t_queue_peek_tail(&wc->output_q);
 	wo->protocol = protocol;
-	g_queue_push_tail(&wc->output_q, websocket_output_new());
-
-	if (done) {
-		lws_callback_on_writable(wc->wsi);
-		lws_cancel_service(websocket_context);
-	}
+	t_queue_push_tail(&wc->output_q, websocket_output_new());
 
 	mutex_unlock(&wc->lock);
 
-	return 0;
+	if (done) {
+		// Sadly lws_callback_on_writable() doesn't do any internal
+		// locking, therefore we must protect it against a concurrently
+		// running lws_service(), as well as against other threads
+		// invoking lws_callback_on_writable().
+		//
+		// Acquire the callback lock first, which is normally unlocked,
+		// then wake up the service thread and try to break out of
+		// lws_service().  The service thread holds the service lock
+		// while lws_service() is executing and releases it as soon as
+		// lws_service() is done. We therefore try to acquire the
+		// service lock here, which blocks us until lws_service() is
+		// actually done. At this point the service thread will try to
+		// acquire the callback lock, which is still held by us here,
+		// and so the service thread will block until we are done
+		// calling lws_callback_on_writable(). Finally we release both
+		// locks, which allows the service thread to resume
+		// lws_service().
+		//
+		// The suggested approach of using
+		// LWS_CALLBACK_EVENT_WAIT_CANCELLED together with a queue and
+		// then calling lws_callback_on_writable() from the service
+		// thread is not usable as libwebsockets 2.0 doesn't support
+		// LWS_CALLBACK_EVENT_WAIT_CANCELLED.
+
+		mutex_lock(&websocket_callback_lock);
+		lws_cancel_service(websocket_context);
+
+		mutex_lock(&websocket_service_lock);
+		lws_callback_on_writable(wc->wsi);
+
+		mutex_unlock(&websocket_service_lock);
+		mutex_unlock(&websocket_callback_lock);
+	}
 }
 
 
 // adds data to output buffer (can be null) and triggers specified response: http or binary websocket
-int websocket_write_http_len(struct websocket_conn *wc, const char *msg, size_t len, bool done) {
-	return websocket_write_raw(wc, msg, len, LWS_WRITE_HTTP, done);
+void websocket_write_http_len(struct websocket_conn *wc, const char *msg, size_t len, bool done) {
+	websocket_write_raw(wc, msg, len, LWS_WRITE_HTTP, done);
 }
-int websocket_write_http(struct websocket_conn *wc, const char *msg, bool done) {
-	return websocket_write_http_len(wc, msg, msg ? strlen(msg) : 0, done);
+void websocket_write_http(struct websocket_conn *wc, const char *msg, bool done) {
+	websocket_write_http_len(wc, msg, msg ? strlen(msg) : 0, done);
 }
-int websocket_write_text(struct websocket_conn *wc, const char *msg, bool done) {
-	return websocket_write_raw(wc, msg, strlen(msg), LWS_WRITE_TEXT, done);
+void websocket_write_text(struct websocket_conn *wc, const char *msg, bool done) {
+	websocket_write_raw(wc, msg, strlen(msg), LWS_WRITE_TEXT, done);
 }
-int websocket_write_binary(struct websocket_conn *wc, const char *msg, size_t len, bool done) {
-	return websocket_write_raw(wc, msg, len, LWS_WRITE_BINARY, done);
+void websocket_write_binary(struct websocket_conn *wc, const char *msg, size_t len, bool done) {
+	websocket_write_raw(wc, msg, len, LWS_WRITE_BINARY, done);
 }
 
 
 void websocket_write_next(struct websocket_conn *wc) {
-	mutex_lock(&wc->lock);
-	g_queue_push_tail(&wc->output_q, websocket_output_new());
-	mutex_unlock(&wc->lock);
+	LOCK(&wc->lock);
+	t_queue_push_tail(&wc->output_q, websocket_output_new());
 }
 
 
@@ -176,19 +215,17 @@ static const char *websocket_echo_process(struct websocket_message *wm) {
 static void websocket_message_push(struct websocket_conn *wc, websocket_message_func_t func) {
 	ilogs(http, LOG_DEBUG, "Adding HTTP/WS message to processing queue");
 
-	mutex_lock(&wc->lock);
+	LOCK(&wc->lock);
 
 	struct websocket_message *wm = wc->wm;
 	assert(wm != NULL);
 	wm->func = func;
 
-	g_queue_push_tail(&wc->messages, wm);
+	t_queue_push_tail(&wc->messages, wm);
 	wc->jobs++;
 	g_thread_pool_push(websocket_threads, wc, NULL);
 
 	wc->wm = websocket_message_new(wc);
-
-	mutex_unlock(&wc->lock);
 }
 
 
@@ -196,7 +233,7 @@ static void websocket_process(void *p, void *up) {
 	struct websocket_conn *wc = p;
 
 	mutex_lock(&wc->lock);
-	struct websocket_message *wm = g_queue_pop_head(&wc->messages);
+	struct websocket_message *wm = t_queue_pop_head(&wc->messages);
 	mutex_unlock(&wc->lock);
 
 	assert(wm != NULL);
@@ -219,55 +256,8 @@ static void websocket_process(void *p, void *up) {
 }
 
 
-static int websocket_dequeue(struct websocket_conn *wc) {
-	if (!wc)
-		return 0;
-
-	int is_http = 0;
-
-	mutex_lock(&wc->lock);
-	struct websocket_output *wo;
-	struct lws *wsi = wc->wsi;
-	while ((wo = g_queue_pop_head(&wc->output_q))) {
-		// used buffer slot?
-		if (wo->str) {
-			// allocate post-buffer
-			g_string_set_size(wo->str, wo->str->len + LWS_SEND_BUFFER_POST_PADDING);
-			size_t to_send = wo->str->len - wo->str_done - LWS_SEND_BUFFER_POST_PADDING;
-			if (to_send) {
-				if (to_send > 2000)
-					ilogs(http, LOG_DEBUG, "Writing %lu bytes to LWS", (unsigned long) to_send);
-				else
-					ilogs(http, LOG_DEBUG, "Writing back to LWS: '%.*s'",
-							(int) to_send, wo->str->str + wo->str_done);
-				size_t ret = lws_write(wsi, (unsigned char *) wo->str->str + wo->str_done,
-						to_send, wo->protocol);
-				if (ret != to_send)
-					ilogs(http, LOG_ERR, "Invalid LWS write: %lu != %lu",
-							(unsigned long) ret,
-							(unsigned long) to_send);
-				wo->str_done += ret;
-
-				if (wo->protocol == LWS_WRITE_HTTP)
-					is_http = 1;
-			}
-		}
-		websocket_output_free(wo);
-	}
-	g_queue_push_tail(&wc->output_q, websocket_output_new());
-
-	mutex_unlock(&wc->lock);
-
-	int ret = 0;
-	if (is_http)
-		if (lws_http_transaction_completed(wsi) == 1) // may destroy `wc`
-			ret = -1;
-
-	return ret;
-}
-
-static const char *websocket_do_http_response(struct websocket_conn *wc, int status, const char *content_type,
-		ssize_t content_length)
+static const char *__websocket_write_http_response(struct websocket_conn *wc, int status,
+		const char *content_type, ssize_t content_length)
 {
 	uint8_t buf[LWS_PRE + 2048], *start = &buf[LWS_PRE], *p = start,
 		*end = &buf[sizeof(buf) - LWS_PRE - 1];
@@ -309,42 +299,102 @@ static const char *websocket_do_http_response(struct websocket_conn *wc, int sta
 
 	return NULL;
 }
-int websocket_http_response(struct websocket_conn *wc, int status, const char *content_type,
+static int websocket_dequeue(struct websocket_conn *wc) {
+	if (!wc)
+		return 0;
+
+	int is_http = 0;
+
+	mutex_lock(&wc->lock);
+	struct websocket_output *wo;
+	struct lws *wsi = wc->wsi;
+	while ((wo = t_queue_pop_head(&wc->output_q))) {
+		// used buffer slot?
+		if (!wo->str)
+			goto next;
+
+		if (wo->http_status) {
+			const char *err = __websocket_write_http_response(wc, wo->http_status,
+					wo->content_type, wo->content_length);
+			if (err) {
+				ilogs(http, LOG_ERR, "Failed to write HTTP response headers: %s", err);
+				goto next;
+			}
+		}
+
+		// allocate post-buffer
+		g_string_set_size(wo->str, wo->str->len + LWS_SEND_BUFFER_POST_PADDING);
+		size_t to_send = wo->str->len - wo->str_done - LWS_SEND_BUFFER_POST_PADDING;
+		if (to_send) {
+			if (to_send > 10000)
+				ilogs(http, LOG_DEBUG, "Writing %lu bytes to LWS", (unsigned long) to_send);
+			else
+				ilogs(http, LOG_DEBUG, "Writing back to LWS: '%.*s'",
+						(int) to_send, wo->str->str + wo->str_done);
+			size_t ret = lws_write(wsi, (unsigned char *) wo->str->str + wo->str_done,
+					to_send, wo->protocol);
+			if (ret != to_send)
+				ilogs(http, LOG_ERR, "Invalid LWS write: %lu != %lu",
+						(unsigned long) ret,
+						(unsigned long) to_send);
+			wo->str_done += ret;
+
+			if (wo->protocol == LWS_WRITE_HTTP)
+				is_http = 1;
+		}
+
+next:
+		websocket_output_free(wo);
+	}
+	t_queue_push_tail(&wc->output_q, websocket_output_new());
+
+	mutex_unlock(&wc->lock);
+
+	int ret = 0;
+	if (is_http)
+		if (lws_http_transaction_completed(wsi) == 1) // may destroy `wc`
+			ret = -1;
+
+	return ret;
+}
+
+void websocket_http_response(struct websocket_conn *wc, int status, const char *content_type,
 		ssize_t content_length)
 {
-	const char *err = websocket_do_http_response(wc, status, content_type, content_length);
-	if (!err)
-		return 0;
-	ilogs(http, LOG_ERR, "Failed to write HTTP response headers: %s", err);
-	return -1;
+	LOCK(&wc->lock);
+
+	struct websocket_output *wo = t_queue_peek_tail(&wc->output_q);
+
+	wo->http_status = status;
+	wo->content_type = content_type;
+	wo->content_length = content_length;
 }
-const char *websocket_http_complete(struct websocket_conn *wc, int status, const char *content_type,
+void websocket_http_complete(struct websocket_conn *wc, int status, const char *content_type,
 		ssize_t content_length, const char *content)
 {
-	if (websocket_http_response(wc, status, content_type, content_length))
-		return "Failed to write response HTTP headers";
-	if (websocket_write_http(wc, content, true))
-		return "Failed to write pong response";
-	return NULL;
+	websocket_http_response(wc, status, content_type, content_length);
+	websocket_write_http(wc, content, true);
 }
 
 
 static const char *websocket_http_ping(struct websocket_message *wm) {
-	ilogs(http, LOG_DEBUG, "Respoding to GET /ping");
-	return websocket_http_complete(wm->wc, 200, "text/plain", 5, "pong\n");
+	ilogs(http, LOG_DEBUG, "Responding to GET /ping");
+	websocket_http_complete(wm->wc, 200, "text/plain", 5, "pong\n");
+	return NULL;
 }
 
 
+TYPED_GHASHTABLE(metric_types_ht, char, void, c_str_hash, c_str_equal, NULL, NULL)
+
 static const char *websocket_http_metrics(struct websocket_message *wm) {
-	ilogs(http, LOG_DEBUG, "Respoding to GET /metrics");
+	ilogs(http, LOG_DEBUG, "Responding to GET /metrics");
 
-	AUTO_CLEANUP_INIT(GQueue *metrics, statistics_free_metrics, statistics_gather_metrics(NULL));
-	AUTO_CLEANUP_INIT(GString *outp, __g_string_free, g_string_new(""));
-	AUTO_CLEANUP_INIT(GHashTable *metric_types, __g_hash_table_destroy,
-			g_hash_table_new(g_str_hash, g_str_equal));
+	g_autoptr(stats_metric_q) metrics = statistics_gather_metrics(NULL);
+	g_autoptr(GString) outp = g_string_new("");
+	g_auto(metric_types_ht) metric_types = metric_types_ht_new();
 
-	for (GList *l = metrics->head; l; l = l->next) {
-		struct stats_metric *m = l->data;
+	for (__auto_type l = metrics->head; l; l = l->next) {
+		stats_metric *m = l->data;
 		if (!m->label)
 			continue;
 		if (!m->value_short)
@@ -352,14 +402,14 @@ static const char *websocket_http_metrics(struct websocket_message *wm) {
 		if (!m->prom_name)
 			continue;
 
-		if (!g_hash_table_lookup(metric_types, m->prom_name)) {
+		if (!t_hash_table_lookup(metric_types, m->prom_name)) {
 			if (m->descr)
 				g_string_append_printf(outp, "# HELP rtpengine_%s %s\n",
 						m->prom_name, m->descr);
 			if (m->prom_type)
 				g_string_append_printf(outp, "# TYPE rtpengine_%s %s\n",
 						m->prom_name, m->prom_type);
-			g_hash_table_insert(metric_types, (void *) m->prom_name, (void *) 0x1);
+			t_hash_table_insert(metric_types, (void *) m->prom_name, (void *) 0x1);
 		}
 
 		g_string_append_printf(outp, "rtpengine_%s", m->prom_name);
@@ -368,18 +418,21 @@ static const char *websocket_http_metrics(struct websocket_message *wm) {
 		g_string_append_printf(outp, " %s\n", m->value_short);
 	}
 
-	return websocket_http_complete(wm->wc, 200, "text/plain", outp->len, outp->str);
+	websocket_http_complete(wm->wc, 200, "text/plain", outp->len, outp->str);
+	return NULL;
 }
 
 
 // adds printf string to output buffer without triggering response
-static void websocket_queue_printf(struct cli_writer *cw, const char *fmt, ...) {
+static size_t websocket_queue_printf(struct cli_writer *cw, const char *fmt, ...) {
 	va_list va;
 	va_start(va, fmt);
 	char *s = g_strdup_vprintf(fmt, va);
+	size_t ret = strlen(s);
 	va_end(va);
-	websocket_queue_raw(cw->ptr, s, strlen(s));
+	websocket_queue_raw(cw->ptr, s, ret);
 	g_free(s);
+	return ret;
 }
 
 
@@ -387,10 +440,9 @@ static const char *websocket_http_cli(struct websocket_message *wm) {
 	assert(strncmp(wm->uri, "/cli/", 5) == 0);
 	char *uri = wm->uri+5;
 
-	ilogs(http, LOG_DEBUG, "Respoding to GET /cli/%s", uri);
+	ilogs(http, LOG_DEBUG, "Responding to GET /cli/%s", uri);
 
-	str uri_cmd;
-	str_init(&uri_cmd, uri);
+	str uri_cmd = STR(uri);
 
 	struct cli_writer cw = {
 		.cw_printf = websocket_queue_printf,
@@ -400,15 +452,31 @@ static const char *websocket_http_cli(struct websocket_message *wm) {
 
 	size_t len = websocket_queue_len(wm->wc);
 
-	return websocket_http_complete(wm->wc, 200, "text/plain", len, NULL);
+	websocket_http_complete(wm->wc, 200, "text/plain", len, NULL);
+	return NULL;
+}
+
+
+static const char *websocket_http_cli_post(struct websocket_message *wm) {
+	ilogs(http, LOG_DEBUG, "Responding to POST /cli");
+
+	struct cli_writer cw = {
+		.cw_printf = websocket_queue_printf,
+		.ptr = wm->wc,
+	};
+	cli_handle(&STR_LEN(wm->body->str, wm->body->len), &cw);
+
+	size_t len = websocket_queue_len(wm->wc);
+
+	websocket_http_complete(wm->wc, 200, "text/plain", len, NULL);
+	return NULL;
 }
 
 
 static const char *websocket_cli_process(struct websocket_message *wm) {
 	ilogs(http, LOG_DEBUG, "Processing websocket CLI req '%s'", wm->body->str);
 
-	str uri_cmd;
-	str_init_len(&uri_cmd, wm->body->str, wm->body->len);
+	str uri_cmd = STR_LEN(wm->body->str, wm->body->len);
 
 	struct cli_writer cw = {
 		.cw_printf = websocket_queue_printf,
@@ -421,30 +489,39 @@ static const char *websocket_cli_process(struct websocket_message *wm) {
 }
 
 
-static void websocket_ng_send_ws(str *cookie, str *body, const endpoint_t *sin, void *p1) {
+static void websocket_ng_send_ws(str *cookie, str *body, const endpoint_t *sin, const sockaddr_t *from,
+		void *p1)
+{
 	struct websocket_conn *wc = p1;
-	websocket_queue_raw(wc, cookie->s, cookie->len);
-	websocket_queue_raw(wc, " ", 1);
+	if (cookie) {
+		websocket_queue_raw(wc, cookie->s, cookie->len);
+		websocket_queue_raw(wc, " ", 1);
+	}
 	websocket_queue_raw(wc, body->s, body->len);
 	websocket_write_binary(wc, NULL, 0, true);
 }
-static void websocket_ng_send_http(str *cookie, str *body, const endpoint_t *sin, void *p1) {
+static void websocket_ng_send_http(str *cookie, str *body, const endpoint_t *sin, const sockaddr_t *from,
+		void *p1)
+{
 	struct websocket_conn *wc = p1;
-	if (websocket_http_response(wc, 200, "application/x-rtpengine-ng", cookie->len + 1 + body->len))
-		ilogs(http, LOG_WARN, "Failed to write HTTP headers");
-	websocket_queue_raw(wc, cookie->s, cookie->len);
-	websocket_queue_raw(wc, " ", 1);
+	websocket_http_response(wc, 200, "application/x-rtpengine-ng",
+			(cookie ? (cookie->len + 1) : 0) + body->len);
+	if (cookie) {
+		websocket_queue_raw(wc, cookie->s, cookie->len);
+		websocket_queue_raw(wc, " ", 1);
+	}
 	websocket_queue_raw(wc, body->s, body->len);
 	websocket_write_http(wc, NULL, true);
 }
 
-static void __ng_buf_free(void *p) {
-	struct websocket_ng_buf *buf = p;
+static void __ng_buf_free(struct websocket_ng_buf *buf) {
 	g_string_free(buf->body, TRUE);
 }
 
-static const char *websocket_ng_process(struct websocket_message *wm) {
-	struct websocket_ng_buf *buf = obj_alloc0("websocket_ng_buf", sizeof(*buf), __ng_buf_free);
+static const char *websocket_ng_process_generic(struct websocket_message *wm,
+		__typeof__(control_ng_process) cb)
+{
+	__auto_type buf = obj_alloc0(struct websocket_ng_buf, __ng_buf_free);
 
 	endpoint_print(&wm->wc->endpoint, buf->addr, sizeof(buf->addr));
 
@@ -453,36 +530,59 @@ static const char *websocket_ng_process(struct websocket_message *wm) {
 	// steal body and initialise
 	buf->body = wm->body;
 	wm->body = g_string_new("");
-	str_init_len(&buf->cmd, buf->body->str, buf->body->len);
+	buf->cmd = STR_LEN(buf->body->str, buf->body->len);
 	buf->endpoint = wm->wc->endpoint;
 
-	control_ng_process(&buf->cmd, &buf->endpoint, buf->addr, websocket_ng_send_ws, wm->wc, &buf->obj);
+	cb(&buf->cmd, &buf->endpoint, buf->addr, NULL, websocket_ng_send_ws, wm->wc, &buf->obj);
 
 	obj_put(buf);
 
 	return NULL;
 }
-static const char *websocket_http_ng(struct websocket_message *wm) {
-	struct websocket_ng_buf *buf = obj_alloc0("websocket_ng_buf", sizeof(*buf), __ng_buf_free);
+static const char *websocket_ng_process(struct websocket_message *wm) {
+	return websocket_ng_process_generic(wm, control_ng_process);
+}
+static const char *websocket_ng_plain_process(struct websocket_message *wm) {
+	return websocket_ng_process_generic(wm, control_ng_process_plain);
+}
+static const char *websocket_http_ng_generic(struct websocket_message *wm,
+		__typeof__(control_ng_process) cb)
+{
+	__auto_type buf = obj_alloc0(struct websocket_ng_buf, __ng_buf_free);
 
 	endpoint_print(&wm->wc->endpoint, buf->addr, sizeof(buf->addr));
 
-	ilogs(http, LOG_DEBUG, "Respoding to POST /ng from %s", buf->addr);
+	ilogs(http, LOG_DEBUG, "Responding to POST /ng from %s", buf->addr);
 
 	// steal body and initialise
 	buf->body = wm->body;
 	wm->body = g_string_new("");
-	str_init_len(&buf->cmd, buf->body->str, buf->body->len);
+	buf->cmd = STR_LEN(buf->body->str, buf->body->len);
 	buf->endpoint = wm->wc->endpoint;
 
-	if (control_ng_process(&buf->cmd, &buf->endpoint, buf->addr, websocket_ng_send_http, wm->wc, &buf->obj))
+	if (cb(&buf->cmd, &buf->endpoint, buf->addr, NULL, websocket_ng_send_http, wm->wc,
+				&buf->obj))
 		websocket_http_complete(wm->wc, 600, "text/plain", 6, "error\n");
 
 	obj_put(buf);
 
 	return NULL;
 }
+static const char *websocket_http_ng(struct websocket_message *wm) {
+	return websocket_http_ng_generic(wm, control_ng_process);
+}
+static const char *websocket_http_ng_plain(struct websocket_message *wm) {
+	return websocket_http_ng_generic(wm, control_ng_process_plain);
+}
 
+
+
+
+static const char *websocket_http_404(struct websocket_message *wm) {
+	ilogs(http, LOG_WARN, "Unhandled HTTP URI: '%s'", wm->uri);
+	websocket_http_complete(wm->wc, 404, "text/plain", 10, "not found\n");
+	return NULL;
+}
 
 
 
@@ -502,12 +602,8 @@ static int websocket_http_get(struct websocket_conn *wc) {
 		handler = websocket_http_metrics;
 	else if (!strncmp(uri, "/admin/", 7))
 		handler = websocket_janus_get;
-
-	if (!handler) {
-		ilogs(http, LOG_WARN, "Unhandled HTTP GET URI: '%s'", uri);
-		websocket_http_complete(wm->wc, 404, "text/plain", 10, "not found\n");
-		return 0;
-	}
+	else
+		handler = websocket_http_404;
 
 	websocket_message_push(wc, handler);
 	return 0;
@@ -542,6 +638,8 @@ static int websocket_http_post(struct websocket_conn *wc) {
 		wm->content_type = CT_JSON;
 	else if (!strcasecmp(ct, "application/x-rtpengine-ng"))
 		wm->content_type = CT_NG;
+	else if (!strcasecmp(ct, "text/plain"))
+		wm->content_type = CT_TEXT;
 	else
 		ilogs(http, LOG_WARN, "Unsupported content-type '%s'", ct);
 
@@ -550,8 +648,9 @@ static int websocket_http_post(struct websocket_conn *wc) {
 
 
 static const char *websocket_http_options_generic(struct websocket_message *wm) {
-	ilogs(http, LOG_DEBUG, "Respoding to OPTIONS");
-	return websocket_http_complete(wm->wc, 200, NULL, 0, NULL);
+	ilogs(http, LOG_DEBUG, "Responding to OPTIONS");
+	websocket_http_complete(wm->wc, 200, NULL, 0, NULL);
+	return NULL;
 }
 
 
@@ -587,18 +686,19 @@ static int websocket_http_body(struct websocket_conn *wc, const char *body, size
 
 	if (!strcmp(uri, "/ng") && wm->method == M_POST && wm->content_type == CT_NG)
 		handler = websocket_http_ng;
+	else if (!strcmp(uri, "/ng-plain") && wm->method == M_POST
+			&& (wm->content_type == CT_NG || wm->content_type == CT_JSON))
+		handler = websocket_http_ng_plain;
 	else if (!strcmp(uri, "/admin") && wm->method == M_POST && wm->content_type == CT_JSON)
 		handler = websocket_janus_process;
 	else if (!strcmp(uri, "/janus") && wm->method == M_POST && wm->content_type == CT_JSON)
 		handler = websocket_janus_process;
 	else if (!strncmp(uri, "/janus/", 7) && wm->method == M_POST && wm->content_type == CT_JSON)
 		handler = websocket_janus_post;
-
-	if (!handler) {
-		ilogs(http, LOG_WARN, "Unhandled HTTP POST URI: '%s'", wm->uri);
-		websocket_http_complete(wm->wc, 404, "text/plain", 10, "not found\n");
-		return 0;
-	}
+	else if (!strcmp(uri, "/cli") && wm->method == M_POST && wm->content_type == CT_TEXT)
+		handler = websocket_http_cli_post;
+	else
+		handler = websocket_http_404;
 
 	websocket_message_push(wc, handler);
 	return 0;
@@ -620,21 +720,21 @@ static void websocket_conn_cleanup(struct websocket_conn *wc) {
 	// therefore, remove janus_sessions list from wc, then unlock, then iterate the
 	// list, as janus_detach_websocket locks the session
 
-	GHashTable *janus_sessions = wc->janus_sessions;
-	wc->janus_sessions = NULL;
+	janus_sessions_ht janus_sessions = wc->janus_sessions;
+	wc->janus_sessions = janus_sessions_ht_null();
 
 	mutex_unlock(&wc->lock);
 
 	// detach all Janus sessions
-	if (janus_sessions) {
-		GHashTableIter iter;
-		g_hash_table_iter_init(&iter, janus_sessions);
-		gpointer key;
-		while (g_hash_table_iter_next(&iter, &key, NULL)) {
-			janus_detach_websocket(key, wc);
-			obj_put_o(key);
+	if (t_hash_table_is_set(janus_sessions)) {
+		janus_sessions_ht_iter iter;
+		t_hash_table_iter_init(&iter, janus_sessions);
+		struct janus_session *session;
+		while (t_hash_table_iter_next(&iter, &session, NULL)) {
+			janus_detach_websocket(session, wc);
+			obj_put_o((void *) session);
 		}
-		g_hash_table_destroy(janus_sessions);
+		t_hash_table_destroy(janus_sessions);
 	}
 
 
@@ -645,7 +745,7 @@ static void websocket_conn_cleanup(struct websocket_conn *wc) {
 		free(wc->wm->uri);
 	g_slice_free1(sizeof(*wc->wm), wc->wm);
 	wc->wm = NULL;
-	g_queue_clear_full(&wc->output_q, websocket_output_free);
+	t_queue_clear_full(&wc->output_q, websocket_output_free);
 	if (wc->uri)
 		free(wc->uri);
 
@@ -692,10 +792,10 @@ static int websocket_conn_init(struct lws *wsi, void *p) {
 	wc->wsi = wsi;
 	mutex_init(&wc->lock);
 	cond_init(&wc->cond);
-	g_queue_init(&wc->messages);
-	g_queue_push_tail(&wc->output_q, websocket_output_new());
+	t_queue_init(&wc->messages);
+	t_queue_push_tail(&wc->output_q, websocket_output_new());
 	wc->wm = websocket_message_new(wc);
-	wc->janus_sessions = g_hash_table_new(g_direct_hash, g_direct_equal);
+	wc->janus_sessions = janus_sessions_ht_new();
 
 	return 0;
 }
@@ -703,9 +803,9 @@ static int websocket_conn_init(struct lws *wsi, void *p) {
 
 void websocket_conn_add_session(struct websocket_conn *wc, struct janus_session *s) {
 	mutex_lock(&wc->lock);
-	if (wc->janus_sessions) {
-		assert(g_hash_table_lookup(wc->janus_sessions, s) == NULL);
-		g_hash_table_insert(wc->janus_sessions, s, s);
+	if (t_hash_table_is_set(wc->janus_sessions)) {
+		assert(t_hash_table_lookup(wc->janus_sessions, s) == NULL);
+		t_hash_table_insert(wc->janus_sessions, s, s);
 	}
 	mutex_unlock(&wc->lock);
 }
@@ -891,6 +991,11 @@ static int websocket_rtpengine_ng(struct lws *wsi, enum lws_callback_reasons rea
 {
 	return websocket_protocol(wsi, reason, user, in, len, websocket_ng_process, "rtpengine-ng");
 }
+static int websocket_rtpengine_ng_plain(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
+		size_t len)
+{
+	return websocket_protocol(wsi, reason, user, in, len, websocket_ng_plain_process, "rtpengine-ng-plain");
+}
 
 
 static const struct lws_protocols websocket_protocols[] = {
@@ -917,6 +1022,11 @@ static const struct lws_protocols websocket_protocols[] = {
 	{
 		.name = "ng.rtpengine.com",
 		.callback = websocket_rtpengine_ng,
+		.per_session_data_size = sizeof(struct websocket_conn),
+	},
+	{
+		.name = "ng-plain.rtpengine.com",
+		.callback = websocket_rtpengine_ng_plain,
 		.per_session_data_size = sizeof(struct websocket_conn),
 	},
 	{ 0, }
@@ -1007,7 +1117,7 @@ int websocket_init(void) {
 		ilogs(http, LOG_DEBUG, "Starting HTTP/WS '%s'", ifa);
 		endpoint_t eps[2];
 		err = "Failed to parse address/port";
-		if (endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
+		if (!endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
 			goto err;
 		addr_any_v6_consolidate(eps, have_lws_ipv6);
 
@@ -1054,7 +1164,7 @@ int websocket_init(void) {
 		ilogs(http, LOG_DEBUG, "Starting HTTPS/WSS '%s'", ifa);
 		endpoint_t eps[2];
 		err = "Failed to parse address/port";
-		if (endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
+		if (!endpoint_parse_any_getaddrinfo_alt(&eps[0], &eps[1], ifa))
 			goto err;
 		addr_any_v6_consolidate(eps, have_lws_ipv6);
 
@@ -1110,8 +1220,16 @@ err:
 
 static void websocket_loop(void *p) {
 	ilogs(http, LOG_INFO, "Websocket listener thread running");
-	while (!rtpe_shutdown)
+	while (!rtpe_shutdown) {
+		// see websocket_write_raw() for locking logic
+
+		mutex_lock(&websocket_service_lock);
 		lws_service(websocket_context, 100);
+		mutex_unlock(&websocket_service_lock);
+
+		mutex_lock(&websocket_callback_lock);
+		mutex_unlock(&websocket_callback_lock);
+	}
 
 	websocket_cleanup();
 }

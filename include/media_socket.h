@@ -1,29 +1,32 @@
 #ifndef _MEDIA_SOCKET_H_
 #define _MEDIA_SOCKET_H_
 
-
 #include <glib.h>
 #include <string.h>
 #include <stdio.h>
+
 #include "str.h"
 #include "obj.h"
-#include "aux.h"
+#include "helpers.h"
 #include "dtls.h"
 #include "crypto.h"
 #include "socket.h"
+#include "containers.h"
+#include "types.h"
+
 #include "xt_RTPENGINE.h"
-
-
-
+#include "common_stats.h"
 
 struct media_packet;
 struct transport_protocol;
 struct ssrc_ctx;
 struct rtpengine_srtp;
 struct jb_packet;
-struct stream_fd;
 struct poller;
 struct media_player_cache_entry;
+
+TYPED_GQUEUE(stream_fd, stream_fd)
+
 
 typedef int rtcp_filter_func(struct media_packet *, GQueue *);
 typedef int (*rewrite_func)(str *, struct packet_stream *, struct ssrc_ctx *);
@@ -71,24 +74,39 @@ struct streamhandler {
 
 
 
+TYPED_GQUEUE(local_intf, struct local_intf)
+TYPED_GHASHTABLE(rr_specs_ht, str, struct logical_intf, str_hash, str_equal, NULL, NULL)
+
 struct logical_intf {
 	str				name;
 	sockfamily_t			*preferred_family;
-	GQueue				list; /* struct local_intf */
-	GHashTable			*rr_specs;
+	local_intf_q			list;
+	rr_specs_ht			rr_specs;
 	str				name_base; // if name is "foo:bar", this is "foo"
 };
-struct port_pool {
-	BIT_ARRAY_DECLARE(ports_used, 0x10000);
-	volatile unsigned int		last_used;
-	volatile unsigned int		free_ports;
 
+typedef void port_t;
+TYPED_GQUEUE(ports, port_t)
+
+struct socket_port_link {
+	socket_t			socket;
+	ports_q				links;
+	struct port_pool		*pp;
+};
+
+TYPED_GQUEUE(port_pool, struct port_pool)
+struct port_pool {
 	unsigned int			min, max;
 
 	mutex_t				free_list_lock;
-	GQueue				free_list;
-	BIT_ARRAY_DECLARE(free_list_used, 0x10000);
+
+	ports_q				free_ports_q;		/* for getting the next free port */
+	ports_list			**free_ports;		/* for a lookup if the port is used */
+
+	port_pool_q			overlaps;
 };
+#define free_ports_link(pp, port) ((pp)->free_ports[port - (pp)->min])
+
 struct intf_address {
 	socktype_t			*type;
 	sockaddr_t			addr;
@@ -97,43 +115,15 @@ struct intf_config {
 	str				name; // full name (before the '/' separator in config)
 	str				name_base; // if name is "foo:bar", this is "foo"
 	str				name_rr_spec; // if name is "foo:bar", this is "bar"
+	str				alias; // if interface is "foo=bar", this is "bar"
 	struct intf_address		local_address;
 	struct intf_address		advertised_address;
 	unsigned int			port_min, port_max;
+	GList				*exclude_ports;
 };
 struct intf_spec {
 	struct intf_address		local_address;
 	struct port_pool		port_pool;
-};
-struct interface_counter_stats_dir {
-#define F(n) atomic64 n;
-#include "interface_counter_stats_fields_dir.inc"
-#undef F
-};
-struct interface_counter_stats {
-#define F(n) atomic64 n;
-#include "interface_counter_stats_fields.inc"
-#undef F
-};
-struct interface_sampled_stats_fields {
-#define F(n) atomic64 n;
-#include "interface_sampled_stats_fields.inc"
-#undef F
-};
-struct interface_sampled_stats {
-	struct interface_sampled_stats_fields sums;
-	struct interface_sampled_stats_fields sums_squared;
-	struct interface_sampled_stats_fields counts;
-};
-struct interface_sampled_stats_avg {
-	struct interface_sampled_stats_fields avg;
-	struct interface_sampled_stats_fields stddev;
-};
-struct interface_stats_block {
-	struct interface_counter_stats_dir	in,
-						out;
-	struct interface_counter_stats		s;
-	struct interface_sampled_stats		sampled;
 };
 struct interface_sampled_rate_stats {
 	GHashTable *ht;
@@ -181,19 +171,27 @@ void interface_sampled_rate_stats_destroy(struct interface_sampled_rate_stats *)
 struct interface_stats_block *interface_sampled_rate_stats_get(struct interface_sampled_rate_stats *s,
 		struct local_intf *lif, long long *time_diff_us);
 
+TYPED_GQUEUE(socket_port, struct socket_port_link)
+
 struct local_intf {
 	struct intf_spec		*spec;
 	struct intf_address		advertised_address;
 	unsigned int			unique_id; /* starting with 0 - serves as preference */
-	const struct logical_intf	*logical;
+	struct logical_intf		*logical;
 	str				ice_foundation;
 
-	struct interface_stats_block	stats;
+	struct interface_stats_block	*stats;
 };
-struct intf_list {
+struct socket_intf_list {
 	struct local_intf		*local_intf;
-	GQueue				list;
+	socket_port_q			list;
 };
+struct sfd_intf_list {
+	struct local_intf		*local_intf;
+	stream_fd_q			list;
+};
+TYPED_GQUEUE(socket_intf_list, struct socket_intf_list) /* RO */
+TYPED_GQUEUE(sfd_intf_list, struct sfd_intf_list)
 
 /**
  * stream_fd is an entry-point object for RTP packets handling,
@@ -217,7 +215,10 @@ struct stream_fd {
 	struct obj			obj;
 
 	unsigned int			unique_id;	/* RO */
-	socket_t			socket;		/* RO */
+	union {
+		socket_t			socket;		/* RO - alias */
+		struct socket_port_link		spl;		/* RO */
+	};
 	struct local_intf		*local_intf;	/* RO */
 
 	/* stream_fd object holds a reference to the call it belongs to.
@@ -227,22 +228,24 @@ struct stream_fd {
 	 * The call is only released when it has been dissociated from all stream_fd objects,
 	 * which happens during call teardown.
 	 */
-	struct call			*call;		/* RO */
+	call_t				*call;		/* RO */
 	struct packet_stream		*stream;	/* LOCK: call->master_lock */
 	struct crypto_context		crypto;		/* IN direction, LOCK: stream->in_lock */
 	struct dtls_connection		dtls;		/* LOCK: stream->in_lock */
 	int				error_strikes;
+	int				active_read_events;
 	struct poller			*poller;
 };
 
 struct sink_attrs {
+	// cannot be bit fields because G_STRUCT_OFFSET is used on them
 	bool block_media;
 	bool silence_media;
 
-	unsigned int offer_answer:1; // bidirectional, exclusive
-	unsigned int rtcp_only:1;
-	unsigned int transcoding:1;
-	unsigned int egress:1;
+	bool offer_answer:1; // bidirectional, exclusive
+	bool rtcp_only:1;
+	bool transcoding:1;
+	bool egress:1;
 };
 
 /**
@@ -260,8 +263,8 @@ struct media_packet {
 
 	endpoint_t fsin; // source address of received packet
 	struct timeval tv; // timestamp when packet was received
-	struct stream_fd *sfd; // fd which received the packet
-	struct call *call; // sfd->call
+	stream_fd *sfd; // fd which received the packet
+	call_t *call; // sfd->call
 	struct packet_stream *stream; // sfd->stream
 	struct call_media *media; // stream->media
 	struct call_media *media_out; // output media
@@ -273,52 +276,46 @@ struct media_packet {
 	struct ssrc_ctx *ssrc_in, *ssrc_out; // SSRC contexts from in_srtp and out_srtp
 	str payload;
 
-	GQueue packets_out;
+	codec_packet_q packets_out;
 	int ptime; // returned from decoding
 };
 
 
 
-extern GQueue all_local_interfaces; // read-only during runtime
+extern local_intf_q all_local_interfaces; // read-only during runtime
+
+extern __thread struct bufferpool *media_bufferpool;
 
 
-
-void interfaces_init(GQueue *interfaces);
+void interfaces_init(intf_config_q *interfaces);
 void interfaces_free(void);
 
 struct logical_intf *get_logical_interface(const str *name, sockfamily_t *fam, int num_ports);
 struct local_intf *get_interface_address(const struct logical_intf *lif, sockfamily_t *fam);
 struct local_intf *get_any_interface_address(const struct logical_intf *lif, sockfamily_t *fam);
-void interfaces_exclude_port(unsigned int port);
+void interfaces_exclude_port(endpoint_t *);
 int is_local_endpoint(const struct intf_address *addr, unsigned int port);
 
-//int get_port(socket_t *r, unsigned int port, const struct local_intf *lif, const struct call *c);
-//void release_port(socket_t *r, const struct local_intf *);
+struct socket_port_link get_specific_port(unsigned int port,
+		struct intf_spec *spec, const str *label);
+bool get_consecutive_ports(socket_intf_list_q *out, unsigned int num_ports, unsigned int num_intfs,
+		struct call_media *media);
+stream_fd *stream_fd_new(struct socket_port_link *, call_t *call, struct local_intf *lif);
+stream_fd *stream_fd_lookup(const endpoint_t *);
+void stream_fd_release(stream_fd *);
+enum thread_looper_action release_closed_sockets(void);
+void append_thread_lpr_to_glob_lpr(void);
 
-int __get_consecutive_ports(GQueue *out, unsigned int num_ports, unsigned int wanted_start_port,
-		struct intf_spec *spec, const str *);
-int get_consecutive_ports(GQueue *out, unsigned int num_ports, unsigned int num_intfs, struct call_media *media);
-struct stream_fd *stream_fd_new(socket_t *fd, struct call *call, struct local_intf *lif);
-struct stream_fd *stream_fd_lookup(const endpoint_t *);
-void stream_fd_release(struct stream_fd *);
-void release_closed_sockets(void);
-
-void free_intf_list(struct intf_list *il);
-void free_release_intf_list(struct intf_list *il);
-void free_release_intf_list(struct intf_list *il);
-void free_socket_intf_list(struct intf_list *il);
-
-INLINE int open_intf_socket(socket_t *r, unsigned int port, const struct local_intf *lif) {
-	return open_socket(r, SOCK_DGRAM, port, &lif->spec->local_address.addr);
-}
+void free_sfd_intf_list(struct sfd_intf_list *il);
+void free_release_sfd_intf_list(struct sfd_intf_list *il);
+void free_socket_intf_list(struct socket_intf_list *il);
 
 void kernelize(struct packet_stream *);
-void __unkernelize(struct packet_stream *);
-void unkernelize(struct packet_stream *);
-void __stream_unconfirm(struct packet_stream *);
+void __unkernelize(struct packet_stream *, const char *);
+void unkernelize(struct packet_stream *, const char *);
+void __stream_unconfirm(struct packet_stream *, const char *);
 void __reset_sink_handlers(struct packet_stream *);
 
-void media_update_stats(struct call_media *m);
 int __hunt_ssrc_ctx_idx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
 		unsigned int start_idx);
 struct ssrc_ctx *__hunt_ssrc_ctx(uint32_t ssrc, struct ssrc_ctx *list[RTPE_NUM_SSRC_TRACKING],
@@ -351,11 +348,13 @@ INLINE int proto_is(const struct transport_protocol *protocol, enum transport_pr
 		return 0;
 	return (protocol->index == idx) ? 1 : 0;
 }
-INLINE void stream_fd_auto_cleanup(struct stream_fd **sp) {
-	if (!*sp)
+INLINE void stream_fd_put(stream_fd *sp) {
+	if (!sp)
 		return;
-	obj_put(*sp);
+	obj_put(sp);
 }
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(stream_fd, stream_fd_put)
 
 
 #endif

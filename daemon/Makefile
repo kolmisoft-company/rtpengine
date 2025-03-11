@@ -1,96 +1,120 @@
 TARGET=		rtpengine
 
+export top_srcdir = ..
+
+include ../lib/deps.Makefile
+
 with_iptables_option ?= yes
 with_transcoding ?= yes
 
-
-CFLAGS?=	-g -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter -Wstrict-prototypes
-CFLAGS+=	-pthread -fno-strict-aliasing
-CFLAGS+=	-std=c99
-CFLAGS+=	$(shell pkg-config --cflags glib-2.0)
-CFLAGS+=	$(shell pkg-config --cflags gthread-2.0)
-CFLAGS+=	$(shell pkg-config --cflags zlib)
-CFLAGS+=	$(shell pkg-config --cflags openssl)
-CFLAGS+=	$(shell pkg-config --cflags libevent_pthreads)
-CFLAGS+=	$(shell pkg-config --cflags libpcre)
-CFLAGS+=	$(shell pkg-config xmlrpc_client --cflags 2> /dev/null || xmlrpc-c-config client --cflags)
-CFLAGS+=	$(shell pkg-config xmlrpc --cflags 2> /dev/null)
-CFLAGS+=	$(shell pkg-config xmlrpc_util --cflags 2> /dev/null)
-CFLAGS+=	$(shell pkg-config --cflags json-glib-1.0)
-CFLAGS+=	$(shell pkg-config --cflags libwebsockets)
-ifeq ($(with_iptables_option),yes)
-CFLAGS+=	$(shell pkg-config --cflags libiptc)
-CFLAGS+=	-DWITH_IPTABLES_OPTION
+ifeq ($(origin CFLAGS),undefined)
+CFLAGS:=	-g -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter -Wstrict-prototypes -Werror=return-type \
+		-Wshadow
+else
+CFLAGS:=	$(CFLAGS)
 endif
+CFLAGS+=	-pthread
+CFLAGS+=	-std=c11
 CFLAGS+=	-I. -I../kernel-module/ -I../lib/ -I../include/
 CFLAGS+=	-D_GNU_SOURCE
+CFLAGS+=	$(CFLAGS_GLIB)
+CFLAGS+=	$(CFLAGS_GTHREAD)
+CFLAGS+=	$(CFLAGS_LIBZ)
+CFLAGS+=	$(CFLAGS_OPENSSL)
+CFLAGS+=	$(CFLAGS_LIBEVENT)
+CFLAGS+=	$(CFLAGS_LIBPCRE)
+CFLAGS+=	$(CFLAGS_XMLRPC)
+CFLAGS+=	$(CFLAGS_JSON_GLIB)
+CFLAGS+=	$(CFLAGS_LIBWEBSOCKETS)
+CFLAGS+=	$(CFLAGS_LIBNFTNL)
+CFLAGS+=	$(CFLAGS_LIBMNL)
+ifeq ($(with_iptables_option),yes)
+CFLAGS+=	$(CFLAGS_LIBIPTC)
+CFLAGS+=	-DWITH_IPTABLES_OPTION
+endif
 ifeq ($(with_transcoding),yes)
-CFLAGS+=	$(shell pkg-config --cflags libavcodec)
-CFLAGS+=	$(shell pkg-config --cflags libavformat)
-CFLAGS+=	$(shell pkg-config --cflags libavutil)
-CFLAGS+=	$(shell pkg-config --cflags libswresample)
-CFLAGS+=	$(shell pkg-config --cflags libavfilter)
-CFLAGS+=	$(shell pkg-config --cflags spandsp)
-CFLAGS+=	$(shell pkg-config --cflags opus)
+CFLAGS+=	$(CFLAGS_LIBAVCODEC)
+CFLAGS+=	$(CFLAGS_LIBAVFORMAT)
+CFLAGS+=	$(CFLAGS_LIBAVUTIL)
+CFLAGS+=	$(CFLAGS_LIBSWRESAMPLE)
+CFLAGS+=	$(CFLAGS_LIBAVFILTER)
+CFLAGS+=	$(CFLAGS_SPANDSP)
+CFLAGS+=	$(CFLAGS_OPUS)
 CFLAGS+=	-DWITH_TRANSCODING
-CFLAGS+=        $(shell mysql_config --cflags)
+CFLAGS+=	$(CFLAGS_MYSQL)
 else
 CFLAGS+=	-DWITHOUT_CODECLIB
+endif
+ifeq ($(without_nftables),yes)
+CFLAGS+=	-DWITHOUT_NFTABLES
 endif
 
 ### compile time options:
 #CFLAGS+=	-DSRTCP_KEY_DERIVATION_RFC_COMPLIANCE
 #CFLAGS+=	-DSTRICT_SDES_KEY_LIFETIME
 
-LDLIBS=		-lm -ldl
-LDLIBS+=	$(shell pkg-config --libs glib-2.0)
-LDLIBS+=	$(shell pkg-config --libs gthread-2.0)
-LDLIBS+=	$(shell pkg-config --libs zlib)
-LDLIBS+=	$(shell pkg-config --libs libpcre)
-LDLIBS+=	$(shell pkg-config --libs libcrypto)
-LDLIBS+=	$(shell pkg-config --libs openssl)
-LDLIBS+=	$(shell pkg-config --libs libevent_pthreads)
-LDLIBS+=	-lpcap
-LDLIBS+=	$(shell pkg-config xmlrpc_client --libs 2> /dev/null || xmlrpc-c-config client --libs)
-LDLIBS+=	$(shell pkg-config xmlrpc --libs 2> /dev/null)
-LDLIBS+=	$(shell pkg-config xmlrpc_util --libs 2> /dev/null)
-LDLIBS+=	-lhiredis
-LDLIBS+=	$(shell pkg-config --libs json-glib-1.0)
-LDLIBS+=	$(shell pkg-config --libs libwebsockets)
+LDLIBS:=	-lm -ldl
+LDLIBS+=	$(LDLIBS_GLIB)
+LDLIBS+=	$(LDLIBS_GTHREAD)
+LDLIBS+=	$(LDLIBS_LIBZ)
+LDLIBS+=	$(LDLIBS_LIBPCRE)
+LDLIBS+=	$(LDLIBS_LIBCRYPTO)
+LDLIBS+=	$(LDLIBS_OPENSSL)
+LDLIBS+=	$(LDLIBS_LIBEVENT)
+LDLIBS+=	$(LDLIBS_LIBPCAP)
+LDLIBS+=	$(LDLIBS_XMLRPC)
+LDLIBS+=	$(LDLIBS_LIBHIREDIS)
+LDLIBS+=	$(LDLIBS_JSON_GLIB)
+LDLIBS+=	$(LDLIBS_LIBWEBSOCKETS)
+LDLIBS+=	$(LDLIBS_LIBNFTNL)
+LDLIBS+=	$(LDLIBS_LIBMNL)
 ifeq ($(with_iptables_option),yes)
-LDLIBS+=	$(shell pkg-config --libs libiptc)
+LDLIBS+=	$(LDLIBS_LIBIPTC)
 endif
 ifeq ($(with_transcoding),yes)
-LDLIBS+=	$(shell pkg-config --libs libavcodec)
-LDLIBS+=	$(shell pkg-config --libs libavformat)
-LDLIBS+=	$(shell pkg-config --libs libavutil)
-LDLIBS+=	$(shell pkg-config --libs libswresample)
-LDLIBS+=	$(shell pkg-config --libs libavfilter)
-LDLIBS+=	$(shell pkg-config --libs spandsp)
-LDLIBS+=	$(shell pkg-config --libs opus)
-LDLIBS+=        $(shell mysql_config --libs)
+LDLIBS+=	$(LDLIBS_LIBAVCODEC)
+LDLIBS+=	$(LDLIBS_LIBAVFORMAT)
+LDLIBS+=	$(LDLIBS_LIBAVUTIL)
+LDLIBS+=	$(LDLIBS_LIBSWRESAMPLE)
+LDLIBS+=	$(LDLIBS_LIBAVFILTER)
+LDLIBS+=	$(LDLIBS_SPANDSP)
+LDLIBS+=	$(LDLIBS_OPUS)
+LDLIBS+=	$(LDLIBS_MYSQL)
 endif
 
 ifeq ($(with_transcoding),yes)
-include ../lib/g729.Makefile
+CFLAGS+=	$(CFLAGS_BCG729)
+LDLIBS+=	$(LDLIBS_BCG729)
+
+CFLAGS+=	$(CFLAGS_CODEC_CHAIN)
+LDLIBS+=	$(LDLIBS_CODEC_CHAIN)
 endif
 
-include ../lib/mqtt.Makefile
+CFLAGS+=	$(CFLAGS_MQTT)
+LDLIBS+=	$(LDLIBS_MQTT)
 
-SRCS=		main.c kernel.c poller.c aux.c control_tcp.c call.c control_udp.c redis.c \
-		bencode.c cookie_cache.c udp_listener.c control_ng.strhash.c sdp.strhash.c stun.c rtcp.c \
-		crypto.c rtp.c call_interfaces.strhash.c dtls.c log.c cli.c graphite.c ice.c \
+SRCS=		main.c kernel.c helpers.c control_tcp.c call.c control_udp.c redis.c \
+		cookie_cache.c udp_listener.c control_ng_flags_parser.c control_ng.strhash.c sdp.strhash.c stun.c rtcp.c \
+		crypto.c rtp.c call_interfaces.strhash.c dtls.c log.c cli.strhash.c graphite.c ice.c \
 		media_socket.c homer.c recording.c statistics.c cdr.c ssrc.c iptables.c tcp_listener.c \
 		codec.c load.c dtmf.c timerthread.c media_player.c jitter_buffer.c t38.c websocket.c \
-		mqtt.c janus.strhash.c
-LIBSRCS=	loglib.c auxlib.c rtplib.c str.c socket.c streambuf.c ssllib.c dtmflib.c
+		mqtt.c janus.strhash.c audio_player.c arena.c
+ifneq ($(without_nftables),yes)
+SRCS+=		nftables.c
+endif
+LIBSRCS=	loglib.c auxlib.c rtplib.c str.c socket.c streambuf.c ssllib.c dtmflib.c mix_buffer.c poller.c \
+		bufferpool.c bencode.c
 ifeq ($(with_transcoding),yes)
 LIBSRCS+=	codeclib.strhash.c resample.c
+LIBASM=		mvr2s_x64_avx2.S mvr2s_x64_avx512.S mix_in_x64_avx2.S mix_in_x64_avx512bw.S mix_in_x64_sse2.S
 endif
-OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o)
+ifneq ($(have_liburing),yes)
+LIBSRCS+=	uring.c
+endif
+OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o) $(LIBASM:.S=.o)
 
-PODS=		rtpengine.pod
-MANS=		$(PODS:.pod=.8)
+MDS=		rtpengine.ronn
+MANS=		$(MDS:.ronn=.8)
 
 include ../lib/common.Makefile
 

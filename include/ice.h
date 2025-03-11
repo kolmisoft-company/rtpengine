@@ -1,22 +1,20 @@
 #ifndef __ICE_H__
 #define __ICE_H__
 
-
-
 #include <arpa/inet.h>
 #include <glib.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <stdbool.h>
+
 #include "str.h"
 #include "obj.h"
-#include "aux.h"
+#include "helpers.h"
 #include "media_socket.h"
 #include "socket.h"
 #include "timerthread.h"
-
-
-
+#include "types.h"
+#include "call.h"
 
 #define MAX_COMPONENTS			2
 #define TIMER_RUN_INTERVAL		20 /* ms */
@@ -24,8 +22,6 @@
 #define STUN_MAX_RETRANSMITS		7
 #define MAX_ICE_CANDIDATES		100
 #define ICE_FOUNDATION_LENGTH		16
-
-
 
 #define ICE_AGENT_COMPLETED		0x0002
 #define ICE_AGENT_CONTROLLING		0x0004
@@ -57,18 +53,13 @@
 #define AGENT_CLEAR3(p, f, g, h) \
 	bf_clear(&(p)->agent_flags, ICE_AGENT_ ## f | ICE_AGENT_ ## g | ICE_AGENT_ ## h)
 
-
-
 struct logical_intf;
 struct local_intf;
 struct packet_stream;
 struct call_media;
-struct call;
 struct stream_params;
 struct stun_attrs;
-
-
-
+struct call_monologue;
 
 enum ice_candidate_type {
 	ICT_UNKNOWN = 0,
@@ -93,8 +84,8 @@ struct ice_candidate {
 struct ice_candidate_pair {
 	struct ice_candidate	*remote_candidate;
 	const struct local_intf	*local_intf;
-	struct stream_fd	*sfd;
-	volatile unsigned int	pair_flags;
+	stream_fd	*sfd;
+	atomic64		pair_flags;
 	uint32_t		stun_transaction[3]; /* belongs to transaction_hash, thus agent->lock */
 	unsigned int		retransmit_ms;
 	struct timeval		retransmit;
@@ -105,10 +96,16 @@ struct ice_candidate_pair {
 				was_nominated:1;
 };
 
+TYPED_GHASHTABLE_PROTO(candidate_ht, struct ice_candidate, struct ice_candidate)
+TYPED_GHASHTABLE_PROTO(candidate_pair_ht, struct ice_candidate_pair, struct ice_candidate_pair)
+TYPED_GHASHTABLE_PROTO(foundation_ht, struct ice_candidate, struct ice_candidate)
+TYPED_GHASHTABLE_PROTO(priority_ht, void, struct ice_candidate)
+TYPED_GHASHTABLE_PROTO(transaction_ht, uint32_t, struct ice_candidate_pair)
+
 /* these are protected by the call's master_lock */
 struct ice_agent {
 	struct timerthread_obj	tt_obj;
-	struct call		*call; /* main reference */
+	call_t		*call; /* main reference */
 	struct call_media	*media;
 	const struct logical_intf	*logical_intf;
 	sockfamily_t		*desired_family;
@@ -116,16 +113,16 @@ struct ice_agent {
 
 	mutex_t			lock; /* for elements below. and call must be locked in R */
 				/* lock order: in_lock first, then agent->lock */
-	GQueue			remote_candidates;
-	GQueue			candidate_pairs; /* for storage */
-	GQueue			triggered;
-	GHashTable		*candidate_hash;
-	GHashTable		*cand_prio_hash;
-	GHashTable		*pair_hash;
-	GHashTable		*transaction_hash;
-	GHashTable		*foundation_hash;
+	candidate_q		remote_candidates;
+	candidate_pair_q	candidate_pairs; /* for storage */
+	candidate_pair_q	triggered;
+	candidate_ht		candidate_hash;
+	priority_ht		cand_prio_hash;
+	candidate_pair_ht	pair_hash;
+	transaction_ht		transaction_hash;
+	foundation_ht		foundation_hash;
 	GTree			*all_pairs;
-	GQueue			all_pairs_list; /* sorted through gtree */
+	candidate_pair_q	all_pairs_list; /* sorted through gtree */
 	GTree			*nominated_pairs; /* nominated by peer */
 	GTree			*succeeded_pairs; /* checked by us */
 	GTree			*valid_pairs; /* succeeded and nominated */
@@ -134,7 +131,7 @@ struct ice_agent {
 
 	str			ufrag[2]; /* 0 = remote, 1 = local */
 	str			pwd[2]; /* ditto */
-	volatile unsigned int	agent_flags;
+	atomic64		agent_flags;
 };
 
 
@@ -152,22 +149,27 @@ void ice_free(void);
 enum ice_candidate_type ice_candidate_type(const str *s);
 bool ice_has_related(enum ice_candidate_type);
 void ice_foundation(str *);
+bool ice_peer_address_known(struct ice_agent *, const endpoint_t *, struct packet_stream *,
+		const struct local_intf *ifa);
 
 void ice_agent_init(struct ice_agent **agp, struct call_media *media);
 void ice_update(struct ice_agent *, struct stream_params *, bool allow_restart);
 void ice_shutdown(struct ice_agent **);
 void ice_restart(struct ice_agent *);
 
-void ice_candidates_free(GQueue *);
-void ice_remote_candidates(GQueue *, struct ice_agent *);
+void ice_candidates_free(candidate_q *);
+void ice_remote_candidates(candidate_q *, struct ice_agent *);
 
-void ice_thread_run(void *);
+void ice_thread_launch(void);
 
-int ice_request(struct stream_fd *, const endpoint_t *, struct stun_attrs *);
-int ice_response(struct stream_fd *, const endpoint_t *src,
+int ice_request(stream_fd *, const endpoint_t *, struct stun_attrs *);
+int ice_response(stream_fd *, const endpoint_t *src,
 		struct stun_attrs *attrs, void *transaction);
 
-
+void dequeue_sdp_fragments(struct call_monologue *);
+bool trickle_ice_update(ng_buffer *ngbuf, call_t *call, sdp_ng_flags *flags,
+		sdp_streams_q *streams);
+void ice_fragments_cleanup(fragments_ht ht, bool all);
 
 #include "call.h"
 

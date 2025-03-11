@@ -5,10 +5,8 @@
 #include <openssl/hmac.h>
 #include <glib.h>
 
-#include "xt_RTPENGINE.h"
-
 #include "str.h"
-#include "aux.h"
+#include "helpers.h"
 #include "rtp.h"
 #include "rtcp.h"
 #include "log.h"
@@ -16,30 +14,28 @@
 #include "rtcplib.h"
 #include "main.h"
 #include "ssllib.h"
+#include "types.h"
 
-
-
+#include "xt_RTPENGINE.h"
 
 __thread GString *crypto_debug_string;
 
-
-
-static int aes_cm_encrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint64_t);
-static int aes_cm_encrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint64_t);
-static int aes_gcm_encrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint64_t);
-static int aes_gcm_decrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint64_t);
-static int aes_gcm_encrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint64_t);
-static int aes_gcm_decrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint64_t);
-static int hmac_sha1_rtp(struct crypto_context *, char *out, str *in, uint64_t);
+static int aes_cm_encrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint32_t);
+static int aes_cm_encrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint32_t);
+static int aes_gcm_encrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint32_t);
+static int aes_gcm_decrypt_rtp(struct crypto_context *, struct rtp_header *, str *, uint32_t);
+static int aes_gcm_encrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint32_t);
+static int aes_gcm_decrypt_rtcp(struct crypto_context *, struct rtcp_packet *, str *, uint32_t);
+static int hmac_sha1_rtp(struct crypto_context *, char *out, str *in, uint32_t);
 static int hmac_sha1_rtcp(struct crypto_context *, char *out, str *in);
-static int aes_f8_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx);
-static int aes_f8_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx);
+static int aes_f8_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx);
+static int aes_f8_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx);
 static int aes_cm_session_key_init(struct crypto_context *c);
 static int aes_gcm_session_key_init(struct crypto_context *c);
 static int aes_f8_session_key_init(struct crypto_context *c);
 static int evp_session_key_cleanup(struct crypto_context *c);
-static int null_crypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx);
-static int null_crypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx);
+static int null_crypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx);
+static int null_crypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx);
 
 /* all lengths are in bytes */
 struct crypto_suite __crypto_suites[] = {
@@ -337,22 +333,14 @@ const unsigned int num_crypto_suites = G_N_ELEMENTS(__crypto_suites);
 
 
 const struct crypto_suite * crypto_find_suite(const str *s) {
-	int i, l;
+	int i;
 	const struct crypto_suite *cs;
 
 	for (i = 0; i < num_crypto_suites; i++) {
 		cs = &crypto_suites[i];
-		if (!cs->name)
-			continue;
 
-		l = strlen(cs->name);
-		if (l != s->len)
-			continue;
-
-		if (strncasecmp(cs->name, s->s, s->len))
-			continue;
-
-		return cs;
+		if (str_casecmp_str(&cs->name_str, s) == 0)
+			return cs;
 	}
 
 	return NULL;
@@ -458,7 +446,7 @@ static void prf_n(str *out, const unsigned char *key, const EVP_CIPHER *ciph, co
 	memcpy(iv, x, 14);
 	/* iv[14] = iv[15] = 0;   := x << 16 */
 	ZERO(in); /* outputs the key stream */
-	str_init_len(&in_s, (void *) in, out->len > 16 ? 32 : 16);
+	in_s = STR_LEN(in, out->len > 16 ? 32 : 16);
 	aes_ctr_no_ctx(o, &in_s, key, ciph, iv);
 
 	memcpy(out->s, o, out->len);
@@ -467,7 +455,7 @@ static void prf_n(str *out, const unsigned char *key, const EVP_CIPHER *ciph, co
 
 
 /* rfc 3711 section 4.3.1 */
-int crypto_gen_session_key(struct crypto_context *c, str *out, unsigned char label, int index_len) {
+int crypto_gen_session_key(struct crypto_context *c, str *out, unsigned char label, unsigned int index_len) {
 	unsigned char key_id[7]; /* [ label, 48-bit ROC || SEQ ] */
 	unsigned char x[14];
 	int i;
@@ -527,7 +515,7 @@ int crypto_gen_session_key(struct crypto_context *c, str *out, unsigned char lab
  */
 
 /* rfc 3711 section 4.1.1 */
-static int aes_cm_encrypt(struct crypto_context *c, uint32_t ssrc, str *s, uint64_t idx) {
+static int aes_cm_encrypt(struct crypto_context *c, uint32_t ssrc, str *s, uint32_t idx) {
 	unsigned char iv[16];
 	uint32_t *ivi;
 	uint32_t idxh, idxl;
@@ -535,9 +523,8 @@ static int aes_cm_encrypt(struct crypto_context *c, uint32_t ssrc, str *s, uint6
 	memcpy(iv, c->session_salt, 14);
 	iv[14] = iv[15] = '\0';
 	ivi = (void *) iv;
-	idx <<= 16;
-	idxh = htonl((idx & 0xffffffff00000000ULL) >> 32);
-	idxl = htonl(idx & 0xffffffffULL);
+	idxh = htonl((idx & 0xffff0000ULL) >> 16);
+	idxl = htonl((idx & 0x0000ffffULL) << 16);
 
 	ivi[1] ^= ssrc;
 	ivi[2] ^= idxh;
@@ -549,12 +536,12 @@ static int aes_cm_encrypt(struct crypto_context *c, uint32_t ssrc, str *s, uint6
 }
 
 /* rfc 3711 section 4.1 */
-static int aes_cm_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx) {
+static int aes_cm_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx) {
 	return aes_cm_encrypt(c, r->ssrc, s, idx);
 }
 
 /* rfc 3711 sections 3.4 and 4.1 */
-static int aes_cm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx) {
+static int aes_cm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx) {
 	return aes_cm_encrypt(c, r->ssrc, s, idx);
 }
 
@@ -573,15 +560,15 @@ union aes_gcm_rtp_iv {
 _Static_assert(offsetof(union aes_gcm_rtp_iv, seq) == 10,
                "union aes_gcm_rtp_iv not packed");
 
-static int aes_gcm_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx) {
+static int aes_gcm_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx) {
 	union aes_gcm_rtp_iv iv;
 	int len, ciphertext_len;
 
 	memcpy(iv.bytes, c->session_salt, 12);
 
 	iv.ssrc ^= r->ssrc;
-	iv.roq ^= htonl((idx & 0x00ffffffff0000ULL) >> 16);
-	iv.seq ^= htons(idx & 0x00ffffULL);
+	iv.roq ^= htonl((idx & 0xffffff0000ULL) >> 16);
+	iv.seq ^= htons( idx & 0x000000ffffULL);
 
 	EVP_EncryptInit_ex(c->session_key_ctx[0], c->params.crypto_suite->aead_evp(), NULL,
 			(const unsigned char *) c->session_key, iv.bytes);
@@ -602,7 +589,7 @@ static int aes_gcm_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, s
 	return 0;
 }
 
-static int aes_gcm_decrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx) {
+static int aes_gcm_decrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx) {
 	union aes_gcm_rtp_iv iv;
 	int len, plaintext_len;
 
@@ -612,8 +599,8 @@ static int aes_gcm_decrypt_rtp(struct crypto_context *c, struct rtp_header *r, s
 	memcpy(iv.bytes, c->session_salt, 12);
 
 	iv.ssrc ^= r->ssrc;
-	iv.roq ^= htonl((idx & 0x00ffffffff0000ULL) >> 16);
-	iv.seq ^= htons(idx & 0x00ffffULL);
+	iv.roq ^= htonl((idx & 0xffff0000ULL) >> 16);
+	iv.seq ^= htons( idx & 0x0000ffffULL);
 
 	EVP_DecryptInit_ex(c->session_key_ctx[0], c->params.crypto_suite->aead_evp(), NULL,
 			(const unsigned char *) c->session_key, iv.bytes);
@@ -649,7 +636,7 @@ union aes_gcm_rtcp_iv {
 _Static_assert(offsetof(union aes_gcm_rtcp_iv, srtcp) == 8,
                "union aes_gcm_rtcp_iv not packed");
 
-static int aes_gcm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx) {
+static int aes_gcm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx) {
 	union aes_gcm_rtcp_iv iv;
 	uint32_t e_idx;
 	int len, ciphertext_len;
@@ -658,7 +645,7 @@ static int aes_gcm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r,
 
 	iv.ssrc ^= r->ssrc;
 	iv.srtcp ^= htonl(idx & 0x007fffffffULL);
-	e_idx = htonl( (idx&0x007fffffffULL) | 0x80000000);
+	e_idx = htonl((idx & 0x007fffffffULL) | 0x80000000ULL);
 
 	EVP_EncryptInit_ex(c->session_key_ctx[0], c->params.crypto_suite->aead_evp(), NULL,
 			(const unsigned char *) c->session_key, iv.bytes);
@@ -680,16 +667,19 @@ static int aes_gcm_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r,
 	return 0;
 }
 
-static int aes_gcm_decrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx) {
+static int aes_gcm_decrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx) {
 	union aes_gcm_rtcp_iv iv;
 	uint32_t e_idx;
 	int len, plaintext_len;
+
+	if (s->len < 16)
+		return -1;
 
 	memcpy(iv.bytes, c->session_salt, 12);
 
 	iv.ssrc ^= r->ssrc;
 	iv.srtcp ^= htonl(idx & 0x007fffffffULL);
-	e_idx = htonl( (idx&0x007fffffffULL) | 0x80000000);
+	e_idx = htonl((idx & 0x007fffffffULL) | 0x80000000ULL);
 
 	EVP_DecryptInit_ex(c->session_key_ctx[0], c->params.crypto_suite->aead_evp(), NULL,
 			(const unsigned char *) c->session_key, iv.bytes);
@@ -773,7 +763,7 @@ done:
 }
 
 /* rfc 3711 section 4.1.2.2 */
-static int aes_f8_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx) {
+static int aes_f8_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx) {
 	unsigned char iv[16];
 	uint32_t roc;
 
@@ -788,7 +778,7 @@ static int aes_f8_encrypt_rtp(struct crypto_context *c, struct rtp_header *r, st
 }
 
 /* rfc 3711 section 4.1.2.3 */
-static int aes_f8_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx) {
+static int aes_f8_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx) {
 	unsigned char iv[16];
 	uint32_t i;
 
@@ -802,7 +792,7 @@ static int aes_f8_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, 
 	return 0;
 }
 /* rfc 3711, sections 4.2 and 4.2.1 */
-static int hmac_sha1_rtp(struct crypto_context *c, char *out, str *in, uint64_t index) {
+static int hmac_sha1_rtp(struct crypto_context *c, char *out, str *in, uint32_t index) {
 	unsigned char hmac[20];
 	uint32_t roc;
 
@@ -942,10 +932,10 @@ static int evp_session_key_cleanup(struct crypto_context *c) {
 	return 0;
 }
 
-static int null_crypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint64_t idx) {
+static int null_crypt_rtp(struct crypto_context *c, struct rtp_header *r, str *s, uint32_t idx) {
 	return 0;
 }
-static int null_crypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint64_t idx) {
+static int null_crypt_rtcp(struct crypto_context *c, struct rtcp_packet *r, str *s, uint32_t idx) {
 	return 0;
 }
 
@@ -1002,12 +992,12 @@ out:
 	return *buf;
 }
 
-void crypto_init_main() {
+void crypto_init_main(void) {
 	struct crypto_suite *cs;
 	for (unsigned int i = 0; i < num_crypto_suites; i++) {
 		cs = &__crypto_suites[i];
 		cs->idx = i;
-		str_init(&cs->name_str, (char *) cs->name);
+		cs->name_str = STR(cs->name);
 		switch(cs->master_key_len) {
 		case 16:
 			cs->aes_evp = EVP_aes_128_ecb();

@@ -11,6 +11,10 @@
 #include <bcg729/decoder.h>
 #endif
 #include <opus.h>
+#ifdef HAVE_CODEC_CHAIN
+#include <codec-chain/types.h>
+#include <codec-chain/client.h>
+#endif
 #include "str.h"
 #include "log.h"
 #include "loglib.h"
@@ -32,9 +36,9 @@
 
 
 
-static packetizer_f packetizer_passthrough; // pass frames as they arrive in AVPackets
 static packetizer_f packetizer_samplestream; // flat stream of samples
 static packetizer_f packetizer_amr;
+
 
 static void codeclib_key_value_parse(const str *instr, bool need_value,
 		void (*cb)(str *key, str *value, void *data), void *data);
@@ -48,6 +52,9 @@ static void libopus_encoder_close(encoder_t *enc);
 static format_init_f opus_init;
 static select_encoder_format_f opus_select_encoder_format;
 static select_decoder_format_f opus_select_decoder_format;
+static format_parse_f opus_format_parse;
+static format_print_f opus_format_print;
+static format_answer_f opus_format_answer;
 
 static format_parse_f ilbc_format_parse;
 static set_enc_options_f ilbc_set_enc_options;
@@ -87,6 +94,14 @@ static void generic_cn_dtx_cleanup(decoder_t *);
 static int generic_cn_dtx(decoder_t *, GQueue *, int);
 
 
+#if defined(__x86_64__)
+// mvr2s_x64_avx2.S
+void mvr2s_avx2(float *in, const uint16_t len, int16_t *out);
+
+// mvr2s_x64_avx512.S
+void mvr2s_avx512(float *in, const uint16_t len, int16_t *out);
+#endif
+
 
 
 static void *evs_lib_handle;
@@ -107,8 +122,9 @@ static void (*evs_enc_out)(void *, unsigned char *buf, uint16_t *len);
 static void (*evs_dec_in)(void *, char *in, uint16_t len, uint16_t amr_mode, uint16_t core_mode,
 		uint16_t q_bit, uint16_t partial_frame, uint16_t next_type);
 static void (*evs_dec_out)(void *, void *, int frame_mode); // frame_mode=1: missing
+static void (*evs_dec_inc_frame)(void *);
 static void (*evs_amr_dec_out)(void *, void *);
-static void (*evs_syn_output)(float *in, const uint16_t len, uint16_t *out);
+static void (*evs_syn_output)(float *in, const uint16_t len, int16_t *out);
 static void (*evs_reset_enc_ind)(void *);
 
 static void evs_def_init(struct codec_def_s *);
@@ -124,6 +140,242 @@ static format_print_f evs_format_print;
 static format_answer_f evs_format_answer;
 static select_encoder_format_f evs_select_encoder_format;
 
+
+
+
+static void *cc_lib_handle;
+
+#ifdef HAVE_CODEC_CHAIN
+
+static __typeof__(codec_chain_client_connect) *cc_client_connect;
+static __typeof__(codec_chain_set_thread_funcs) *cc_set_thread_funcs;
+
+
+static __typeof__(codec_chain_client_pcma2opus_runner_new) *cc_client_pcma2opus_runner_new;
+static __typeof__(codec_chain_client_pcmu2opus_runner_new) *cc_client_pcmu2opus_runner_new;
+static __typeof__(codec_chain_client_opus2pcma_runner_new) *cc_client_opus2pcma_runner_new;
+static __typeof__(codec_chain_client_opus2pcmu_runner_new) *cc_client_opus2pcmu_runner_new;
+
+static __typeof__(codec_chain_client_pcma2opus_runner_free) *cc_client_pcma2opus_runner_free;
+static __typeof__(codec_chain_client_pcmu2opus_runner_free) *cc_client_pcmu2opus_runner_free;
+static __typeof__(codec_chain_client_opus2pcma_runner_free) *cc_client_opus2pcma_runner_free;
+static __typeof__(codec_chain_client_opus2pcmu_runner_free) *cc_client_opus2pcmu_runner_free;
+
+static __typeof__(codec_chain_client_pcma2opus_async_runner_new) *cc_client_pcma2opus_async_runner_new;
+static __typeof__(codec_chain_client_pcmu2opus_async_runner_new) *cc_client_pcmu2opus_async_runner_new;
+static __typeof__(codec_chain_client_opus2pcma_async_runner_new) *cc_client_opus2pcma_async_runner_new;
+static __typeof__(codec_chain_client_opus2pcmu_async_runner_new) *cc_client_opus2pcmu_async_runner_new;
+
+static __typeof__(codec_chain_client_pcma2opus_async_runner_free) *cc_client_pcma2opus_async_runner_free;
+static __typeof__(codec_chain_client_pcmu2opus_async_runner_free) *cc_client_pcmu2opus_async_runner_free;
+static __typeof__(codec_chain_client_opus2pcma_async_runner_free) *cc_client_opus2pcma_async_runner_free;
+static __typeof__(codec_chain_client_opus2pcmu_async_runner_free) *cc_client_opus2pcmu_async_runner_free;
+
+static __typeof__(codec_chain_pcma2opus_runner_do) *cc_pcma2opus_runner_do;
+static __typeof__(codec_chain_pcmu2opus_runner_do) *cc_pcmu2opus_runner_do;
+static __typeof__(codec_chain_opus2pcma_runner_do) *cc_opus2pcma_runner_do;
+static __typeof__(codec_chain_opus2pcmu_runner_do) *cc_opus2pcmu_runner_do;
+
+static __typeof__(codec_chain_pcma2opus_runner_async_do_nonblock) *cc_pcma2opus_runner_async_do_nonblock;
+static __typeof__(codec_chain_pcmu2opus_runner_async_do_nonblock) *cc_pcmu2opus_runner_async_do_nonblock;
+static __typeof__(codec_chain_opus2pcma_runner_async_do_nonblock) *cc_opus2pcma_runner_async_do_nonblock;
+static __typeof__(codec_chain_opus2pcmu_runner_async_do_nonblock) *cc_opus2pcmu_runner_async_do_nonblock;
+
+static __typeof__(codec_chain_client_float2opus_new_ext) *cc_client_float2opus_new_ext;
+static __typeof__(codec_chain_client_opus2float_new) *cc_client_opus2float_new;
+
+static __typeof__(codec_chain_client_float2opus_free) *cc_client_float2opus_free;
+static __typeof__(codec_chain_client_opus2float_free) *cc_client_opus2float_free;
+
+
+static __typeof__(codec_chain_client_pcma2g729a_runner_new) *cc_client_pcma2g729a_runner_new;
+static __typeof__(codec_chain_client_pcmu2g729a_runner_new) *cc_client_pcmu2g729a_runner_new;
+static __typeof__(codec_chain_client_g729a2pcma_runner_new) *cc_client_g729a2pcma_runner_new;
+static __typeof__(codec_chain_client_g729a2pcmu_runner_new) *cc_client_g729a2pcmu_runner_new;
+
+static __typeof__(codec_chain_client_pcma2g729a_runner_free) *cc_client_pcma2g729a_runner_free;
+static __typeof__(codec_chain_client_pcmu2g729a_runner_free) *cc_client_pcmu2g729a_runner_free;
+static __typeof__(codec_chain_client_g729a2pcma_runner_free) *cc_client_g729a2pcma_runner_free;
+static __typeof__(codec_chain_client_g729a2pcmu_runner_free) *cc_client_g729a2pcmu_runner_free;
+
+static __typeof__(codec_chain_client_pcma2g729a_async_runner_new) *cc_client_pcma2g729a_async_runner_new;
+static __typeof__(codec_chain_client_pcmu2g729a_async_runner_new) *cc_client_pcmu2g729a_async_runner_new;
+static __typeof__(codec_chain_client_g729a2pcma_async_runner_new) *cc_client_g729a2pcma_async_runner_new;
+static __typeof__(codec_chain_client_g729a2pcmu_async_runner_new) *cc_client_g729a2pcmu_async_runner_new;
+
+static __typeof__(codec_chain_client_pcma2g729a_async_runner_free) *cc_client_pcma2g729a_async_runner_free;
+static __typeof__(codec_chain_client_pcmu2g729a_async_runner_free) *cc_client_pcmu2g729a_async_runner_free;
+static __typeof__(codec_chain_client_g729a2pcma_async_runner_free) *cc_client_g729a2pcma_async_runner_free;
+static __typeof__(codec_chain_client_g729a2pcmu_async_runner_free) *cc_client_g729a2pcmu_async_runner_free;
+
+static __typeof__(codec_chain_pcma2g729a_runner_do) *cc_pcma2g729a_runner_do;
+static __typeof__(codec_chain_pcmu2g729a_runner_do) *cc_pcmu2g729a_runner_do;
+static __typeof__(codec_chain_g729a2pcma_runner_do) *cc_g729a2pcma_runner_do;
+static __typeof__(codec_chain_g729a2pcmu_runner_do) *cc_g729a2pcmu_runner_do;
+
+static __typeof__(codec_chain_pcma2g729a_runner_async_do_nonblock) *cc_pcma2g729a_runner_async_do_nonblock;
+static __typeof__(codec_chain_pcmu2g729a_runner_async_do_nonblock) *cc_pcmu2g729a_runner_async_do_nonblock;
+static __typeof__(codec_chain_g729a2pcma_runner_async_do_nonblock) *cc_g729a2pcma_runner_async_do_nonblock;
+static __typeof__(codec_chain_g729a2pcmu_runner_async_do_nonblock) *cc_g729a2pcmu_runner_async_do_nonblock;
+
+static __typeof__(codec_chain_client_float2g729a_new) *cc_client_float2g729a_new;
+static __typeof__(codec_chain_client_g729a2float_new) *cc_client_g729a2float_new;
+
+static __typeof__(codec_chain_client_float2g729a_free) *cc_client_float2g729a_free;
+static __typeof__(codec_chain_client_g729a2float_free) *cc_client_g729a2float_free;
+
+
+static codec_chain_client *cc_client;
+
+
+static codec_chain_pcma2opus_runner *pcma2opus_runner;
+static codec_chain_pcmu2opus_runner *pcmu2opus_runner;
+static codec_chain_opus2pcmu_runner *opus2pcmu_runner;
+static codec_chain_opus2pcma_runner *opus2pcma_runner;
+
+static codec_chain_pcma2opus_async_runner *pcma2opus_async_runner;
+static codec_chain_pcmu2opus_async_runner *pcmu2opus_async_runner;
+static codec_chain_opus2pcmu_async_runner *opus2pcmu_async_runner;
+static codec_chain_opus2pcma_async_runner *opus2pcma_async_runner;
+
+
+static codec_chain_pcma2g729a_runner *pcma2g729a_runner;
+static codec_chain_pcmu2g729a_runner *pcmu2g729a_runner;
+static codec_chain_g729a2pcma_runner *g729a2pcma_runner;
+static codec_chain_g729a2pcmu_runner *g729a2pcmu_runner;
+
+static codec_chain_pcma2g729a_async_runner *pcma2g729a_async_runner;
+static codec_chain_pcmu2g729a_async_runner *pcmu2g729a_async_runner;
+static codec_chain_g729a2pcma_async_runner *g729a2pcma_async_runner;
+static codec_chain_g729a2pcmu_async_runner *g729a2pcmu_async_runner;
+
+
+typedef enum {
+	CCC_OK,
+	CCC_ASYNC,
+	CCC_ERR,
+} codec_cc_state;
+
+struct async_job {
+	str data;
+	unsigned long ts;
+	void *async_cb_obj;
+};
+TYPED_GQUEUE(async_job, struct async_job);
+
+struct codec_cc_s {
+	union {
+		struct {
+			codec_chain_pcmu2opus_runner *runner;
+			codec_chain_float2opus *enc;
+		} pcmu2opus;
+		struct {
+			codec_chain_pcma2opus_runner *runner;
+			codec_chain_float2opus *enc;
+		} pcma2opus;
+		struct {
+			codec_chain_pcmu2g729a_runner *runner;
+			codec_chain_float2g729a *enc;
+		} pcmu2g729a;
+		struct {
+			codec_chain_pcma2g729a_runner *runner;
+			codec_chain_float2g729a *enc;
+		} pcma2g729a;
+		struct {
+			codec_chain_g729a2pcma_runner *runner;
+			codec_chain_g729a2float *dec;
+		} g729a2pcma;
+		struct {
+			codec_chain_g729a2pcmu_runner *runner;
+			codec_chain_g729a2float *dec;
+		} g729a2pcmu;
+		struct {
+			codec_chain_opus2pcmu_runner *runner;
+			codec_chain_opus2float *dec;
+		} opus2pcmu;
+		struct {
+			codec_chain_opus2pcma_runner *runner;
+			codec_chain_opus2float *dec;
+		} opus2pcma;
+		struct {
+			codec_chain_pcmu2opus_async_runner *runner;
+			codec_chain_float2opus *enc;
+		} pcmu2opus_async;
+		struct {
+			codec_chain_pcma2opus_async_runner *runner;
+			codec_chain_float2opus *enc;
+		} pcma2opus_async;
+		struct {
+			codec_chain_pcmu2g729a_async_runner *runner;
+			codec_chain_float2g729a *enc;
+		} pcmu2g729a_async;
+		struct {
+			codec_chain_pcma2g729a_async_runner *runner;
+			codec_chain_float2g729a *enc;
+		} pcma2g729a_async;
+		struct {
+			codec_chain_g729a2pcma_async_runner *runner;
+			codec_chain_float2g729a *enc;
+		} g729a2pcma_async;
+		struct {
+			codec_chain_g729a2pcmu_async_runner *runner;
+			codec_chain_float2g729a *enc;
+		} g729a2pcmu_async;
+		struct {
+			codec_chain_opus2pcmu_async_runner *runner;
+			codec_chain_opus2float *dec;
+		} opus2pcmu_async;
+		struct {
+			codec_chain_opus2pcma_async_runner *runner;
+			codec_chain_opus2float *dec;
+		} opus2pcma_async;
+	};
+	AVPacket *avpkt;
+	codec_cc_state (*run)(codec_cc_t *c, const str *data, unsigned long ts, void *);
+	void (*clear)(void *);
+	void *clear_arg;
+
+	mutex_t async_lock;
+	AVPacket *avpkt_async;
+	size_t data_len;
+	bool async_busy; // currently processing a packet
+	bool async_blocked; // couldn't find context
+	bool async_shutdown; // shutdown/free happened while busy
+	async_job_q async_jobs;
+	unsigned long ts;
+	void *(*async_init)(void *, void *, void *);
+	void (*async_callback)(AVPacket *, void *);
+	void *async_cb_obj;
+};
+
+static codec_cc_t *codec_cc_new_sync(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *));
+static codec_cc_t *codec_cc_new_async(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *));
+
+
+static bool __cc_pcmu2opus_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_pcma2opus_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_opus2pcma_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_opus2pcmu_run_async(codec_cc_t *, const str *, unsigned long, void *);
+
+
+static bool __cc_pcmu2g729a_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_pcma2g729a_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_g729a2pcmu_run_async(codec_cc_t *, const str *, unsigned long, void *);
+static bool __cc_g729a2pcma_run_async(codec_cc_t *, const str *, unsigned long, void *);
+
+
+codec_cc_t *(*codec_cc_new)(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *));
+
+#endif
 
 
 
@@ -206,6 +458,7 @@ static const dtx_method_t dtx_method_evs = {
 
 #ifdef HAVE_BCG729
 static packetizer_f packetizer_g729; // aggregate some frames into packets
+static format_cmp_f format_cmp_g729;
 
 static void bcg729_def_init(struct codec_def_s *);
 static const char *bcg729_decoder_init(decoder_t *, const str *);
@@ -239,11 +492,12 @@ static struct codec_def_s __codec_defs[] = {
 		.bits_per_sample = 8,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
-		.silence_pattern = STR_CONST_INIT("\xd5"),
+		.silence_pattern = STR_CONST("\xd5"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "PCMU",
@@ -255,11 +509,12 @@ static struct codec_def_s __codec_defs[] = {
 		.bits_per_sample = 8,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
-		.silence_pattern = STR_CONST_INIT("\xff"),
+		.silence_pattern = STR_CONST("\xff"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "G723",
@@ -276,6 +531,7 @@ static struct codec_def_s __codec_defs[] = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "G722",
@@ -284,15 +540,17 @@ static struct codec_def_s __codec_defs[] = {
 		.default_clockrate = 8000,
 		.default_channels = 1,
 		.default_ptime = 20,
+		.format_cmp = format_cmp_ignore,
 		.packetizer = packetizer_samplestream,
 		.bits_per_sample = 4,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_avcodec,
-		.silence_pattern = STR_CONST_INIT("\xfa"),
+		.silence_pattern = STR_CONST("\xfa"),
 		.dtx_methods = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "QCELP",
@@ -322,6 +580,7 @@ static struct codec_def_s __codec_defs[] = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "G729a",
@@ -337,6 +596,7 @@ static struct codec_def_s __codec_defs[] = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 #else
 	{
@@ -347,6 +607,7 @@ static struct codec_def_s __codec_defs[] = {
 		.default_ptime = 20,
 		.minimum_ptime = 20,
 		.default_fmtp = "annexb=no",
+		.format_cmp = format_cmp_g729,
 		.packetizer = packetizer_g729,
 		.bits_per_sample = 1, // 10 ms frame has 80 samples and encodes as (max) 10 bytes = 80 bits
 		.media_type = MT_AUDIO,
@@ -355,6 +616,7 @@ static struct codec_def_s __codec_defs[] = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 	{
 		.rtpname = "G729a",
@@ -363,6 +625,7 @@ static struct codec_def_s __codec_defs[] = {
 		.default_channels = 1,
 		.default_ptime = 20,
 		.minimum_ptime = 20,
+		.format_cmp = format_cmp_g729,
 		.packetizer = packetizer_g729,
 		.bits_per_sample = 1, // 10 ms frame has 80 samples and encodes as (max) 10 bytes = 80 bits
 		.media_type = MT_AUDIO,
@@ -371,6 +634,7 @@ static struct codec_def_s __codec_defs[] = {
 			[DTX_SILENCE] = &dtx_method_silence,
 			[DTX_CN] = &dtx_method_cn,
 		},
+		.fixed_sizes = 1,
 	},
 #endif
 	{
@@ -431,7 +695,11 @@ static struct codec_def_s __codec_defs[] = {
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_libopus,
 		.init = opus_init,
+		.default_fmtp = "useinbandfec=1",
+		.format_parse = opus_format_parse,
+		.format_print = opus_format_print,
 		.format_cmp = format_cmp_ignore,
+		.format_answer = opus_format_answer,
 		.select_encoder_format = opus_select_encoder_format,
 		.select_decoder_format = opus_select_decoder_format,
 		.dtx_methods = {
@@ -457,6 +725,7 @@ static struct codec_def_s __codec_defs[] = {
 		.select_encoder_format = evs_select_encoder_format,
 		.packetizer = packetizer_passthrough,
 		.bits_per_sample = 1,
+		.evs = 1,
 		.media_type = MT_AUDIO,
 		.codec_type = &codec_type_evs,
 		.dtx_methods = {
@@ -676,6 +945,9 @@ static GQueue __supplemental_codecs = G_QUEUE_INIT;
 const GQueue * const codec_supplemental_codecs = &__supplemental_codecs;
 static codec_def_t *codec_def_cn;
 
+void (*codeclib_thread_init)(void);
+void (*codeclib_thread_cleanup)(void);
+void (*codeclib_thread_loop)(void);
 
 
 static GHashTable *codecs_ht;
@@ -704,25 +976,31 @@ static const char *avc_decoder_init(decoder_t *dec, const str *extra_opts) {
 	if (!codec)
 		return "codec not supported";
 
-	dec->u.avc.avpkt = av_packet_alloc();
+	dec->avc.avpkt = av_packet_alloc();
 
-	dec->u.avc.avcctx = avcodec_alloc_context3(codec);
-	if (!dec->u.avc.avcctx)
+	dec->avc.avcctx = avcodec_alloc_context3(codec);
+	if (!dec->avc.avcctx)
 		return "failed to alloc codec context";
-	SET_CHANNELS(dec->u.avc.avcctx, dec->in_format.channels);
-	DEF_CH_LAYOUT(&dec->u.avc.avcctx->CH_LAYOUT, dec->in_format.channels);
-	dec->u.avc.avcctx->sample_rate = dec->in_format.clockrate;
+	SET_CHANNELS(dec->avc.avcctx, dec->in_format.channels);
+	DEF_CH_LAYOUT(&dec->avc.avcctx->CH_LAYOUT, dec->in_format.channels);
+	dec->avc.avcctx->sample_rate = dec->in_format.clockrate;
 
 	if (dec->def->set_dec_options)
 		dec->def->set_dec_options(dec, extra_opts);
 
-	int i = avcodec_open2(dec->u.avc.avcctx, codec, NULL);
+	int i = avcodec_open2(dec->avc.avcctx, codec, NULL);
 	if (i) {
 		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Error returned from libav: %s", av_error(i));
 		return "failed to open codec context";
 	}
 
-	for (const enum AVSampleFormat *sfmt = codec->sample_fmts; sfmt && *sfmt != -1; sfmt++)
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 19, 0)
+	avcodec_get_supported_config(dec->avc.avcctx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void **) &dec->avc.sample_fmts, NULL);
+#else
+	dec->avc.sample_fmts = codec->sample_fmts;
+#endif
+
+	for (const enum AVSampleFormat *sfmt = dec->avc.sample_fmts; sfmt && *sfmt != -1; sfmt++)
 		cdbg("supported sample format for input codec %s: %s",
 				codec->name, av_get_sample_fmt_name(*sfmt));
 
@@ -794,8 +1072,12 @@ decoder_t *decoder_new_fmtp(codec_def_t *def, int clockrate, int channels, int p
 	if (resample_fmt)
 		ret->dest_format = *resample_fmt;
 
+	err = "failed to parse \"fmtp\"";
+	if (codec_parse_fmtp(def, fmtp, fmtp_string, &ret->format_options))
+		goto err;
+
 	if (def->select_decoder_format)
-		def->select_decoder_format(ret);
+		def->select_decoder_format(ret, fmtp);
 
 	ret->in_format.clockrate = fraction_mult(ret->in_format.clockrate, &ret->clockrate_fact);
 	ret->dec_out_format = ret->in_format;
@@ -813,10 +1095,6 @@ decoder_t *decoder_new_fmtp(codec_def_t *def, int clockrate, int channels, int p
 			break;
 		}
 	}
-
-	err = "failed to parse \"fmtp\"";
-	if (codec_parse_fmtp(def, fmtp, fmtp_string, &ret->format_options))
-		goto err;
 
 	err = def->codec_type->decoder_init(ret, extra_opts);
 	if (err)
@@ -862,7 +1140,7 @@ int decoder_switch_dtx(decoder_t *dec, enum dtx_method dm) {
 int decoder_set_cn_dtx(decoder_t *dec, const str *cn_pl) {
 	if (decoder_switch_dtx(dec, DTX_CN))
 		return -1;
-	dec->dtx.u.cn.cn_payload = cn_pl;
+	dec->dtx.cn.cn_payload = cn_pl;
 	return 0;
 }
 
@@ -874,12 +1152,12 @@ gboolean decoder_has_dtx(decoder_t *dec) {
 
 static void avc_decoder_close(decoder_t *dec) {
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 1, 0)
-	avcodec_free_context(&dec->u.avc.avcctx);
+	avcodec_free_context(&dec->avc.avcctx);
 #else
-	avcodec_close(dec->u.avc.avcctx);
-	av_free(dec->u.avc.avcctx);
+	avcodec_close(dec->avc.avcctx);
+	av_free(dec->avc.avcctx);
 #endif
-	av_packet_free(&dec->u.avc.avpkt);
+	av_packet_free(&dec->avc.avpkt);
 }
 
 
@@ -899,15 +1177,15 @@ void decoder_close(decoder_t *dec) {
 
 
 static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
-	if (!dec->u.avc.avpkt)
+	if (!dec->avc.avpkt)
 		return -1; // decoder shut down
 
 	const char *err;
 	int av_ret = 0;
 
-	dec->u.avc.avpkt->data = (unsigned char *) data->s;
-	dec->u.avc.avpkt->size = data->len;
-	dec->u.avc.avpkt->pts = dec->pts;
+	dec->avc.avpkt->data = (unsigned char *) data->s;
+	dec->avc.avpkt->size = data->len;
+	dec->avc.avpkt->pts = dec->pts;
 
 	AVFrame *frame = NULL;
 
@@ -922,13 +1200,13 @@ static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 			goto err;
 
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 36, 0)
-		if (dec->u.avc.avpkt->size) {
-			av_ret = avcodec_send_packet(dec->u.avc.avcctx, dec->u.avc.avpkt);
+		if (dec->avc.avpkt->size) {
+			av_ret = avcodec_send_packet(dec->avc.avcctx, dec->avc.avpkt);
 			cdbg("send packet ret %i", av_ret);
 			err = "failed to send packet to avcodec";
 			if (av_ret == 0) {
 				// consumed the packet
-				dec->u.avc.avpkt->size = 0;
+				dec->avc.avpkt->size = 0;
 				keep_going = 1;
 			}
 			else {
@@ -939,7 +1217,7 @@ static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 			}
 		}
 
-		av_ret = avcodec_receive_frame(dec->u.avc.avcctx, frame);
+		av_ret = avcodec_receive_frame(dec->avc.avcctx, frame);
 		cdbg("receive frame ret %i", av_ret);
 		err = "failed to receive frame from avcodec";
 		if (av_ret == 0) {
@@ -955,10 +1233,10 @@ static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 		}
 #else
 		// only do this if we have any input left
-		if (dec->u.avc.avpkt->size == 0)
+		if (dec->avc.avpkt->size == 0)
 			break;
 
-		av_ret = avcodec_decode_audio4(dec->u.avc.avcctx, frame, &got_frame, dec->u.avc.avpkt);
+		av_ret = avcodec_decode_audio4(dec->avc.avcctx, frame, &got_frame, dec->avc.avpkt);
 		cdbg("decode frame ret %i, got frame %i", av_ret, got_frame);
 		err = "failed to decode audio packet";
 		if (av_ret < 0)
@@ -966,10 +1244,10 @@ static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 		if (av_ret > 0) {
 			// consumed some input
 			err = "invalid return value";
-			if (av_ret > dec->u.avc.avpkt->size)
+			if (av_ret > dec->avc.avpkt->size)
 				goto err;
-			dec->u.avc.avpkt->size -= av_ret;
-			dec->u.avc.avpkt->data += av_ret;
+			dec->avc.avpkt->size -= av_ret;
+			dec->avc.avpkt->data += av_ret;
 			keep_going = 1;
 		}
 		if (got_frame)
@@ -984,8 +1262,8 @@ static int avc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 			frame->pts = frame->pkt_pts;
 #endif
 			if (G_UNLIKELY(frame->pts == AV_NOPTS_VALUE))
-				frame->pts = dec->u.avc.avpkt->pts;
-			dec->u.avc.avpkt->pts += frame->nb_samples;
+				frame->pts = dec->avc.avpkt->pts;
+			dec->avc.avpkt->pts += frame->nb_samples;
 
 			g_queue_push_tail(out, frame);
 			frame = NULL;
@@ -1057,7 +1335,8 @@ static int __decoder_input_data(decoder_t *dec, const str *data, unsigned long t
 			if (callback(dec, rsmp_frame, u1, u2))
 				ret = -1;
 		}
-		av_frame_free(&frame);
+		if (rsmp_frame != frame)
+			av_frame_free(&frame);
 	}
 
 	if (ptime)
@@ -1141,13 +1420,395 @@ static void avc_def_init(struct codec_def_s *def) {
 	}
 }
 
+static void cc_cleanup(void);
+
 void codeclib_free(void) {
 	g_hash_table_destroy(codecs_ht);
 	g_hash_table_destroy(codecs_ht_by_av);
 	avformat_network_deinit();
+	cc_cleanup();
 	if (evs_lib_handle)
 		dlclose(evs_lib_handle);
+	if (cc_lib_handle)
+		dlclose(cc_lib_handle);
 }
+
+
+bool rtpe_has_cpu_flag(enum rtpe_cpu_flag flag) {
+	static bool done = false;
+	static bool cpu_flags[__NUM_RTPE_CPU_FLAGS] = {false,};
+
+	if (!done) {
+#if defined(__x86_64__)
+		int32_t ebx_7h0h, edx_1h;
+
+		__asm (
+			"mov $1, %%eax"		"\n\t"
+			"cpuid"			"\n\t"
+			"mov %%edx, %1"		"\n\t"
+			"mov $7, %%eax"		"\n\t"
+			"xor %%ecx, %%ecx"	"\n\t"
+			"cpuid"			"\n\t"
+			"mov %%ebx, %0"		"\n\t"
+			: "=rm" (ebx_7h0h), "=rm" (edx_1h)
+			:
+			: "eax", "ebx", "ecx", "edx"
+		    );
+
+		cpu_flags[RTPE_CPU_FLAG_SSE2]      = !!(edx_1h   & (1L << 26));
+		cpu_flags[RTPE_CPU_FLAG_AVX2]      = !!(ebx_7h0h & (1L << 5));
+		cpu_flags[RTPE_CPU_FLAG_AVX512BW]  = !!(ebx_7h0h & (1L << 30));
+		cpu_flags[RTPE_CPU_FLAG_AVX512F]   = !!(ebx_7h0h & (1L << 16));
+#endif
+
+		done = true;
+	}
+
+	if (flag < 0 || flag >= __NUM_RTPE_CPU_FLAGS)
+		abort();
+
+	return cpu_flags[flag];
+}
+
+
+static void *dlsym_assert(void *handle, const char *sym, const char *fn) {
+	void *ret = dlsym(handle, sym);
+	if (!ret)
+		die("Failed to resolve symbol '%s' from '%s': %s", sym, fn, dlerror());
+	return ret;
+}
+
+
+#ifdef HAVE_CODEC_CHAIN
+static void cc_dlsym_resolve(const char *fn) {
+	cc_client_connect = dlsym_assert(cc_lib_handle, "codec_chain_client_connect", fn);
+	cc_set_thread_funcs = dlsym_assert(cc_lib_handle, "codec_chain_set_thread_funcs", fn);
+
+	cc_client_pcma2opus_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2opus_runner_new", fn);
+	cc_client_pcmu2opus_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2opus_runner_new", fn);
+	cc_client_opus2pcma_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcma_runner_new", fn);
+	cc_client_opus2pcmu_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcmu_runner_new", fn);
+
+	cc_client_pcma2opus_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2opus_runner_free", fn);
+	cc_client_pcmu2opus_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2opus_runner_free", fn);
+	cc_client_opus2pcma_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcma_runner_free", fn);
+	cc_client_opus2pcmu_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcmu_runner_free", fn);
+
+	cc_client_pcma2opus_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2opus_async_runner_new", fn);
+	cc_client_pcmu2opus_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2opus_async_runner_new", fn);
+	cc_client_opus2pcma_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcma_async_runner_new", fn);
+	cc_client_opus2pcmu_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcmu_async_runner_new", fn);
+
+	cc_client_pcma2opus_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2opus_async_runner_free", fn);
+	cc_client_pcmu2opus_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2opus_async_runner_free", fn);
+	cc_client_opus2pcma_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcma_async_runner_free", fn);
+	cc_client_opus2pcmu_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2pcmu_async_runner_free", fn);
+
+	cc_pcma2opus_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcma2opus_runner_do", fn);
+	cc_pcmu2opus_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcmu2opus_runner_do", fn);
+	cc_opus2pcma_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_opus2pcma_runner_do", fn);
+	cc_opus2pcmu_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_opus2pcmu_runner_do", fn);
+
+	cc_pcma2opus_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcma2opus_runner_async_do_nonblock", fn);
+	cc_pcmu2opus_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcmu2opus_runner_async_do_nonblock", fn);
+	cc_opus2pcma_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_opus2pcma_runner_async_do_nonblock", fn);
+	cc_opus2pcmu_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_opus2pcmu_runner_async_do_nonblock", fn);
+
+	cc_client_float2opus_new_ext = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_float2opus_new_ext", fn);
+	cc_client_opus2float_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2float_new", fn);
+
+	cc_client_float2opus_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_float2opus_free", fn);
+	cc_client_opus2float_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_opus2float_free", fn);
+
+
+	cc_client_pcma2g729a_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2g729a_runner_new", fn);
+	cc_client_pcmu2g729a_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2g729a_runner_new", fn);
+
+	cc_client_pcma2g729a_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2g729a_runner_free", fn);
+	cc_client_pcmu2g729a_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2g729a_runner_free", fn);
+
+	cc_client_pcma2g729a_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2g729a_async_runner_new", fn);
+	cc_client_pcmu2g729a_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2g729a_async_runner_new", fn);
+
+	cc_client_pcma2g729a_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcma2g729a_async_runner_free", fn);
+	cc_client_pcmu2g729a_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_pcmu2g729a_async_runner_free", fn);
+
+	cc_pcma2g729a_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcma2g729a_runner_do", fn);
+	cc_pcmu2g729a_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcmu2g729a_runner_do", fn);
+
+	cc_pcma2g729a_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcma2g729a_runner_async_do_nonblock", fn);
+	cc_pcmu2g729a_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_pcmu2g729a_runner_async_do_nonblock", fn);
+
+	cc_client_float2g729a_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_float2g729a_new", fn);
+
+	cc_client_float2g729a_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_float2g729a_free", fn);
+
+
+	cc_client_g729a2pcma_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcma_runner_new", fn);
+	cc_client_g729a2pcmu_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcmu_runner_new", fn);
+
+	cc_client_g729a2pcma_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcma_runner_free", fn);
+	cc_client_g729a2pcmu_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcmu_runner_free", fn);
+
+	cc_client_g729a2pcma_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcma_async_runner_new", fn);
+	cc_client_g729a2pcmu_async_runner_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcmu_async_runner_new", fn);
+
+	cc_client_g729a2pcma_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcma_async_runner_free", fn);
+	cc_client_g729a2pcmu_async_runner_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2pcmu_async_runner_free", fn);
+
+	cc_g729a2pcma_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_g729a2pcma_runner_do", fn);
+	cc_g729a2pcmu_runner_do = dlsym_assert(cc_lib_handle,
+			"codec_chain_g729a2pcmu_runner_do", fn);
+
+	cc_g729a2pcma_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_g729a2pcma_runner_async_do_nonblock", fn);
+	cc_g729a2pcmu_runner_async_do_nonblock = dlsym_assert(cc_lib_handle,
+			"codec_chain_g729a2pcmu_runner_async_do_nonblock", fn);
+
+	cc_client_g729a2float_new = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2float_new", fn);
+
+	cc_client_g729a2float_free = dlsym_assert(cc_lib_handle,
+			"codec_chain_client_g729a2float_free", fn);
+}
+
+static void cc_create_runners(void) {
+	pcma2opus_runner = cc_client_pcma2opus_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcma2opus_runner)
+		die("Failed to initialise GPU pcma2opus");
+
+	pcmu2opus_runner = cc_client_pcmu2opus_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcmu2opus_runner)
+		die("Failed to initialise GPU pcmu2opus");
+
+	opus2pcmu_runner = cc_client_opus2pcmu_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!opus2pcmu_runner)
+		die("Failed to initialise GPU opus2pcmu");
+
+	opus2pcma_runner = cc_client_opus2pcma_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!opus2pcma_runner)
+		die("Failed to initialise GPU opus2pcma");
+
+	pcma2g729a_runner = cc_client_pcma2g729a_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 2);
+	if (!pcma2g729a_runner)
+		die("Failed to initialise GPU pcma2g729a");
+
+	pcmu2g729a_runner = cc_client_pcmu2g729a_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 2);
+	if (!pcmu2g729a_runner)
+		die("Failed to initialise GPU pcmu2g729a");
+
+	g729a2pcma_runner = cc_client_g729a2pcma_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 2);
+	if (!g729a2pcma_runner)
+		die("Failed to initialise GPU g729a2pcma");
+
+	g729a2pcmu_runner = cc_client_g729a2pcmu_runner_new(cc_client,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 2);
+	if (!g729a2pcmu_runner)
+		die("Failed to initialise GPU g729a2pcmu");
+}
+
+static void cc_create_async_runners(void) {
+	pcma2opus_async_runner = cc_client_pcma2opus_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcma2opus_async_runner)
+		die("Failed to initialise GPU pcma2opus");
+
+	pcmu2opus_async_runner = cc_client_pcmu2opus_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcmu2opus_async_runner)
+		die("Failed to initialise GPU pcmu2opus");
+
+	opus2pcmu_async_runner = cc_client_opus2pcmu_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!opus2pcmu_async_runner)
+		die("Failed to initialise GPU opus2pcmu");
+
+	opus2pcma_async_runner = cc_client_opus2pcma_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!opus2pcma_async_runner)
+		die("Failed to initialise GPU opus2pcma");
+
+	pcma2g729a_async_runner = cc_client_pcma2g729a_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcma2g729a_async_runner)
+		die("Failed to initialise GPU pcma2g729a");
+
+	pcmu2g729a_async_runner = cc_client_pcmu2g729a_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!pcmu2g729a_async_runner)
+		die("Failed to initialise GPU pcmu2g729a");
+
+	g729a2pcmu_async_runner = cc_client_g729a2pcmu_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!g729a2pcmu_async_runner)
+		die("Failed to initialise GPU g729a2pcmu");
+
+	g729a2pcma_async_runner = cc_client_g729a2pcma_async_runner_new(cc_client,
+			rtpe_common_config_ptr->codec_chain_async,
+			10000,
+			rtpe_common_config_ptr->codec_chain_runners,
+			rtpe_common_config_ptr->codec_chain_concurrency, 160);
+	if (!g729a2pcma_async_runner)
+		die("Failed to initialise GPU g729a2pcma");
+}
+
+
+static codec_cc_t *codec_cc_new_dummy(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *))
+{
+	return NULL;
+}
+
+static void cc_init(void) {
+	codec_cc_new = codec_cc_new_dummy;
+
+	if (!rtpe_common_config_ptr->codec_chain_lib_path)
+		return;
+
+	cc_lib_handle = dlopen(rtpe_common_config_ptr->codec_chain_lib_path, RTLD_NOW | RTLD_LOCAL);
+	if (!cc_lib_handle)
+		die("Failed to load libcodec-chain.so '%s': %s",
+				rtpe_common_config_ptr->codec_chain_lib_path,
+				dlerror());
+
+	cc_dlsym_resolve(rtpe_common_config_ptr->codec_chain_lib_path);
+
+	cc_set_thread_funcs(codeclib_thread_init, codeclib_thread_cleanup, codeclib_thread_loop);
+
+	cc_client = cc_client_connect(4);
+	if (!cc_client)
+		die("Failed to connect to cudecsd");
+
+	if (!rtpe_common_config_ptr->codec_chain_async) {
+		cc_create_runners();
+		codec_cc_new = codec_cc_new_sync;
+	}
+	else {
+		cc_create_async_runners();
+		codec_cc_new = codec_cc_new_async;
+	}
+
+	ilog(LOG_DEBUG, "CUDA codecs initialised");
+}
+
+static void cc_cleanup(void) {
+	if (!cc_lib_handle)
+		return;
+
+	cc_client_opus2pcma_runner_free(cc_client, &opus2pcma_runner);
+	cc_client_opus2pcmu_runner_free(cc_client, &opus2pcmu_runner);
+	cc_client_pcma2opus_runner_free(cc_client, &pcma2opus_runner);
+	cc_client_pcmu2opus_runner_free(cc_client, &pcmu2opus_runner);
+
+	cc_client_opus2pcma_async_runner_free(cc_client, &opus2pcma_async_runner);
+	cc_client_opus2pcmu_async_runner_free(cc_client, &opus2pcmu_async_runner);
+	cc_client_pcma2opus_async_runner_free(cc_client, &pcma2opus_async_runner);
+	cc_client_pcmu2opus_async_runner_free(cc_client, &pcmu2opus_async_runner);
+}
+
+#else
+
+static void cc_init(void) { }
+static void cc_cleanup(void) { }
+
+#endif
 
 void codeclib_init(int print) {
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 9, 100)
@@ -1158,13 +1819,15 @@ void codeclib_init(int print) {
 	avformat_network_init();
 	av_log_set_callback(avlog_ilog);
 
-	codecs_ht = g_hash_table_new(str_case_hash, str_case_equal);
+	codecs_ht = g_hash_table_new((GHashFunc) str_case_hash, (GEqualFunc) str_case_equal);
 	codecs_ht_by_av = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+	cc_init();
 
 	for (int i = 0; i < G_N_ELEMENTS(__codec_defs); i++) {
 		// add to hash table
 		struct codec_def_s *def = &__codec_defs[i];
-		str_init(&def->rtpname_str, (char *) def->rtpname);
+		def->rtpname_str = STR(def->rtpname);
 		assert(g_hash_table_lookup(codecs_ht, &def->rtpname_str) == NULL);
 		g_hash_table_insert(codecs_ht, &def->rtpname_str, def);
 
@@ -1227,6 +1890,12 @@ void codeclib_init(int print) {
 
 		if (def->supplemental)
 			g_queue_push_tail(&__supplemental_codecs, def);
+
+		if (rtpe_common_config_ptr->mos_type) {
+			def->mos_type = rtpe_common_config_ptr->mos_type;
+			if (def->mos_type == MOS_FB && def->default_clockrate != 48000)
+				def->mos_type = MOS_NB;
+		}
 	}
 }
 
@@ -1331,9 +2000,12 @@ out:
 	g_tree_steal(ps->packets, GINT_TO_POINTER(packet->seq));
 	ps->seq = (packet->seq + 1) & 0xffff;
 
-	if (packet->seq < ps->ext_seq)
+	unsigned int ext_seq = ps->roc << 16 | packet->seq;
+	while (ext_seq < ps->ext_seq) {
 		ps->roc++;
-	ps->ext_seq = ps->roc << 16 | packet->seq;
+		ext_seq += 0x10000;
+	}
+	ps->ext_seq = ext_seq;
 
 	return packet;
 }
@@ -1401,44 +2073,50 @@ encoder_t *encoder_new(void) {
 }
 
 static const char *avc_encoder_init(encoder_t *enc, const str *extra_opts) {
-	enc->u.avc.codec = enc->def->encoder;
-	if (!enc->u.avc.codec)
+	enc->avc.codec = enc->def->encoder;
+	if (!enc->avc.codec)
 		return "output codec not found";
 
-	enc->u.avc.avcctx = avcodec_alloc_context3(enc->u.avc.codec);
-	if (!enc->u.avc.avcctx)
+	enc->avc.avcctx = avcodec_alloc_context3(enc->avc.codec);
+	if (!enc->avc.avcctx)
 		return "failed to alloc codec context";
 
 	enc->actual_format = enc->requested_format;
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 19, 0)
+	avcodec_get_supported_config(enc->avc.avcctx, enc->avc.codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void **) &enc->avc.sample_fmts, NULL);
+#else
+	enc->avc.sample_fmts = enc->avc.codec->sample_fmts;
+#endif
+
 	enc->actual_format.format = -1;
-	for (const enum AVSampleFormat *sfmt = enc->u.avc.codec->sample_fmts; sfmt && *sfmt != -1; sfmt++) {
+	for (const enum AVSampleFormat *sfmt = enc->avc.sample_fmts; sfmt && *sfmt != -1; sfmt++) {
 		cdbg("supported sample format for output codec %s: %s",
-				enc->u.avc.codec->name, av_get_sample_fmt_name(*sfmt));
+				enc->avc.codec->name, av_get_sample_fmt_name(*sfmt));
 		if (*sfmt == enc->requested_format.format)
 			enc->actual_format.format = *sfmt;
 	}
-	if (enc->actual_format.format == -1 && enc->u.avc.codec->sample_fmts)
-		enc->actual_format.format = enc->u.avc.codec->sample_fmts[0];
+	if (enc->actual_format.format == -1 && enc->avc.sample_fmts)
+		enc->actual_format.format = enc->avc.sample_fmts[0];
 	cdbg("using output sample format %s for codec %s",
-			av_get_sample_fmt_name(enc->actual_format.format), enc->u.avc.codec->name);
+			av_get_sample_fmt_name(enc->actual_format.format), enc->avc.codec->name);
 
-	SET_CHANNELS(enc->u.avc.avcctx, enc->actual_format.channels);
-	DEF_CH_LAYOUT(&enc->u.avc.avcctx->CH_LAYOUT, enc->actual_format.channels);
-	enc->u.avc.avcctx->sample_rate = enc->actual_format.clockrate;
-	enc->u.avc.avcctx->sample_fmt = enc->actual_format.format;
-	enc->u.avc.avcctx->time_base = (AVRational){1,enc->actual_format.clockrate};
-	enc->u.avc.avcctx->bit_rate = enc->bitrate;
+	SET_CHANNELS(enc->avc.avcctx, enc->actual_format.channels);
+	DEF_CH_LAYOUT(&enc->avc.avcctx->CH_LAYOUT, enc->actual_format.channels);
+	enc->avc.avcctx->sample_rate = enc->actual_format.clockrate;
+	enc->avc.avcctx->sample_fmt = enc->actual_format.format;
+	enc->avc.avcctx->time_base = (AVRational){1,enc->actual_format.clockrate};
+	enc->avc.avcctx->bit_rate = enc->bitrate;
 
 	enc->samples_per_frame = enc->actual_format.clockrate * enc->ptime / 1000;
-	if (enc->u.avc.avcctx->frame_size)
-		enc->samples_per_frame = enc->u.avc.avcctx->frame_size;
+	if (enc->avc.avcctx->frame_size)
+		enc->samples_per_frame = enc->avc.avcctx->frame_size;
 	enc->samples_per_packet = enc->samples_per_frame;
 
 	if (enc->def->set_enc_options)
 		enc->def->set_enc_options(enc, extra_opts);
 
-	int i = avcodec_open2(enc->u.avc.avcctx, enc->u.avc.codec, NULL);
+	int i = avcodec_open2(enc->avc.avcctx, enc->avc.codec, NULL);
 	if (i) {
 		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Error returned from libav: %s", av_error(i));
 		return "failed to open output context";
@@ -1466,11 +2144,15 @@ int encoder_config_fmtp(encoder_t *enc, codec_def_t *def, int bitrate, int ptime
 	if (!def->codec_type)
 		goto err;
 
+	err = "failed to parse \"fmtp\"";
+	if (codec_parse_fmtp(def, fmtp, fmtp_string, &enc->format_options))
+		goto err;
+
 	// select encoder format
 	format_t requested_format = *requested_format_p;
 	enc->clockrate_fact = def->default_clockrate_fact;
 	if (def->select_encoder_format)
-		def->select_encoder_format(enc, &requested_format, input_format);
+		def->select_encoder_format(enc, &requested_format, input_format, fmtp);
 
 	requested_format.clockrate = fraction_mult(requested_format.clockrate, &enc->clockrate_fact);
 
@@ -1497,10 +2179,6 @@ int encoder_config_fmtp(encoder_t *enc, codec_def_t *def, int bitrate, int ptime
 	enc->def = def;
 	enc->ptime = ptime;
 	enc->bitrate = bitrate;
-
-	err = "failed to parse \"fmtp\"";
-	if (codec_parse_fmtp(def, fmtp, fmtp_string, &enc->format_options))
-		goto err;
 
 	err = def->codec_type->encoder_init ? def->codec_type->encoder_init(enc, extra_opts) : 0;
 	if (err)
@@ -1538,12 +2216,14 @@ err:
 }
 
 static void avc_encoder_close(encoder_t *enc) {
-	if (enc->u.avc.avcctx) {
-		avcodec_close(enc->u.avc.avcctx);
-		avcodec_free_context(&enc->u.avc.avcctx);
+	if (enc->avc.avcctx) {
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 0, 0)
+		avcodec_close(enc->avc.avcctx);
+#endif
+		avcodec_free_context(&enc->avc.avcctx);
 	}
-	enc->u.avc.avcctx = NULL;
-	enc->u.avc.codec = NULL;
+	enc->avc.avcctx = NULL;
+	enc->avc.codec = NULL;
 }
 
 void encoder_close(encoder_t *enc) {
@@ -1562,6 +2242,7 @@ void encoder_close(encoder_t *enc) {
 void encoder_free(encoder_t *enc) {
 	encoder_close(enc);
 	av_packet_free(&enc->avpkt);
+	resample_shutdown(&enc->resampler);
 	g_slice_free1(sizeof(*enc), enc);
 }
 
@@ -1570,12 +2251,12 @@ static int avc_encoder_input(encoder_t *enc, AVFrame **frame) {
 	int got_packet = 0;
 	int av_ret = 0;
 
-	if (!enc->u.avc.avcctx)
+	if (!enc->avc.avcctx)
 		return -1;
 
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 36, 0)
 	if (*frame) {
-		av_ret = avcodec_send_frame(enc->u.avc.avcctx, *frame);
+		av_ret = avcodec_send_frame(enc->avc.avcctx, *frame);
 		cdbg("send frame ret %i", av_ret);
 		if (av_ret == 0) {
 			// consumed
@@ -1590,7 +2271,7 @@ static int avc_encoder_input(encoder_t *enc, AVFrame **frame) {
 		}
 	}
 
-	av_ret = avcodec_receive_packet(enc->u.avc.avcctx, enc->avpkt);
+	av_ret = avcodec_receive_packet(enc->avc.avcctx, enc->avpkt);
 	cdbg("receive packet ret %i", av_ret);
 	if (av_ret == 0) {
 		// got some data
@@ -1607,7 +2288,7 @@ static int avc_encoder_input(encoder_t *enc, AVFrame **frame) {
 	if (!*frame)
 		return 0;
 
-	av_ret = avcodec_encode_audio2(enc->u.avc.avcctx, enc->avpkt, *frame, &got_packet);
+	av_ret = avcodec_encode_audio2(enc->avc.avcctx, enc->avpkt, *frame, &got_packet);
 	cdbg("encode frame ret %i, got packet %i", av_ret, got_packet);
 	if (av_ret == 0)
 		*frame = NULL; // consumed
@@ -1702,14 +2383,21 @@ static int encoder_fifo_flush(encoder_t *enc,
 int encoder_input_fifo(encoder_t *enc, AVFrame *frame,
 		int (*callback)(encoder_t *, void *u1, void *u2), void *u1, void *u2)
 {
-	if (av_audio_fifo_write(enc->fifo, (void **) frame->extended_data, frame->nb_samples) < 0)
+	AVFrame *rsmp_frame = resample_frame(&enc->resampler, frame, &enc->actual_format);
+	if (!rsmp_frame) {
+		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Resampling failed");
 		return -1;
+	}
+	if (av_audio_fifo_write(enc->fifo, (void **) rsmp_frame->extended_data, rsmp_frame->nb_samples) < 0)
+		return -1;
+	if (rsmp_frame != frame)
+		av_frame_free(&rsmp_frame);
 
 	return encoder_fifo_flush(enc, callback, u1, u2);
 }
 
 
-static int packetizer_passthrough(AVPacket *pkt, GString *buf, str *output, encoder_t *enc) {
+int packetizer_passthrough(AVPacket *pkt, GString *buf, str *output, encoder_t *enc) {
 	if (!pkt)
 		return -1;
 	if (output->len < pkt->size) {
@@ -1759,7 +2447,7 @@ static int codeclib_set_av_opt_int(encoder_t *enc, const char *opt, int64_t val)
 	ilog(LOG_DEBUG, "Setting ffmpeg '%s' option for '%s' to %" PRId64,
 			opt, enc->def->rtpname, val);
 
-	int ret = av_opt_set_int(enc->u.avc.avcctx, opt, val, AV_OPT_SEARCH_CHILDREN);
+	int ret = av_opt_set_int(enc->avc.avcctx, opt, val, AV_OPT_SEARCH_CHILDREN);
 	if (!ret)
 		return 0;
 
@@ -1845,8 +2533,8 @@ static const char *libopus_decoder_init(decoder_t *dec, const str *extra_opts) {
 	}
 
 	int err = 0;
-	dec->u.opus = opus_decoder_create(dec->in_format.clockrate, dec->in_format.channels, &err);
-	if (!dec->u.opus) {
+	dec->opus = opus_decoder_create(dec->in_format.clockrate, dec->in_format.channels, &err);
+	if (!dec->opus) {
 		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Error from libopus: %s", opus_strerror(err));
 		return "failed to alloc codec context";
 	}
@@ -1854,7 +2542,7 @@ static const char *libopus_decoder_init(decoder_t *dec, const str *extra_opts) {
 	return NULL;
 }
 static void libopus_decoder_close(decoder_t *dec) {
-	opus_decoder_destroy(dec->u.opus);
+	opus_decoder_destroy(dec->opus);
 }
 static int libopus_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	// get frame with buffer large enough for the max
@@ -1867,7 +2555,7 @@ static int libopus_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	if (av_frame_get_buffer(frame, 0) < 0)
 		abort();
 
-	int ret = opus_decode(dec->u.opus, (unsigned char *) data->s, data->len,
+	int ret = opus_decode(dec->opus, (unsigned char *) data->s, data->len,
 			(int16_t *) frame->extended_data[0], frame->nb_samples, 0);
 	if (ret < 0) {
 		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Error decoding Opus packet: %s", opus_strerror(ret));
@@ -1884,7 +2572,6 @@ struct libopus_encoder_options {
 	int complexity;
 	int vbr;
 	int vbr_constraint;
-	int fec;
 	int pl;
 	int application;
 };
@@ -1929,10 +2616,6 @@ static void libopus_set_enc_opts(str *key, str *val, void *p) {
 		case CSH_LOOKUP("packet loss"):
 			opts->pl = str_to_i(val, -1);
 			break;
-		case CSH_LOOKUP("fec"):
-		case CSH_LOOKUP("FEC"):
-			opts->fec = str_to_i(val, -1);
-			break;
 		default:
 			ilog(LOG_WARN | LOG_FLAG_LIMIT, "Unknown Opus encoder option encountered: '"
 					STR_FORMAT "'", STR_FMT(key));
@@ -1962,9 +2645,9 @@ static const char *libopus_encoder_init(encoder_t *enc, const str *extra_opts) {
 	codeclib_key_value_parse(extra_opts, true, libopus_set_enc_opts, &opts);
 
 	int err;
-	enc->u.opus = opus_encoder_create(enc->requested_format.clockrate, enc->requested_format.channels,
+	enc->opus = opus_encoder_create(enc->requested_format.clockrate, enc->requested_format.channels,
 			opts.application, &err);
-	if (!enc->u.opus) {
+	if (!enc->opus) {
 		ilog(LOG_ERR, "Error from libopus: %s", opus_strerror(err));
 		return "failed to alloc codec context";
 	}
@@ -1974,36 +2657,36 @@ static const char *libopus_encoder_init(encoder_t *enc, const str *extra_opts) {
 	enc->samples_per_frame = enc->actual_format.clockrate * enc->ptime / 1000;
 	enc->samples_per_packet = enc->samples_per_frame;
 
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_BITRATE(enc->bitrate));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_BITRATE(enc->bitrate));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus bitrate to %i: %s", enc->bitrate,
 				opus_strerror(err));
 
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_COMPLEXITY(opts.complexity));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_COMPLEXITY(opts.complexity));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus complexity to %i': %s",
 				opts.complexity, opus_strerror(err));
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_VBR(opts.vbr));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_VBR(opts.vbr));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus VBR to %i': %s",
-				opts.complexity, opus_strerror(err));
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_VBR_CONSTRAINT(opts.vbr_constraint));
+				opts.vbr, opus_strerror(err));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_VBR_CONSTRAINT(opts.vbr_constraint));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus VBR constraint to %i': %s",
-				opts.complexity, opus_strerror(err));
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_PACKET_LOSS_PERC(opts.pl));
+				opts.vbr_constraint, opus_strerror(err));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_PACKET_LOSS_PERC(opts.pl));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus PL%% to %i': %s",
-				opts.complexity, opus_strerror(err));
-	err = opus_encoder_ctl(enc->u.opus, OPUS_SET_INBAND_FEC(opts.fec));
+				opts.pl, opus_strerror(err));
+	err = opus_encoder_ctl(enc->opus, OPUS_SET_INBAND_FEC(enc->format_options.opus.fec_send >= 0));
 	if (err != OPUS_OK)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Failed to set Opus FEC to %i': %s",
-				opts.complexity, opus_strerror(err));
+				enc->format_options.opus.fec_send >= 0, opus_strerror(err));
 
 	return NULL;
 }
 static void libopus_encoder_close(encoder_t *enc) {
-	opus_encoder_destroy(enc->u.opus);
+	opus_encoder_destroy(enc->opus);
 }
 #define MAX_OPUS_FRAME_SIZE 1275 /* 20 ms at 510 kbps */
 #define MAX_OPUS_FRAMES_PER_PACKET 6 /* 120 ms = 6 * 20 ms */
@@ -2015,7 +2698,7 @@ static int libopus_encoder_input(encoder_t *enc, AVFrame **frame) {
 	// max length of Opus packet:
 	av_new_packet(enc->avpkt, MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE);
 
-	int ret = opus_encode(enc->u.opus, (int16_t *) (*frame)->extended_data[0], (*frame)->nb_samples,
+	int ret = opus_encode(enc->opus, (int16_t *) (*frame)->extended_data[0], (*frame)->nb_samples,
 			enc->avpkt->data, enc->avpkt->size);
 	if (ret < 0) {
 		ilog(LOG_ERR | LOG_FLAG_LIMIT, "Error encoding Opus packet: %s", opus_strerror(ret));
@@ -2036,7 +2719,9 @@ static int libopus_encoder_input(encoder_t *enc, AVFrame **frame) {
 
 
 // opus RTP always runs at 48 kHz
-static void opus_select_encoder_format(encoder_t *enc, format_t *req_format, const format_t *f) {
+static void opus_select_encoder_format(encoder_t *enc, format_t *req_format, const format_t *f,
+		const struct rtp_codec_format *fmtp)
+{
 	if (req_format->clockrate != 48000)
 		return; // bail - encoder will fail to initialise
 
@@ -2064,11 +2749,16 @@ static void opus_select_encoder_format(encoder_t *enc, format_t *req_format, con
 			break;
 	}
 
-	// switch to mono encoding if possible
-	if (req_format->channels == 2 && f->channels == 1)
+	// honour remote stereo=0/1 flag if given,
+	// otherwise go with the input format
+	if (fmtp && fmtp->parsed.opus.stereo_send == -1)
+		req_format->channels = 1;
+	else if (fmtp && fmtp->parsed.opus.stereo_send == 1)
+		req_format->channels = 2;
+	else if (req_format->channels == 2 && f->channels == 1)
 		req_format->channels = 1;
 }
-static void opus_select_decoder_format(decoder_t *dec) {
+static void opus_select_decoder_format(decoder_t *dec, const struct rtp_codec_format *fmtp) {
 	if (dec->in_format.clockrate != 48000)
 		return;
 
@@ -2100,6 +2790,107 @@ static void opus_select_decoder_format(decoder_t *dec) {
 	if (dec->in_format.channels == 2 && dec->dest_format.channels == 1)
 		dec->in_format.channels = 1;
 }
+static void opus_parse_format_cb(str *key, str *token, void *data) {
+	union codec_format_options *opts = data;
+	__auto_type o = &opts->opus;
+
+	switch (__csh_lookup(key)) {
+#define YNFLAG(flag, varname) \
+		case flag: \
+			if (token->len == 1 && token->s[0] == '1') \
+				o->varname = 1; \
+			else if (token->len == 1 && token->s[0] == '0') \
+				o->varname = -1; \
+			break;
+		YNFLAG(CSH_LOOKUP("stereo"), stereo_recv)
+		YNFLAG(CSH_LOOKUP("sprop-stereo"), stereo_send)
+		YNFLAG(CSH_LOOKUP("useinbandfec"), fec_recv)
+		YNFLAG(CSH_LOOKUP("cbr"), cbr)
+		YNFLAG(CSH_LOOKUP("usedtx"), fec_recv)
+#undef YNFLAG
+		case CSH_LOOKUP("maxplaybackrate"):
+			opts->opus.maxplaybackrate = str_to_i(token, 0);
+			break;
+		case CSH_LOOKUP("sprop-maxcapturerate"):
+			opts->opus.sprop_maxcapturerate = str_to_i(token, 0);
+			break;
+		case CSH_LOOKUP("maxaveragebitrate"):
+			opts->opus.maxaveragebitrate = str_to_i(token, 0);
+			break;
+		case CSH_LOOKUP("minptime"):
+			opts->opus.minptime = str_to_i(token, 0);
+			break;
+	}
+}
+static int opus_format_parse(struct rtp_codec_format *f, const str *fmtp) {
+	codeclib_key_value_parse(fmtp, true, opus_parse_format_cb, &f->parsed);
+	return 0;
+}
+static GString *opus_format_print(const struct rtp_payload_type *p) {
+	if (!p->format.fmtp_parsed)
+		return NULL;
+
+	GString *s = g_string_new("");
+	__auto_type f = &p->format.parsed.opus;
+
+	if (f->stereo_recv)
+		g_string_append_printf(s, "stereo=%i; ", f->stereo_recv == -1 ? 0 : 1);
+	if (f->stereo_send)
+		g_string_append_printf(s, "sprop-stereo=%i; ", f->stereo_send == -1 ? 0 : 1);
+	if (f->fec_recv)
+		g_string_append_printf(s, "useinbandfec=%i; ", f->fec_recv == -1 ? 0 : 1);
+	if (f->usedtx)
+		g_string_append_printf(s, "usedtx=%i; ", f->usedtx == -1 ? 0 : 1);
+	if (f->cbr)
+		g_string_append_printf(s, "cbr=%i; ", f->cbr == -1 ? 0 : 1);
+	if (f->maxplaybackrate)
+		g_string_append_printf(s, "maxplaybackrate=%i; ", f->maxplaybackrate);
+	if (f->maxaveragebitrate)
+		g_string_append_printf(s, "maxaveragebitrate=%i; ", f->maxaveragebitrate);
+	if (f->sprop_maxcapturerate)
+		g_string_append_printf(s, "sprop-maxcapturerate=%i; ", f->sprop_maxcapturerate);
+	if (f->minptime)
+		g_string_append_printf(s, "minptime=%i; ", f->minptime);
+
+	if (s->len != 0)
+		g_string_truncate(s, s->len - 2);
+
+	return s;
+}
+static void opus_format_answer(struct rtp_payload_type *p, const struct rtp_payload_type *src) {
+	if (!p->format.fmtp_parsed)
+		return;
+
+	__auto_type f = &p->format.parsed.opus;
+
+	// swap send/recv
+
+	int t = f->stereo_send;
+	f->stereo_send = f->stereo_recv;
+	f->stereo_recv = t;
+
+	t = f->fec_send;
+	f->fec_send = f->fec_recv;
+	f->fec_recv = t;
+
+	// if stereo recv is unset, base it on input format
+	if (f->stereo_recv == 0)
+		f->stereo_recv = src->channels == 1 ? -1 : 1;
+
+	// we can always use FEC, unless we've been told that we should lie
+	if (f->fec_recv == 0)
+		f->fec_recv = 1;
+
+	// set everything unsupported to 0
+	f->usedtx = 0;
+	f->cbr = 0;
+	f->maxplaybackrate = 0;
+	f->sprop_maxcapturerate = 0;
+	f->maxaveragebitrate = 0;
+	f->minptime = 0;
+}
+
+
 
 
 static int ilbc_format_parse(struct rtp_codec_format *f, const str *fmtp) {
@@ -2159,9 +2950,9 @@ static void ilbc_set_enc_options(encoder_t *enc, const str *codec_opts) {
 static void ilbc_set_dec_options(decoder_t *dec, const str *codec_opts) {
 	int mode = ilbc_mode(dec->ptime, &dec->format_options, "decoder");
 	if (mode == 20)
-		dec->u.avc.avcctx->block_align = 38;
+		dec->avc.avcctx->block_align = 38;
 	else if (mode == 30)
-		dec->u.avc.avcctx->block_align = 50;
+		dec->avc.avcctx->block_align = 50;
 	else
 		ilog(LOG_WARN, "Unsupported iLBC mode %i", mode);
 }
@@ -2186,11 +2977,11 @@ static int ilbc_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 		ilog(LOG_WARNING | LOG_FLAG_LIMIT, "iLBC received %i bytes packet, does not match "
 				"one of the block sizes", (int) data->len);
 
-	if (block_align && dec->u.avc.avcctx->block_align != block_align) {
+	if (block_align && dec->avc.avcctx->block_align != block_align) {
 		ilog(LOG_INFO | LOG_FLAG_LIMIT, "iLBC decoder set to %i bytes blocks, but received packet "
 				"of %i bytes, therefore resetting decoder and switching to %i bytes "
 				"block mode (%i ms mode)",
-				(int) dec->u.avc.avcctx->block_align, (int) data->len, block_align, mode);
+				(int) dec->avc.avcctx->block_align, (int) data->len, block_align, mode);
 		avc_decoder_close(dec);
 		dec->format_options = *fmtp;
 		avc_decoder_init(dec, NULL);
@@ -2209,8 +3000,8 @@ static void codeclib_key_value_parse(const str *instr, bool need_value,
 	// semicolon-separated key=value
 	str s = *instr;
 	str key, value;
-	while (str_token_sep(&value, &s, ';') == 0) {
-		if (str_token(&key, &value, '=')) {
+	while (str_token_sep(&value, &s, ';')) {
+		if (!str_token(&key, &value, '=')) {
 			if (need_value)
 				continue;
 			value = STR_NULL;
@@ -2328,7 +3119,7 @@ static void amr_parse_format_cb(str *key, str *token, void *data) {
 			break;
 		case CSH_LOOKUP("mode-set"):;
 			str mode;
-			while (str_token_sep(&mode, token, ',') == 0) {
+			while (str_token_sep(&mode, token, ',')) {
 				int m = str_to_i(&mode, -1);
 				if (m < 0 || m >= AMR_FT_TYPES)
 					continue;
@@ -2388,7 +3179,7 @@ static void amr_set_enc_options(encoder_t *enc, const str *codec_opts) {
 
 	// if a mode-set was given, pick the highest supported bitrate
 	if (enc->format_options.amr.mode_set) {
-		int max_bitrate = enc->u.avc.avcctx->bit_rate;
+		int max_bitrate = enc->avc.avcctx->bit_rate;
 		int use_bitrate = 0;
 		for (int i = 0; i < AMR_FT_TYPES; i++) {
 			if (!(enc->format_options.amr.mode_set & (1 << i)))
@@ -2408,7 +3199,7 @@ static void amr_set_enc_options(encoder_t *enc, const str *codec_opts) {
 		else {
 			ilog(LOG_DEBUG, "Using %i as initial %s bitrate based on mode-set",
 					use_bitrate, enc->def->rtpname);
-			enc->u.avc.avcctx->bit_rate = use_bitrate;
+			enc->avc.avcctx->bit_rate = use_bitrate;
 		}
 	}
 }
@@ -2472,8 +3263,8 @@ static void amr_bitrate_tracker(decoder_t *dec, unsigned int ft) {
 	if (dec->codec_options.amr.cmr_interval <= 0)
 		return;
 
-	if (dec->u.avc.u.amr.tracker_end.tv_sec
-			&& timeval_cmp(&dec->u.avc.u.amr.tracker_end, &rtpe_now) >= 0) {
+	if (dec->avc.amr.tracker_end.tv_sec
+			&& timeval_cmp(&dec->avc.amr.tracker_end, &rtpe_now) >= 0) {
 		// analyse the data we gathered
 		int next_highest = -1;
 		int lowest_used = -1;
@@ -2493,7 +3284,7 @@ static void amr_bitrate_tracker(decoder_t *dec, unsigned int ft) {
 				next_highest = i;
 
 			// did we see any frames?
-			if (!dec->u.avc.u.amr.bitrate_tracker[i])
+			if (!dec->avc.amr.bitrate_tracker[i])
 				continue;
 
 			next_highest = -1;
@@ -2508,21 +3299,21 @@ static void amr_bitrate_tracker(decoder_t *dec, unsigned int ft) {
 		}
 
 		// and reset tracker
-		ZERO(dec->u.avc.u.amr.tracker_end);
+		ZERO(dec->avc.amr.tracker_end);
 	}
 
-	if (!dec->u.avc.u.amr.tracker_end.tv_sec) {
+	if (!dec->avc.amr.tracker_end.tv_sec) {
 		// init
-		ZERO(dec->u.avc.u.amr.bitrate_tracker);
-		dec->u.avc.u.amr.tracker_end = rtpe_now;
-		timeval_add_usec(&dec->u.avc.u.amr.tracker_end, dec->codec_options.amr.cmr_interval * 1000);
+		ZERO(dec->avc.amr.bitrate_tracker);
+		dec->avc.amr.tracker_end = rtpe_now;
+		timeval_add_usec(&dec->avc.amr.tracker_end, dec->codec_options.amr.cmr_interval * 1000);
 	}
 
-	dec->u.avc.u.amr.bitrate_tracker[ft]++;
+	dec->avc.amr.bitrate_tracker[ft]++;
 }
 static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	const char *err = NULL;
-	AUTO_CLEANUP(GQueue toc, g_queue_clear) = G_QUEUE_INIT;
+	g_auto(GQueue) toc = G_QUEUE_INIT;
 
 	if (!data || !data->s)
 		goto err;
@@ -2533,7 +3324,7 @@ static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	unsigned int ill = 0, ilp = 0;
 
 	unsigned char cmr_chr[2];
-	str cmr = STR_CONST_INIT_BUF(cmr_chr);
+	str cmr = STR_CONST_BUF(cmr_chr);
 	err = "no CMR";
 	if (bitstr_shift_ret(&d, 4, &cmr))
 		goto err;
@@ -2541,17 +3332,17 @@ static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	unsigned int cmr_int = cmr_chr[0] >> 4;
 	if (cmr_int != 15) {
 		decoder_event(dec, CE_AMR_CMR_RECV, GUINT_TO_POINTER(cmr_int));
-		dec->u.avc.u.amr.last_cmr = rtpe_now;
+		dec->avc.amr.last_cmr = rtpe_now;
 	}
 	else if (dec->codec_options.amr.mode_change_interval) {
 		// no CMR, check if we're due to do our own mode change
-		if (!dec->u.avc.u.amr.last_cmr.tv_sec) // start tracking now
-			dec->u.avc.u.amr.last_cmr = rtpe_now;
-		else if (timeval_diff(&rtpe_now, &dec->u.avc.u.amr.last_cmr)
+		if (!dec->avc.amr.last_cmr.tv_sec) // start tracking now
+			dec->avc.amr.last_cmr = rtpe_now;
+		else if (timeval_diff(&rtpe_now, &dec->avc.amr.last_cmr)
 				>= (long long) dec->codec_options.amr.mode_change_interval * 1000) {
 			// switch up if we can
 			decoder_event(dec, CE_AMR_CMR_RECV, GUINT_TO_POINTER(0xffff));
-			dec->u.avc.u.amr.last_cmr = rtpe_now;
+			dec->avc.amr.last_cmr = rtpe_now;
 		}
 	}
 
@@ -2561,7 +3352,7 @@ static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 
 		if (dec->format_options.amr.interleaving) {
 			unsigned char ill_ilp_chr[2];
-			str ill_ilp = STR_CONST_INIT_BUF(ill_ilp_chr);
+			str ill_ilp = STR_CONST_BUF(ill_ilp_chr);
 			err = "no ILL/ILP";
 			if (bitstr_shift_ret(&d, 8, &ill_ilp))
 				goto err;
@@ -2581,7 +3372,7 @@ static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	int num_crcs = 0;
 	while (1) {
 		unsigned char toc_byte[2];
-		str toc_entry = STR_CONST_INIT_BUF(toc_byte);
+		str toc_entry = STR_CONST_BUF(toc_byte);
 		err = "missing TOC entry";
 		if (bitstr_shift_ret(&d, 6, &toc_entry))
 			goto err;
@@ -2625,7 +3416,7 @@ static int amr_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 
 		// AMR decoder expects an octet aligned TOC byte plus the payload
 		unsigned char frame_buf[(bits + 7) / 8 + 1 + 1];
-		str frame = STR_CONST_INIT_BUF(frame_buf);
+		str frame = STR_CONST_BUF(frame_buf);
 		str_shift(&frame, 1);
 		err = "short frame";
 		if (bitstr_shift_ret(&d, bits, &frame))
@@ -2676,7 +3467,7 @@ static unsigned int amr_encoder_find_next_mode(encoder_t *enc) {
 		int br = enc->codec_options.amr.bitrates[i];
 		if (!br) // end of list
 			break;
-		if (br == enc->u.avc.avcctx->bit_rate) {
+		if (br == enc->avc.avcctx->bit_rate) {
 			mode = i;
 			break;
 		}
@@ -2707,10 +3498,10 @@ static unsigned int amr_encoder_find_next_mode(encoder_t *enc) {
 }
 static void amr_encoder_mode_change(encoder_t *enc) {
 	if (!memcmp(&enc->callback.amr.cmr_in_ts,
-				&enc->u.avc.u.amr.cmr_in_ts, sizeof(struct timeval)))
+				&enc->avc.amr.cmr_in_ts, sizeof(struct timeval)))
 		return;
 	// mode change requested: check if this is allowed right now
-	if (enc->format_options.amr.mode_change_period == 2 && (enc->u.avc.u.amr.pkt_seq & 1) != 0)
+	if (enc->format_options.amr.mode_change_period == 2 && (enc->avc.amr.pkt_seq & 1) != 0)
 		return;
 	unsigned int cmr = enc->callback.amr.cmr_in;
 	if (cmr == 0xffff)
@@ -2726,7 +3517,7 @@ static void amr_encoder_mode_change(encoder_t *enc) {
 	int cmr_done = 1;
 	if (enc->format_options.amr.mode_change_neighbor) {
 		// handle non-neighbour mode changes
-		int cur_br = enc->u.avc.avcctx->bit_rate;
+		int cur_br = enc->avc.avcctx->bit_rate;
 		// step up or down from the requested bitrate towards the current one
 		int cmr_diff = (req_br > cur_br) ? -1 : 1;
 		int neigh_br = req_br;
@@ -2753,13 +3544,13 @@ static void amr_encoder_mode_change(encoder_t *enc) {
 			cmr_done = 0;
 		req_br = neigh_br; // set to this
 	}
-	enc->u.avc.avcctx->bit_rate = req_br;
+	enc->avc.avcctx->bit_rate = req_br;
 	if (cmr_done)
-		enc->u.avc.u.amr.cmr_in_ts = enc->callback.amr.cmr_in_ts;
+		enc->avc.amr.cmr_in_ts = enc->callback.amr.cmr_in_ts;
 }
 static void amr_encoder_got_packet(encoder_t *enc) {
 	amr_encoder_mode_change(enc);
-	enc->u.avc.u.amr.pkt_seq++;
+	enc->avc.amr.pkt_seq++;
 }
 static int packetizer_amr(AVPacket *pkt, GString *buf, str *output, encoder_t *enc) {
 	assert(pkt->size >= 1);
@@ -2793,15 +3584,15 @@ static int packetizer_amr(AVPacket *pkt, GString *buf, str *output, encoder_t *e
 	s[0] = '\xf0'; // no CMR req (4 bits)
 
 	// or do we have a CMR?
-	if (!enc->u.avc.u.amr.cmr_out_seq) {
-		if (memcmp(&enc->u.avc.u.amr.cmr_out_ts, &enc->callback.amr.cmr_out_ts,
+	if (!enc->avc.amr.cmr_out_seq) {
+		if (memcmp(&enc->avc.amr.cmr_out_ts, &enc->callback.amr.cmr_out_ts,
 					sizeof(struct timeval))) {
-			enc->u.avc.u.amr.cmr_out_seq += 3; // make this configurable?
-			enc->u.avc.u.amr.cmr_out_ts = enc->callback.amr.cmr_out_ts;
+			enc->avc.amr.cmr_out_seq += 3; // make this configurable?
+			enc->avc.amr.cmr_out_ts = enc->callback.amr.cmr_out_ts;
 		}
 	}
-	if (enc->u.avc.u.amr.cmr_out_seq) {
-		enc->u.avc.u.amr.cmr_out_seq--;
+	if (enc->avc.amr.cmr_out_seq) {
+		enc->avc.amr.cmr_out_seq--;
 		unsigned int cmr = enc->callback.amr.cmr_out;
 		if (cmr < AMR_FT_TYPES && enc->codec_options.amr.bitrates[cmr])
 			s[0] = cmr << 4;
@@ -2840,7 +3631,7 @@ static int amr_dtx(decoder_t *dec, GQueue *out, int ptime) {
 	ilog(LOG_DEBUG, "pushing empty/lost frame to AMR decoder");
 	unsigned char frame_buf[1];
 	frame_buf[0] = 0xf << 3; // no data
-	str frame = STR_CONST_INIT_BUF(frame_buf);
+	str frame = STR_CONST_BUF(frame_buf);
 	if (avc_decoder_input(dec, &frame, out))
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Error while writing 'no data' frame to AMR decoder");
 	return 0;
@@ -2851,7 +3642,7 @@ static int amr_dtx(decoder_t *dec, GQueue *out, int ptime) {
 static int generic_silence_dtx(decoder_t *dec, GQueue *out, int ptime) {
 	if (dec->dec_out_format.format == -1)
 		return -1;
-	if (!dec->u.avc.avpkt)
+	if (!dec->avc.avpkt)
 		return -1;
 
 	if (ptime <= 0)
@@ -2873,8 +3664,8 @@ static int generic_silence_dtx(decoder_t *dec, GQueue *out, int ptime) {
 	memset(frame->extended_data[0], 0, frame->linesize[0]);
 
 	// advance PTS
-	frame->pts = dec->u.avc.avpkt->pts;
-	dec->u.avc.avpkt->pts += frame->nb_samples;
+	frame->pts = dec->avc.avpkt->pts;
+	dec->avc.avpkt->pts += frame->nb_samples;
 
 	g_queue_push_tail(out, frame);
 
@@ -2889,8 +3680,8 @@ static int cn_append_frame(decoder_t *dec, AVFrame *f, void *u1, void *u2) {
 }
 
 static int generic_cn_dtx(decoder_t *dec, GQueue *out, int ptime) {
-	dec->dtx.u.cn.cn_dec->ptime = ptime;
-	return decoder_input_data(dec->dtx.u.cn.cn_dec, dec->dtx.u.cn.cn_payload,
+	dec->dtx.cn.cn_dec->ptime = ptime;
+	return decoder_input_data(dec->dtx.cn.cn_dec, dec->dtx.cn.cn_payload,
 			dec->rtp_ts, cn_append_frame, out, NULL);
 }
 
@@ -2899,12 +3690,12 @@ static int generic_cn_dtx_init(decoder_t *dec) {
 	format_t cn_format = dec->dest_format;
 	cn_format.channels = dec->in_format.channels;
 	cn_format.clockrate = dec->in_format.clockrate;
-	dec->dtx.u.cn.cn_dec = decoder_new_fmt(codec_def_cn, 8000, 1, dec->ptime, &cn_format);
+	dec->dtx.cn.cn_dec = decoder_new_fmt(codec_def_cn, 8000, 1, dec->ptime, &cn_format);
 	return 0;
 }
 
 static void generic_cn_dtx_cleanup(decoder_t *dec) {
-	decoder_close(dec->dtx.u.cn.cn_dec);
+	decoder_close(dec->dtx.cn.cn_dec);
 }
 
 
@@ -2926,8 +3717,8 @@ static void bcg729_def_init(struct codec_def_s *def) {
 }
 
 static const char *bcg729_decoder_init(decoder_t *dec, const str *extra_opts) {
-	dec->u.bcg729 = initBcg729DecoderChannel();
-	if (!dec->u.bcg729)
+	dec->bcg729 = initBcg729DecoderChannel();
+	if (!dec->bcg729)
 		return "failed to initialize bcg729";
 	return NULL;
 }
@@ -2954,7 +3745,7 @@ static int bcg729_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 		pts += frame->nb_samples;
 
 		// XXX handle lost packets and comfort noise
-		bcg729Decoder(dec->u.bcg729, (void *) inp_frame.s, inp_frame.len, 0, 0, 0,
+		bcg729Decoder(dec->bcg729, (void *) inp_frame.s, inp_frame.len, 0, 0, 0,
 				(void *) frame->extended_data[0]);
 
 		g_queue_push_tail(out, frame);
@@ -2964,14 +3755,14 @@ static int bcg729_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 }
 
 static void bcg729_decoder_close(decoder_t *dec) {
-	if (dec->u.bcg729)
-		closeBcg729DecoderChannel(dec->u.bcg729);
-	dec->u.bcg729 = NULL;
+	if (dec->bcg729)
+		closeBcg729DecoderChannel(dec->bcg729);
+	dec->bcg729 = NULL;
 }
 
 static const char *bcg729_encoder_init(encoder_t *enc, const str *extra_opts) {
-	enc->u.bcg729 = initBcg729EncoderChannel(0); // no VAD
-	if (!enc->u.bcg729)
+	enc->bcg729 = initBcg729EncoderChannel(0); // no VAD
+	if (!enc->bcg729)
 		return "failed to initialize bcg729";
 
 	enc->actual_format.format = AV_SAMPLE_FMT_S16;
@@ -2995,7 +3786,7 @@ static int bcg729_encoder_input(encoder_t *enc, AVFrame **frame) {
 	av_new_packet(enc->avpkt, 10);
 	unsigned char len = 0;
 
-	bcg729Encoder(enc->u.bcg729, (void *) (*frame)->extended_data[0], enc->avpkt->data, &len);
+	bcg729Encoder(enc->bcg729, (void *) (*frame)->extended_data[0], enc->avpkt->data, &len);
 	if (!len) {
 		av_packet_unref(enc->avpkt);
 		return 0;
@@ -3009,9 +3800,9 @@ static int bcg729_encoder_input(encoder_t *enc, AVFrame **frame) {
 }
 
 static void bcg729_encoder_close(encoder_t *enc) {
-	if (enc->u.bcg729)
-		closeBcg729EncoderChannel(enc->u.bcg729);
-	enc->u.bcg729 = NULL;
+	if (enc->bcg729)
+		closeBcg729EncoderChannel(enc->bcg729);
+	enc->bcg729 = NULL;
 }
 
 static int packetizer_g729(AVPacket *pkt, GString *buf, str *input_output, encoder_t *enc) {
@@ -3058,11 +3849,26 @@ static int packetizer_g729(AVPacket *pkt, GString *buf, str *input_output, encod
 	input_output->len = output.s - input_output->s;
 	return buf->len >= 2 ? 1 : 0;
 }
+
+static int format_cmp_g729(const struct rtp_payload_type *a, const struct rtp_payload_type *b) {
+	// shortcut the most common case:
+	if (!str_cmp_str(&a->format_parameters, &b->format_parameters))
+		return 0;
+	// incompatible is if one side uses annex B but the other one doesn't
+	if (str_str(&a->format_parameters, "annexb=yes") != -1
+			&& str_str(&b->format_parameters, "annexb=yes") == -1)
+		return -1;
+	if (str_str(&a->format_parameters, "annexb=yes") == -1
+			&& str_str(&b->format_parameters, "annexb=yes") != -1)
+		return -1;
+	// everything else is compatible
+	return 0;
+}
 #endif
 
 
 static const char *dtmf_decoder_init(decoder_t *dec, const str *extra_opts) {
-	dec->u.dtmf.event = -1;
+	dec->dtmf.event = -1;
 	return NULL;
 }
 
@@ -3098,22 +3904,22 @@ static int dtmf_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	dtmf = (void *) data->s;
 
 	// init if we need to
-	if (dtmf->event != dec->u.dtmf.event || dec->rtp_ts != dec->u.dtmf.start_ts) {
-		ZERO(dec->u.dtmf);
-		dec->u.dtmf.event = dtmf->event;
-		dec->u.dtmf.start_ts = dec->rtp_ts;
+	if (dtmf->event != dec->dtmf.event || dec->rtp_ts != dec->dtmf.start_ts) {
+		ZERO(dec->dtmf);
+		dec->dtmf.event = dtmf->event;
+		dec->dtmf.start_ts = dec->rtp_ts;
 		ilog(LOG_DEBUG, "New DTMF event starting: %u at TS %lu", dtmf->event, dec->rtp_ts);
 	}
 
 	unsigned long duration = ntohs(dtmf->duration);
-	unsigned long frame_ts = dec->rtp_ts - dec->u.dtmf.start_ts + dec->u.dtmf.duration;
-	long num_samples = duration - dec->u.dtmf.duration;
+	unsigned long frame_ts = dec->rtp_ts - dec->dtmf.start_ts + dec->dtmf.duration;
+	long num_samples = duration - dec->dtmf.duration;
 
 	ilog(LOG_DEBUG, "Generate DTMF samples for event %u, start TS %lu, TS now %lu, frame TS %lu, "
 			"duration %lu, "
 			"old duration %lu, num samples %li",
-			dtmf->event, dec->u.dtmf.start_ts, dec->rtp_ts, frame_ts,
-			duration, dec->u.dtmf.duration, num_samples);
+			dtmf->event, dec->dtmf.start_ts, dec->rtp_ts, frame_ts,
+			duration, dec->dtmf.duration, num_samples);
 
 	if (num_samples <= 0)
 		return 0;
@@ -3125,10 +3931,10 @@ static int dtmf_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 
 	AVFrame *frame = dtmf_frame_int16_t_mono(frame_ts, num_samples, dtmf->event, dtmf->volume,
 			dec->in_format.clockrate);
-	frame->pts += dec->u.dtmf.start_ts;
+	frame->pts += dec->dtmf.start_ts;
 	g_queue_push_tail(out, frame);
 
-	dec->u.dtmf.duration = duration;
+	dec->dtmf.duration = duration;
 
 	return 0;
 }
@@ -3154,7 +3960,7 @@ static int cn_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	if (ptime <= 0)
 		ptime = 20; // ?
 	int samples = dec->in_format.clockrate * ptime / 1000;
-	dec->u.avc.avcctx->frame_size = samples;
+	dec->avc.avcctx->frame_size = samples;
 	int ret = avc_decoder_input(dec, data, out);
 	if (ret)
 		return ret;
@@ -3211,12 +4017,11 @@ void frame_fill_dtmf_samples(enum AVSampleFormat fmt, void *samples, unsigned in
 
 
 
-
 // lamely parse out decimal numbers without using floating point
 static unsigned int str_to_i_k(str *s) {
 	str intg;
 	str frac = *s;
-	if (!str_token(&intg, &frac, '.')) {
+	if (str_token(&intg, &frac, '.')) {
 		unsigned int ret = str_to_i(s, 0) * 1000;
 		if (frac.len > 1) // at most one decimal digit
 			frac.len = 1;
@@ -3274,7 +4079,7 @@ static void evs_parse_bw(enum evs_bw *minp, enum evs_bw *maxp, const str *token)
 static void evs_parse_br(unsigned int *minp, unsigned int *maxp, str *token) {
 	str min;
 	str max = *token;
-	if (!str_token(&min, &max, '-')) {
+	if (str_token(&min, &max, '-')) {
 		*minp = str_to_i_k(&min);
 		*maxp = str_to_i_k(&max);
 	}
@@ -3323,12 +4128,12 @@ static void evs_format_print_bw(GString *s, const char *k, enum evs_bw min, enum
 	g_string_append(s, evs_bw_strings[max]);
 	g_string_append(s, "; ");
 }
-static bool evs_format_print(GString *s, const struct rtp_payload_type *p) {
+static GString *evs_format_print(const struct rtp_payload_type *p) {
 	if (!p->format.fmtp_parsed)
 		return false;
 
+	GString *s = g_string_new("");
 	__auto_type f = &p->format.parsed.evs;
-	gsize orig_len = s->len;
 
 	if (f->hf_only)
 		g_string_append(s, "hf-only=1; ");
@@ -3369,10 +4174,10 @@ static bool evs_format_print(GString *s, const struct rtp_payload_type *p) {
 		evs_format_print_bw(s, "bw-recv", f->min_bw_recv, f->max_bw_recv);
 	}
 
-	if (orig_len != s->len)
+	if (s->len != 0)
 		g_string_truncate(s, s->len - 2); // remove trailing "; " if anything was printed
 
-	return true;
+	return s;
 }
 static void evs_parse_format_cb(str *key, str *token, void *data) {
 	union codec_format_options *opts = data;
@@ -3421,7 +4226,7 @@ static void evs_parse_format_cb(str *key, str *token, void *data) {
 			break;
 		case CSH_LOOKUP("mode-set"):;
 			str mode;
-			while (str_token_sep(&mode, token, ',') == 0) {
+			while (str_token_sep(&mode, token, ',')) {
 				int m = str_to_i(&mode, -1);
 				if (m < 0 || m > 8)
 					continue;
@@ -3446,10 +4251,10 @@ static int evs_format_parse(struct rtp_codec_format *f, const str *fmtp) {
 	f->parsed.evs.max_bw_recv = EVS_BW_UNSPEC;
 	f->parsed.evs.min_bw_recv = EVS_BW_UNSPEC;
 
-	codeclib_key_value_parse(fmtp, true, evs_parse_format_cb, f);
+	codeclib_key_value_parse(fmtp, true, evs_parse_format_cb, &f->parsed);
 	return 0;
 }
-static void evs_format_answer(struct rtp_payload_type *p) {
+static void evs_format_answer(struct rtp_payload_type *p, const struct rtp_payload_type *src) {
 	if (!p->format.fmtp_parsed)
 		return;
 
@@ -3534,7 +4339,9 @@ static int evs_format_cmp(const struct rtp_payload_type *A, const struct rtp_pay
 	return (compat == 0) ? 0 : 1;
 }
 // EVS RTP always runs at 16 kHz
-static void evs_select_encoder_format(encoder_t *enc, format_t *req_format, const format_t *f) {
+static void evs_select_encoder_format(encoder_t *enc, format_t *req_format, const format_t *f,
+		const struct rtp_codec_format *fmtp)
+{
 	if (req_format->clockrate != 16000)
 		return; // bail - encoder will fail to initialise
 
@@ -3565,7 +4372,7 @@ static void evs_select_encoder_format(encoder_t *enc, format_t *req_format, cons
 
 
 static const char *evs_decoder_init(decoder_t *dec, const str *extra_opts) {
-	dec->u.evs = g_slice_alloc0(evs_decoder_size);
+	dec->evs = g_slice_alloc0(evs_decoder_size);
 	if (dec->in_format.clockrate != 48000)
 		ilog(LOG_WARN, "EVS: invalid decoder clock rate (%i) requested",
 				fraction_div(dec->in_format.clockrate, &dec->clockrate_fact));
@@ -3573,13 +4380,13 @@ static const char *evs_decoder_init(decoder_t *dec, const str *extra_opts) {
 		ilog(LOG_WARN, "EVS: %i-channel EVS is not supported",
 				dec->in_format.channels);
 	dec->in_format.clockrate = 48000;
-	evs_set_decoder_Fs(dec->u.evs, dec->in_format.clockrate);
-	evs_init_decoder(dec->u.evs);
+	evs_set_decoder_Fs(dec->evs, dec->in_format.clockrate);
+	evs_init_decoder(dec->evs);
 	return NULL;
 }
 static void evs_decoder_close(decoder_t *dec) {
-	evs_destroy_decoder(dec->u.evs);
-	g_slice_free1(evs_decoder_size, dec->u.evs);
+	evs_destroy_decoder(dec->evs);
+	g_slice_free1(evs_decoder_size, dec->evs);
 }
 
 
@@ -3813,8 +4620,8 @@ static int evs_match_bitrate(int orig_br, unsigned int amr) {
 
 
 static const char *evs_encoder_init(encoder_t *enc, const str *extra_opts) {
-	enc->u.evs.ctx = g_slice_alloc0(evs_encoder_size);
-	enc->u.evs.ind_list = g_slice_alloc(evs_encoder_ind_list_size);
+	enc->evs.ctx = g_slice_alloc0(evs_encoder_size);
+	enc->evs.ind_list = g_slice_alloc(evs_encoder_ind_list_size);
 	if (enc->requested_format.channels != 1)
 		ilog(LOG_WARN, "EVS: %i-channel EVS is not supported",
 				enc->requested_format.channels);
@@ -3850,7 +4657,7 @@ static const char *evs_encoder_init(encoder_t *enc, const str *extra_opts) {
 			ilog(LOG_WARN, "EVS: invalid encoder clock rate (%i) requested",
 					fraction_div(enc->requested_format.clockrate, &enc->clockrate_fact));
 	}
-	evs_set_encoder_opts(enc->u.evs.ctx, enc->actual_format.clockrate, enc->u.evs.ind_list);
+	evs_set_encoder_opts(enc->evs.ctx, enc->actual_format.clockrate, enc->evs.ind_list);
 
 	// limit bitrate to given range
 	if (!o->amr_io) {
@@ -3874,7 +4681,7 @@ static const char *evs_encoder_init(encoder_t *enc, const str *extra_opts) {
 		else {
 			mode &= 0xff;
 			mode = evs_clamp_mode_by_bw(mode, enc->codec_options.evs.max_bw);
-			int bitrate = evs_mode_bitrates[0][mode];
+			bitrate = evs_mode_bitrates[0][mode];
 			ilog(LOG_INFO, "EVS: using bitrate %i instead of %i as restricted by BW %i",
 					bitrate, enc->bitrate, enc->codec_options.evs.max_bw);
 			enc->bitrate = bitrate;
@@ -3923,16 +4730,16 @@ static const char *evs_encoder_init(encoder_t *enc, const str *extra_opts) {
 		}
 	}
 
-	evs_set_encoder_brate(enc->u.evs.ctx, enc->bitrate, enc->codec_options.evs.max_bw,
+	evs_set_encoder_brate(enc->evs.ctx, enc->bitrate, enc->codec_options.evs.max_bw,
 			evs_bitrate_mode(enc->bitrate), o->amr_io);
-	evs_init_encoder(enc->u.evs.ctx);
+	evs_init_encoder(enc->evs.ctx);
 
 	return NULL;
 }
 static void evs_encoder_close(encoder_t *enc) {
-	evs_destroy_encoder(enc->u.evs.ctx);
-	g_slice_free1(evs_encoder_size, enc->u.evs.ctx);
-	g_slice_free1(evs_encoder_ind_list_size, enc->u.evs.ind_list);
+	evs_destroy_encoder(enc->evs.ctx);
+	g_slice_free1(evs_encoder_size, enc->evs.ctx);
+	g_slice_free1(evs_encoder_ind_list_size, enc->evs.ind_list);
 }
 
 
@@ -3942,10 +4749,10 @@ static void evs_handle_cmr(encoder_t *enc) {
 	if ((enc->callback.evs.cmr_in & 0x80) == 0)
 		return;
 	if (!memcmp(&enc->callback.evs.cmr_in_ts,
-				&enc->u.evs.cmr_in_ts, sizeof(struct timeval)))
+				&enc->evs.cmr_in_ts, sizeof(struct timeval)))
 		return;
 
-	enc->u.evs.cmr_in_ts = enc->callback.evs.cmr_in_ts; // XXX should use a queue or something instead
+	enc->evs.cmr_in_ts = enc->callback.evs.cmr_in_ts; // XXX should use a queue or something instead
 
 	__auto_type f = &enc->format_options.evs;
 	__auto_type o = &enc->codec_options.evs;
@@ -3981,7 +4788,7 @@ static void evs_handle_cmr(encoder_t *enc) {
 		goto err;
 
 	enc->bitrate = bitrate;
-	evs_set_encoder_brate(enc->u.evs.ctx, bitrate, o->max_bw,
+	evs_set_encoder_brate(enc->evs.ctx, bitrate, o->max_bw,
 			evs_bitrate_mode(bitrate), f->amr_io);
 
 	return;
@@ -4008,9 +4815,9 @@ static int evs_encoder_input(encoder_t *enc, AVFrame **frame) {
 	evs_handle_cmr(enc);
 
 	if (!enc->format_options.evs.amr_io)
-		evs_enc_in(enc->u.evs.ctx, (void *) (*frame)->extended_data[0], (*frame)->nb_samples);
+		evs_enc_in(enc->evs.ctx, (void *) (*frame)->extended_data[0], (*frame)->nb_samples);
 	else
-		evs_amr_enc_in(enc->u.evs.ctx, (void *) (*frame)->extended_data[0], (*frame)->nb_samples);
+		evs_amr_enc_in(enc->evs.ctx, (void *) (*frame)->extended_data[0], (*frame)->nb_samples);
 
 	// max output: 320 bytes, plus some overhead
 	av_new_packet(enc->avpkt, 340);
@@ -4061,7 +4868,7 @@ static int evs_encoder_input(encoder_t *enc, AVFrame **frame) {
 	}
 
 	uint16_t bits = 0;
-	evs_enc_out(enc->u.evs.ctx, out, &bits);
+	evs_enc_out(enc->evs.ctx, out, &bits);
 	uint16_t bytes = (bits + 7) / 8;
 	int32_t mode = evs_mode_from_bytes(bytes);
 	if (mode < 0) {
@@ -4070,7 +4877,7 @@ static int evs_encoder_input(encoder_t *enc, AVFrame **frame) {
 		av_packet_unref(enc->avpkt);
 		return -1;
 	}
-	evs_reset_enc_ind(enc->u.evs.ctx);
+	evs_reset_enc_ind(enc->evs.ctx);
 
 	if (toc) {
 		*toc = (mode & 0xff);
@@ -4097,6 +4904,15 @@ static int evs_encoder_input(encoder_t *enc, AVFrame **frame) {
 
 	bytes += (out - enc->avpkt->data);
 	assert(bytes <= enc->avpkt->size);
+
+	if (toc && !enc->format_options.evs.amr_io && !enc->format_options.evs.hf_only) {
+		// hf-only=0 but HF packet, check for size collisions and zero-pad if needed
+		while (evs_mode_from_bytes(bytes) != -1) {
+			enc->avpkt->data[bytes] = '\0';
+			bytes++;
+		}
+	}
+
 	enc->avpkt->size = bytes;
 	enc->avpkt->pts = (*frame)->pts;
 	enc->avpkt->duration = (*frame)->nb_samples;
@@ -4118,15 +4934,75 @@ static const char evs_amr_io_compact_cmr[8] = {
 };
 
 
+#if defined(__x86_64__) && !defined(ASAN_BUILD) && HAS_ATTR(ifunc) && defined(__GLIBC__)
+static void mvr2s_dynlib_wrapper(float *in, const uint16_t len, int16_t *out) {
+	evs_syn_output(in, len, out);
+}
+static void (*resolve_float2int16_array(void))(float *, const uint16_t, int16_t *) {
+#if defined(__x86_64__)
+	if (rtpe_has_cpu_flag(RTPE_CPU_FLAG_AVX512BW) && rtpe_has_cpu_flag(RTPE_CPU_FLAG_AVX512F))
+		return mvr2s_avx512;
+	if (rtpe_has_cpu_flag(RTPE_CPU_FLAG_AVX2))
+		return mvr2s_avx2;
+#endif
+	return mvr2s_dynlib_wrapper;
+}
+static void float2int16_array(float *in, const uint16_t len, int16_t *out)
+	__attribute__ ((ifunc ("resolve_float2int16_array")));
+#else
+#define float2int16_array evs_syn_output
+#endif
+
+
+
+static void evs_push_frame(decoder_t *dec, char *frame_data, int bits, int is_amr, int mode, int q_bit,
+		GQueue *out)
+{
+	const unsigned int n_samples = 960; // fixed 20 ms ptime
+	uint64_t pts = dec->pts;
+
+	AVFrame *frame = av_frame_alloc();
+	frame->nb_samples = n_samples;
+	frame->format = AV_SAMPLE_FMT_S16;
+	frame->sample_rate = 48000;
+	DEF_CH_LAYOUT(&frame->CH_LAYOUT, 1);
+	frame->pts = pts;
+	if (av_frame_get_buffer(frame, 0) < 0)
+		abort();
+
+	evs_dec_in(dec->evs, frame_data, bits, is_amr, mode, q_bit, 0, 0);
+
+	// check for floating point implementation
+	if (evs_syn_output) {
+		// temp float buffer
+		float tmp[n_samples * 3];
+		if (!is_amr)
+			evs_dec_out(dec->evs, tmp, 0);
+		else
+			evs_amr_dec_out(dec->evs, tmp);
+		float2int16_array(tmp, n_samples, (void *) frame->extended_data[0]);
+	}
+	else {
+		if (!is_amr)
+			evs_dec_out(dec->evs, frame->extended_data[0], 0);
+		else
+			evs_amr_dec_out(dec->evs, frame->extended_data[0]);
+	}
+
+	evs_dec_inc_frame(dec->evs);
+
+	pts += n_samples;
+	dec->pts = pts;
+
+	g_queue_push_tail(out, frame);
+}
+
 static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	str input = *data;
-	uint64_t pts = dec->pts;
 	const char *err = NULL;
 
 	if (input.len == 0)
 		return 0;
-
-	unsigned int n_samples = dec->in_format.clockrate * 20 / 1000;
 
 	str frame_data = STR_NULL;
 	const unsigned char *toc = NULL, *toc_end = NULL;
@@ -4204,38 +5080,8 @@ static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	while (1) {
 		// process frame if we have one; we don't have one if
 		// this is the first iteration and this is not a compact frame
-		if (mode != -1) {
-			AVFrame *frame = av_frame_alloc();
-			frame->nb_samples = n_samples;
-			frame->format = AV_SAMPLE_FMT_S16;
-			frame->sample_rate = dec->in_format.clockrate; // 48000
-			DEF_CH_LAYOUT(&frame->CH_LAYOUT, dec->in_format.channels);
-			frame->pts = pts;
-			if (av_frame_get_buffer(frame, 0) < 0)
-				abort();
-
-			evs_dec_in(dec->u.evs, frame_data.s, bits, is_amr, mode, q_bit, 0, 0);
-
-			if (evs_syn_output) {
-				// temp float buffer
-				float tmp[n_samples * 3];
-				if (!is_amr)
-					evs_dec_out(dec->u.evs, tmp, 0);
-				else
-					evs_amr_dec_out(dec->u.evs, tmp);
-				evs_syn_output(tmp, n_samples, (void *) frame->extended_data[0]);
-				// XXX ^ use something SIMD accelerated? ffmpeg?
-			}
-			else {
-				if (!is_amr)
-					evs_dec_out(dec->u.evs, frame->extended_data[0], 0);
-				else
-					evs_amr_dec_out(dec->u.evs, frame->extended_data[0]);
-			}
-
-			pts += n_samples;
-			g_queue_push_tail(out, frame);
-		}
+		if (mode != -1)
+			evs_push_frame(dec, frame_data.s, bits, is_amr, mode, q_bit, out);
 
 		// anything left? we break here in compact mode
 		if (!input.len)
@@ -4255,8 +5101,7 @@ static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 		// consume and shift
 		toc++;
 		int bytes = (bits + 7) / 8;
-		frame_data.s = input.s;
-		frame_data.len = bytes;
+		frame_data = STR_LEN(input.s, bytes);
 		err = "speech frame truncated";
 		if (str_shift(&input, bytes))
 			goto err;
@@ -4280,7 +5125,7 @@ static void evs_load_so(const char *path) {
 
 	evs_lib_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!evs_lib_handle)
-		goto err;
+		die("Failed to open EVS codec .so '%s': %s", path, dlerror());
 
 	static unsigned int (*get_evs_decoder_size)(void);
 	static unsigned int (*get_evs_encoder_size)(void);
@@ -4290,90 +5135,39 @@ static void evs_load_so(const char *path) {
 	evs_init_decoder = dlsym(evs_lib_handle, "init_decoder");
 	if (!evs_init_decoder) {
 		// fx codec?
-		evs_init_decoder = dlsym(evs_lib_handle, "init_decoder_fx");
-		if (!evs_init_decoder)
-			goto err;
-		evs_init_encoder = dlsym(evs_lib_handle, "init_encoder_fx");
-		if (!evs_init_encoder)
-			goto err;
-		evs_destroy_encoder = dlsym(evs_lib_handle, "destroy_encoder_fx");
-		if (!evs_destroy_encoder)
-			goto err;
-		evs_enc_in = dlsym(evs_lib_handle, "evs_enc_fx");
-		if (!evs_enc_in)
-			goto err;
-		evs_amr_enc_in = dlsym(evs_lib_handle, "amr_wb_enc_fx");
-		if (!evs_amr_enc_in)
-			goto err;
-		evs_reset_enc_ind = dlsym(evs_lib_handle, "reset_indices_enc_fx");
-		if (!evs_reset_enc_ind)
-			goto err;
-		evs_dec_in = dlsym(evs_lib_handle, "read_indices_from_djb_fx");
-		if (!evs_dec_in)
-			goto err;
-		evs_dec_out = dlsym(evs_lib_handle, "evs_dec_fx");
-		if (!evs_dec_out)
-			goto err;
-		evs_amr_dec_out = dlsym(evs_lib_handle, "amr_wb_dec_fx");
-		if (!evs_amr_dec_out)
-			goto err;
+		evs_init_decoder = dlsym_assert(evs_lib_handle, "init_decoder_fx", path);
+		evs_init_encoder = dlsym_assert(evs_lib_handle, "init_encoder_fx", path);
+		evs_destroy_encoder = dlsym_assert(evs_lib_handle, "destroy_encoder_fx", path);
+		evs_enc_in = dlsym_assert(evs_lib_handle, "evs_enc_fx", path);
+		evs_amr_enc_in = dlsym_assert(evs_lib_handle, "amr_wb_enc_fx", path);
+		evs_reset_enc_ind = dlsym_assert(evs_lib_handle, "reset_indices_enc_fx", path);
+		evs_dec_in = dlsym_assert(evs_lib_handle, "read_indices_from_djb_fx", path);
+		evs_dec_out = dlsym_assert(evs_lib_handle, "evs_dec_fx", path);
+		evs_amr_dec_out = dlsym_assert(evs_lib_handle, "amr_wb_dec_fx", path);
 	}
 	else {
 		// flp codec
-		evs_init_encoder = dlsym(evs_lib_handle, "init_encoder");
-		if (!evs_init_encoder)
-			goto err;
-		evs_destroy_encoder = dlsym(evs_lib_handle, "destroy_encoder");
-		if (!evs_destroy_encoder)
-			goto err;
-		evs_enc_in = dlsym(evs_lib_handle, "evs_enc");
-		if (!evs_enc_in)
-			goto err;
-		evs_amr_enc_in = dlsym(evs_lib_handle, "amr_wb_enc");
-		if (!evs_amr_enc_in)
-			goto err;
-		evs_reset_enc_ind = dlsym(evs_lib_handle, "reset_indices_enc");
-		if (!evs_reset_enc_ind)
-			goto err;
-		evs_dec_in = dlsym(evs_lib_handle, "read_indices_from_djb");
-		if (!evs_dec_in)
-			goto err;
-		evs_dec_out = dlsym(evs_lib_handle, "evs_dec");
-		if (!evs_dec_out)
-			goto err;
-		evs_syn_output = dlsym(evs_lib_handle, "syn_output");
-		if (!evs_syn_output)
-			goto err;
-		evs_amr_dec_out = dlsym(evs_lib_handle, "amr_wb_dec");
-		if (!evs_amr_dec_out)
-			goto err;
+		evs_init_encoder = dlsym_assert(evs_lib_handle, "init_encoder", path);
+		evs_destroy_encoder = dlsym_assert(evs_lib_handle, "destroy_encoder", path);
+		evs_enc_in = dlsym_assert(evs_lib_handle, "evs_enc", path);
+		evs_amr_enc_in = dlsym_assert(evs_lib_handle, "amr_wb_enc", path);
+		evs_reset_enc_ind = dlsym_assert(evs_lib_handle, "reset_indices_enc", path);
+		evs_dec_in = dlsym_assert(evs_lib_handle, "read_indices_from_djb", path);
+		evs_dec_out = dlsym_assert(evs_lib_handle, "evs_dec", path);
+		evs_syn_output = dlsym_assert(evs_lib_handle, "syn_output", path);
+		evs_amr_dec_out = dlsym_assert(evs_lib_handle, "amr_wb_dec", path);
 	}
 
 	// common
-	get_evs_decoder_size = dlsym(evs_lib_handle, "decoder_size");
-	if (!get_evs_decoder_size)
-		goto err;
-	get_evs_encoder_size = dlsym(evs_lib_handle, "encoder_size");
-	if (!get_evs_encoder_size)
-		goto err;
-	get_evs_encoder_ind_list_size = dlsym(evs_lib_handle, "encoder_ind_list_size");
-	if (!get_evs_encoder_ind_list_size)
-		goto err;
-	evs_destroy_decoder = dlsym(evs_lib_handle, "destroy_decoder");
-	if (!evs_destroy_decoder)
-		goto err;
-	evs_enc_out = dlsym(evs_lib_handle, "indices_to_serial");
-	if (!evs_enc_out)
-		goto err;
-	evs_set_encoder_opts = dlsym(evs_lib_handle, "encoder_set_opts");
-	if (!evs_set_encoder_opts)
-		goto err;
-	evs_set_encoder_brate = dlsym(evs_lib_handle, "encoder_set_brate");
-	if (!evs_set_encoder_brate)
-		goto err;
-	evs_set_decoder_Fs = dlsym(evs_lib_handle, "decoder_set_Fs");
-	if (!evs_set_decoder_Fs)
-		goto err;
+	get_evs_decoder_size = dlsym_assert(evs_lib_handle, "decoder_size", path);
+	get_evs_encoder_size = dlsym_assert(evs_lib_handle, "encoder_size", path);
+	get_evs_encoder_ind_list_size = dlsym_assert(evs_lib_handle, "encoder_ind_list_size", path);
+	evs_destroy_decoder = dlsym_assert(evs_lib_handle, "destroy_decoder", path);
+	evs_enc_out = dlsym_assert(evs_lib_handle, "indices_to_serial", path);
+	evs_set_encoder_opts = dlsym_assert(evs_lib_handle, "encoder_set_opts", path);
+	evs_set_encoder_brate = dlsym_assert(evs_lib_handle, "encoder_set_brate", path);
+	evs_set_decoder_Fs = dlsym_assert(evs_lib_handle, "decoder_set_Fs", path);
+	evs_dec_inc_frame = dlsym_assert(evs_lib_handle, "decoder_inc_ini_frame", path);
 
 	// all ok
 
@@ -4382,12 +5176,6 @@ static void evs_load_so(const char *path) {
 	evs_encoder_ind_list_size = get_evs_encoder_ind_list_size();
 
 	return;
-
-err:
-	ilog(LOG_ERR, "Failed to open EVS codec .so '%s': %s", path, dlerror());
-	if (evs_lib_handle)
-		dlclose(evs_lib_handle);
-	evs_lib_handle = NULL;
 }
 
 static void evs_def_init(struct codec_def_s *def) {
@@ -4400,5 +5188,1025 @@ static void evs_def_init(struct codec_def_s *def) {
 }
 
 static int evs_dtx(decoder_t *dec, GQueue *out, int ptime) {
+	ilog(LOG_DEBUG, "pushing empty/lost frame to EVS decoder");
+	evs_push_frame(dec, NULL, 0, 0, 0, 0, out);
 	return 0;
+}
+
+
+
+
+
+
+#ifdef HAVE_CODEC_CHAIN
+codec_cc_state cc_pcmu2opus_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_pcmu2opus_runner_do(c->pcmu2opus.runner, c->pcmu2opus.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+	// XXX handle input frame sizes != 160
+
+	pkt->size = ret;
+	pkt->duration = data->len * 6L;
+	pkt->pts = ts * 6L;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_pcma2opus_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_pcma2opus_runner_do(c->pcma2opus.runner, c->pcma2opus.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+	// XXX handle input frame sizes != 160
+
+	pkt->size = ret;
+	pkt->duration = data->len * 6L;
+	pkt->pts = ts * 6L;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_pcmu2g729a_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_pcmu2g729a_runner_do(c->pcmu2g729a.runner, c->pcmu2g729a.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = data->len;
+	pkt->pts = ts;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_pcma2g729a_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_pcma2g729a_runner_do(c->pcma2g729a.runner, c->pcma2g729a.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = data->len;
+	pkt->pts = ts;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_g729a2pcma_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_g729a2pcma_runner_do(c->g729a2pcma.runner, c->g729a2pcma.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = data->len;
+	pkt->pts = ts;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_g729a2pcmu_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_g729a2pcmu_runner_do(c->g729a2pcmu.runner, c->g729a2pcmu.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = data->len;
+	pkt->pts = ts;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_opus2pcmu_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_opus2pcmu_runner_do(c->opus2pcmu.runner, c->opus2pcmu.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = ret;
+	pkt->pts = ts / 6L;
+
+	return CCC_OK;
+}
+
+codec_cc_state cc_opus2pcma_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt;
+	ssize_t ret = cc_opus2pcma_runner_do(c->opus2pcma.runner, c->opus2pcma.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size);
+	if (ret <= 0)
+		return CCC_ERR;
+
+	pkt->size = ret;
+	pkt->duration = ret;
+	pkt->pts = ts / 6L;
+
+	return CCC_OK;
+}
+
+static void __cc_async_job_free(struct async_job *j) {
+	g_free(j->data.s);
+	g_free(j);
+}
+
+static void __codec_cc_free(codec_cc_t *c) {
+	c->clear(c->clear_arg);
+	while (c->async_jobs.length) {
+		__auto_type j = t_queue_pop_head(&c->async_jobs);
+		c->async_callback(NULL, j->async_cb_obj);
+		__cc_async_job_free(j);
+	}
+	av_packet_free(&c->avpkt);
+	av_packet_free(&c->avpkt_async);
+	g_slice_free1(sizeof(*c), c);
+}
+
+
+// lock must be held
+// append job to queue
+static void __cc_async_do_add_queue(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	struct async_job *j = g_new0(__typeof__(*j), 1);
+	j->data = str_dup_str(data);
+	j->async_cb_obj = async_cb_obj;
+	j->ts = ts;
+	t_queue_push_tail(&c->async_jobs, j);
+}
+// check busy flag and append to queue if set
+// if not busy, sets busy flag
+// also check blocked flag if busy: if set, try running first job
+static bool __cc_async_check_busy_blocked_queue(codec_cc_t *c, const str *data, unsigned long ts,
+		void *async_cb_obj, __typeof__(__cc_pcmu2opus_run_async) run_async)
+{
+	struct async_job *j = NULL;
+
+	{
+		LOCK(&c->async_lock);
+
+		if (!c->async_busy) {
+			// we can try running
+			c->async_busy = true;
+			return false;
+		}
+
+		// codec is busy (either currently running or was blocked)
+		// append to queue
+		__cc_async_do_add_queue(c, data, ts, async_cb_obj);
+
+		// if we were blocked (not currently running), try running now
+		if (c->async_blocked)
+			j = t_queue_pop_head(&c->async_jobs);
+	}
+
+	if (j) {
+		if (!run_async(c, &j->data, j->ts, j->async_cb_obj)) {
+			// still blocked. return to queue
+			LOCK(&c->async_lock);
+			t_queue_push_head(&c->async_jobs, j);
+		}
+		else {
+			// unblocked, running now
+			__cc_async_job_free(j);
+			LOCK(&c->async_lock);
+			c->async_blocked = false;
+		}
+	}
+
+	return true;
+}
+// runner failed, needed to block (no available context)
+// set blocked flag and append to queue
+// queue is guaranteed to be empty
+static void __cc_async_blocked_queue(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	LOCK(&c->async_lock);
+	__cc_async_do_add_queue(c, data, ts, async_cb_obj);
+	c->async_blocked = true;
+	// busy == true
+}
+
+static codec_cc_state cc_X_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj,
+		__typeof__(__cc_pcmu2opus_run_async) run_async)
+{
+	if (__cc_async_check_busy_blocked_queue(c, data, ts, async_cb_obj, run_async))
+		return CCC_ASYNC;
+	if (!run_async(c, data, ts, async_cb_obj))
+		__cc_async_blocked_queue(c, data, ts, async_cb_obj);
+	return CCC_ASYNC;
+}
+
+static void cc_X_pkt_callback(codec_cc_t *c, int size, __typeof__(__cc_pcmu2opus_run_async) run_async) {
+	AVPacket *pkt = c->avpkt_async;
+	void *async_cb_obj = c->async_cb_obj;
+	c->async_cb_obj = NULL;
+
+	c->async_callback(pkt, async_cb_obj);
+
+	pkt->size = 0;
+
+	struct async_job *j = NULL;
+	bool shutdown = false;
+	{
+		LOCK(&c->async_lock);
+		j = t_queue_pop_head(&c->async_jobs);
+		if (!j) {
+			if (c->async_shutdown)
+				shutdown = true;
+			else
+				c->async_busy = false;
+		}
+	}
+
+	if (shutdown) {
+		__codec_cc_free(c);
+		return;
+	}
+
+	if (j) {
+		if (!run_async(c, &j->data, j->ts, j->async_cb_obj)) {
+			LOCK(&c->async_lock);
+			t_queue_push_head(&c->async_jobs, j);
+			c->async_blocked = true;
+		}
+		else {
+			g_free(j->data.s);
+			g_free(j);
+			LOCK(&c->async_lock);
+			c->async_blocked = false;
+		}
+	}
+}
+
+static void cc_pcmX2opus_run_callback(void *p, int size, __typeof__(__cc_pcmu2opus_run_async) run_async) {
+	codec_cc_t *c = p;
+
+	assert(size > 0); // XXX handle errors XXX handle input frame sizes != 160
+
+	AVPacket *pkt = c->avpkt_async;
+
+	pkt->size = size;
+	pkt->duration = c->data_len * 6L;
+	pkt->pts = c->ts * 6L;
+
+	cc_X_pkt_callback(c, size, run_async);
+}
+
+static void cc_pcmu2opus_run_callback(void *p, int size) {
+	cc_pcmX2opus_run_callback(p, size, __cc_pcmu2opus_run_async);
+}
+static bool __cc_pcmu2opus_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_pcmu2opus_runner_async_do_nonblock(c->pcmu2opus_async.runner, c->pcmu2opus.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_pcmu2opus_run_callback, c);
+}
+codec_cc_state cc_pcmu2opus_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_pcmu2opus_run_async);
+}
+
+static void cc_pcma2opus_run_callback(void *p, int size) {
+	cc_pcmX2opus_run_callback(p, size, __cc_pcma2opus_run_async);
+}
+static bool __cc_pcma2opus_run_async(codec_cc_t *c, const str *data, unsigned long ts,
+		void *async_cb_obj)
+{
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_pcma2opus_runner_async_do_nonblock(c->pcma2opus_async.runner, c->pcma2opus.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_pcma2opus_run_callback, c);
+}
+codec_cc_state cc_pcma2opus_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_pcma2opus_run_async);
+}
+
+static void cc_opus2pcmX_run_callback(void *p, int size, __typeof__(__cc_opus2pcma_run_async) run_async) {
+	codec_cc_t *c = p;
+
+	assert(size > 0); // XXX handle errors
+
+	AVPacket *pkt = c->avpkt_async;
+
+	pkt->size = size;
+	pkt->duration = size;
+	pkt->pts = c->ts / 6L;
+
+	cc_X_pkt_callback(c, size, run_async);
+}
+
+static void cc_opus2pcmu_run_callback(void *p, int size) {
+	cc_opus2pcmX_run_callback(p, size, __cc_opus2pcmu_run_async);
+}
+static bool __cc_opus2pcmu_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = 960;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_opus2pcmu_runner_async_do_nonblock(c->opus2pcmu_async.runner, c->opus2pcmu.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_opus2pcmu_run_callback, c);
+}
+codec_cc_state cc_opus2pcmu_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_opus2pcmu_run_async);
+}
+
+static void cc_opus2pcma_run_callback(void *p, int size) {
+	return cc_opus2pcmX_run_callback(p, size, __cc_opus2pcma_run_async);
+}
+static bool __cc_opus2pcma_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = 960;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_opus2pcma_runner_async_do_nonblock(c->opus2pcma_async.runner, c->opus2pcma.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_opus2pcma_run_callback, c);
+}
+codec_cc_state cc_opus2pcma_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_opus2pcma_run_async);
+}
+
+
+
+
+static void cc_pcmX2g729a_run_callback(void *p, int size, __typeof__(__cc_pcmu2g729a_run_async) run_async) {
+	codec_cc_t *c = p;
+
+	assert(size > 0); // XXX handle errors XXX handle input frame sizes != 160
+
+	AVPacket *pkt = c->avpkt_async;
+
+	pkt->size = size;
+	pkt->duration = c->data_len * 8L;
+	pkt->pts = c->ts;
+
+	cc_X_pkt_callback(c, size, run_async);
+}
+
+static void cc_pcmu2g729a_run_callback(void *p, int size) {
+	cc_pcmX2g729a_run_callback(p, size, __cc_pcmu2g729a_run_async);
+}
+static bool __cc_pcmu2g729a_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = (data->len + 7) / 8L;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_pcmu2g729a_runner_async_do_nonblock(c->pcmu2g729a_async.runner, c->pcmu2g729a.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_pcmu2g729a_run_callback, c);
+}
+codec_cc_state cc_pcmu2g729a_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_pcmu2g729a_run_async);
+}
+
+static void cc_pcma2g729a_run_callback(void *p, int size) {
+	cc_pcmX2g729a_run_callback(p, size, __cc_pcma2g729a_run_async);
+}
+static bool __cc_pcma2g729a_run_async(codec_cc_t *c, const str *data, unsigned long ts,
+		void *async_cb_obj)
+{
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = (data->len + 7) / 8L;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_pcma2g729a_runner_async_do_nonblock(c->pcma2g729a_async.runner, c->pcma2g729a.enc,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_pcma2g729a_run_callback, c);
+}
+codec_cc_state cc_pcma2g729a_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_pcma2g729a_run_async);
+}
+
+
+
+
+static void cc_g729a2pcmX_run_callback(void *p, int size, __typeof__(__cc_g729a2pcma_run_async) run_async) {
+	codec_cc_t *c = p;
+
+	assert(size > 0); // XXX handle errors XXX handle input frame sizes != 160
+
+	AVPacket *pkt = c->avpkt_async;
+
+	pkt->size = size;
+	pkt->duration = c->data_len / 8L;
+	pkt->pts = c->ts;
+
+	cc_X_pkt_callback(c, size, run_async);
+}
+
+static void cc_g729a2pcmu_run_callback(void *p, int size) {
+	cc_g729a2pcmX_run_callback(p, size, __cc_g729a2pcmu_run_async);
+}
+static bool __cc_g729a2pcmu_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = (data->len + 9) * 8L;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_g729a2pcmu_runner_async_do_nonblock(c->g729a2pcmu_async.runner, c->g729a2pcmu.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_g729a2pcmu_run_callback, c);
+}
+codec_cc_state cc_g729a2pcmu_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_g729a2pcmu_run_async);
+}
+
+static void cc_g729a2pcma_run_callback(void *p, int size) {
+	cc_g729a2pcmX_run_callback(p, size, __cc_g729a2pcma_run_async);
+}
+static bool __cc_g729a2pcma_run_async(codec_cc_t *c, const str *data, unsigned long ts,
+		void *async_cb_obj)
+{
+	AVPacket *pkt = c->avpkt_async;
+	pkt->size = (data->len + 9) * 8L;
+
+	c->data_len = data->len;
+	c->ts = ts;
+	c->async_cb_obj = async_cb_obj;
+
+	return cc_g729a2pcma_runner_async_do_nonblock(c->g729a2pcma_async.runner, c->g729a2pcma.dec,
+			(unsigned char *) data->s, data->len,
+			pkt->data, pkt->size, cc_g729a2pcma_run_callback, c);
+}
+codec_cc_state cc_g729a2pcma_run_async(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
+	return cc_X_run_async(c, data, ts, async_cb_obj, __cc_g729a2pcma_run_async);
+}
+
+
+
+
+
+static void cc_float2opus_clear(void *a) {
+	codec_chain_float2opus *enc = a;
+	cc_client_float2opus_free(cc_client, enc);
+}
+static void cc_opus2float_clear(void *a) {
+	codec_chain_opus2float *dec = a;
+	cc_client_opus2float_free(cc_client, dec);
+}
+static void cc_float2g729a_clear(void *a) {
+	codec_chain_float2g729a *enc = a;
+	cc_client_float2g729a_free(cc_client, enc);
+}
+static void cc_g729a2float_clear(void *a) {
+	codec_chain_g729a2float *dec = a;
+	cc_client_g729a2float_free(cc_client, dec);
+}
+
+static codec_cc_t *codec_cc_new_sync(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *))
+{
+	if (!strcmp(dst->rtpname, "opus") && !strcmp(src->rtpname, "PCMA")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 2)
+			return NULL;
+		if (dst_format->clockrate != 48000)
+			return NULL;
+
+		if (!pcma2opus_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcma2opus.enc = cc_client_float2opus_new_ext(cc_client,
+				(codec_chain_opus_arguments) {
+					.bitrate = bitrate,
+					.complexity = rtpe_common_config_ptr->codec_chain_opus_complexity,
+					.application = rtpe_common_config_ptr->codec_chain_opus_application,
+				});
+		ret->clear = cc_float2opus_clear;
+		ret->clear_arg = ret->pcma2opus.enc;
+		ret->pcma2opus.runner = pcma2opus_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_pcma2opus_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "opus") && !strcmp(src->rtpname, "PCMU")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 2)
+			return NULL;
+		if (dst_format->clockrate != 48000)
+			return NULL;
+
+		if (!pcmu2opus_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcmu2opus.enc = cc_client_float2opus_new_ext(cc_client,
+				(codec_chain_opus_arguments) {
+					.bitrate = bitrate,
+					.complexity = rtpe_common_config_ptr->codec_chain_opus_complexity,
+					.application = rtpe_common_config_ptr->codec_chain_opus_application,
+				});
+		ret->clear = cc_float2opus_clear;
+		ret->clear_arg = ret->pcmu2opus.enc;
+		ret->pcmu2opus.runner = pcmu2opus_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_pcmu2opus_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "G729") && !strcmp(src->rtpname, "PCMA")) {
+		// XXX check annex
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!pcma2g729a_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcma2g729a.enc = cc_client_float2g729a_new(cc_client);
+		ret->clear = cc_float2g729a_clear;
+		ret->clear_arg = ret->pcma2g729a.enc;
+		ret->pcma2g729a.runner = pcma2g729a_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_pcma2g729a_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "G729") && !strcmp(src->rtpname, "PCMU")) {
+		// XXX check annex
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!pcmu2g729a_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcmu2g729a.enc = cc_client_float2g729a_new(cc_client);
+		ret->clear = cc_float2g729a_clear;
+		ret->clear_arg = ret->pcmu2g729a.enc;
+		ret->pcmu2g729a.runner = pcmu2g729a_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_pcmu2g729a_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMA") && !strcmp(src->rtpname, "G729")) {
+		// XXX check annex
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!g729a2pcma_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->g729a2pcma.dec = cc_client_g729a2float_new(cc_client);
+		ret->clear = cc_g729a2float_clear;
+		ret->clear_arg = ret->g729a2pcma.dec;
+		ret->g729a2pcma.runner = g729a2pcma_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_g729a2pcma_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMU") && !strcmp(src->rtpname, "G729")) {
+		// XXX check annex
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!g729a2pcmu_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->g729a2pcmu.dec = cc_client_g729a2float_new(cc_client);
+		ret->clear = cc_g729a2float_clear;
+		ret->clear_arg = ret->g729a2pcmu.dec;
+		ret->g729a2pcmu.runner = g729a2pcmu_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_g729a2pcmu_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMU") && !strcmp(src->rtpname, "opus")) {
+		if (dst_format->clockrate != 8000)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (src_format->channels != 2)
+			return NULL;
+		if (src_format->clockrate != 48000)
+			return NULL;
+
+		if (!opus2pcmu_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->opus2pcmu.dec = cc_client_opus2float_new(cc_client);
+		ret->clear = cc_opus2float_clear;
+		ret->clear_arg = ret->opus2pcmu.dec;
+		ret->opus2pcmu.runner = opus2pcmu_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_opus2pcmu_run;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMA") && !strcmp(src->rtpname, "opus")) {
+		if (dst_format->clockrate != 8000)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (src_format->channels != 2)
+			return NULL;
+		if (src_format->clockrate != 48000)
+			return NULL;
+
+		if (!opus2pcma_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->opus2pcma.dec = cc_client_opus2float_new(cc_client);
+		ret->clear = cc_opus2float_clear;
+		ret->clear_arg = ret->opus2pcma.dec;
+		ret->opus2pcma.runner = opus2pcma_runner;
+		ret->avpkt = av_packet_alloc();
+		ret->run = cc_opus2pcma_run;
+
+		return ret;
+	}
+
+	return NULL;
+}
+
+static codec_cc_t *codec_cc_new_async(codec_def_t *src, format_t *src_format, codec_def_t *dst,
+		format_t *dst_format, int bitrate, int ptime,
+		void *(*async_init)(void *, void *, void *),
+		void (*async_callback)(AVPacket *, void *))
+{
+	// XXX check ptime, adjust avpkt sizes
+	if (!strcmp(dst->rtpname, "opus") && !strcmp(src->rtpname, "PCMA")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 2)
+			return NULL;
+		if (dst_format->clockrate != 48000)
+			return NULL;
+
+		if (!pcma2opus_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcma2opus.enc = cc_client_float2opus_new_ext(cc_client,
+				(codec_chain_opus_arguments) {
+					.bitrate = bitrate,
+					.complexity = rtpe_common_config_ptr->codec_chain_opus_complexity,
+					.application = rtpe_common_config_ptr->codec_chain_opus_application,
+				});
+		ret->clear = cc_float2opus_clear;
+		ret->clear_arg = ret->pcma2opus.enc;
+		ret->pcma2opus_async.runner = pcma2opus_async_runner;
+		ret->run = cc_pcma2opus_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async,
+				MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "opus") && !strcmp(src->rtpname, "PCMU")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 2)
+			return NULL;
+		if (dst_format->clockrate != 48000)
+			return NULL;
+
+		if (!pcmu2opus_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcmu2opus.enc = cc_client_float2opus_new_ext(cc_client,
+				(codec_chain_opus_arguments) {
+					.bitrate = bitrate,
+					.complexity = rtpe_common_config_ptr->codec_chain_opus_complexity,
+					.application = rtpe_common_config_ptr->codec_chain_opus_application,
+				});
+		ret->clear = cc_float2opus_clear;
+		ret->clear_arg = ret->pcmu2opus.enc;
+		ret->pcmu2opus_async.runner = pcmu2opus_async_runner;
+		ret->run = cc_pcmu2opus_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async,
+				MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMU") && !strcmp(src->rtpname, "opus")) {
+		if (dst_format->clockrate != 8000)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (src_format->channels != 2)
+			return NULL;
+		if (src_format->clockrate != 48000)
+			return NULL;
+
+		if (!opus2pcmu_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->opus2pcmu.dec = cc_client_opus2float_new(cc_client);
+		ret->clear = cc_opus2float_clear;
+		ret->clear_arg = ret->opus2pcmu.dec;
+		ret->opus2pcmu_async.runner = opus2pcmu_async_runner;
+		ret->run = cc_opus2pcmu_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 960);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMA") && !strcmp(src->rtpname, "opus")) {
+		if (dst_format->clockrate != 8000)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (src_format->channels != 2)
+			return NULL;
+		if (src_format->clockrate != 48000)
+			return NULL;
+
+		if (!opus2pcma_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->opus2pcma.dec = cc_client_opus2float_new(cc_client);
+		ret->clear = cc_opus2float_clear;
+		ret->clear_arg = ret->opus2pcma.dec;
+		ret->opus2pcma_async.runner = opus2pcma_async_runner;
+		ret->run = cc_opus2pcma_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 960);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "G729") && !strcmp(src->rtpname, "PCMA")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!pcma2g729a_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcma2g729a.enc = cc_client_float2g729a_new(cc_client);
+		ret->clear = cc_float2g729a_clear;
+		ret->clear_arg = ret->pcma2g729a.enc;
+		ret->pcma2g729a_async.runner = pcma2g729a_async_runner;
+		ret->run = cc_pcma2g729a_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 20);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "G729") && !strcmp(src->rtpname, "PCMU")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!pcmu2g729a_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->pcmu2g729a.enc = cc_client_float2g729a_new(cc_client);
+		ret->clear = cc_float2g729a_clear;
+		ret->clear_arg = ret->pcmu2g729a.enc;
+		ret->pcmu2g729a_async.runner = pcmu2g729a_async_runner;
+		ret->run = cc_pcmu2g729a_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 20);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMA") && !strcmp(src->rtpname, "G729")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!g729a2pcma_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->g729a2pcma.dec = cc_client_g729a2float_new(cc_client);
+		ret->clear = cc_g729a2float_clear;
+		ret->clear_arg = ret->g729a2pcma.dec;
+		ret->g729a2pcma_async.runner = g729a2pcma_async_runner;
+		ret->run = cc_g729a2pcma_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 160);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+	else if (!strcmp(dst->rtpname, "PCMU") && !strcmp(src->rtpname, "G729")) {
+		if (src_format->clockrate != 8000)
+			return NULL;
+		if (src_format->channels != 1)
+			return NULL;
+		if (dst_format->channels != 1)
+			return NULL;
+		if (dst_format->clockrate != 8000)
+			return NULL;
+
+		if (!g729a2pcmu_async_runner)
+			return NULL;
+
+		codec_cc_t *ret = g_slice_alloc0(sizeof(*ret));
+		ret->g729a2pcmu.dec = cc_client_g729a2float_new(cc_client);
+		ret->clear = cc_g729a2float_clear;
+		ret->clear_arg = ret->g729a2pcmu.dec;
+		ret->g729a2pcmu_async.runner = g729a2pcmu_async_runner;
+		ret->run = cc_g729a2pcmu_run_async;
+		ret->avpkt_async = av_packet_alloc();
+		av_new_packet(ret->avpkt_async, 160);
+		mutex_init(&ret->async_lock);
+		t_queue_init(&ret->async_jobs);
+		ret->async_init = async_init;
+		ret->async_callback = async_callback;
+
+		return ret;
+	}
+
+	return NULL;
+}
+
+void codec_cc_stop(codec_cc_t *c) {
+	if (!c)
+		return;
+
+	// steal and fire all callbacks to release any references
+
+	async_job_q q;
+
+	{
+		LOCK(&c->async_lock);
+		q = c->async_jobs;
+		t_queue_init(&c->async_jobs);
+	}
+
+	while (q.length) {
+		__auto_type j = t_queue_pop_head(&q);
+		c->async_callback(NULL, j->async_cb_obj);
+		__cc_async_job_free(j);
+	}
+}
+
+void codec_cc_free(codec_cc_t **ccp) {
+	codec_cc_t *c = *ccp;
+	if (!c)
+		return;
+	*ccp = NULL;
+
+	{
+		LOCK(&c->async_lock);
+		if (c->async_busy && !c->async_blocked) {
+			c->async_shutdown = true;
+			return; // wait for callback
+		}
+	}
+	__codec_cc_free(c);
+}
+
+
+#endif
+
+AVPacket *codec_cc_input_data(codec_cc_t *c, const str *data, unsigned long ts, void *x, void *y, void *z) {
+#ifdef HAVE_CODEC_CHAIN
+	if (c->avpkt)
+		av_new_packet(c->avpkt, MAX_OPUS_FRAME_SIZE * MAX_OPUS_FRAMES_PER_PACKET + MAX_OPUS_HEADER_SIZE);
+	void *async_cb_obj = NULL;
+	if (c->async_init)
+		async_cb_obj = c->async_init(x, y, z);
+
+	codec_cc_state ret = c->run(c, data, ts, async_cb_obj);
+
+	if (ret == CCC_ERR) {
+		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Received error from codec-chain job");
+		return c->avpkt; // return empty packet in case of error
+	}
+	if (ret == CCC_OK)
+		return c->avpkt;
+
+	// CCC_ASYNC
+	return NULL;
+
+#else
+	return NULL;
+#endif
 }

@@ -1,44 +1,59 @@
 TARGET=		rtpengine-recording
 
-CFLAGS?=	-g -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter -Wstrict-prototypes
-CFLAGS+=	-pthread -I. -I../lib/ -I../kernel-module/
-CFLAGS+=	-std=c99 -fno-strict-aliasing
+export top_srcdir = ..
+
+include ../lib/deps.Makefile
+
+ifeq ($(origin CFLAGS),undefined)
+CFLAGS?=	-g -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter -Wstrict-prototypes -Werror=return-type \
+		-Wshadow
+else
+CFLAGS:=	$(CFLAGS)
+endif
+CFLAGS+=	-pthread
+CFLAGS+=	-std=c11
+CFLAGS+=	-I. -I../lib/ -I../kernel-module/
 CFLAGS+=	-D_GNU_SOURCE -D_POSIX_SOURCE -D_POSIX_C_SOURCE
-CFLAGS+=	$(shell pkg-config --cflags glib-2.0)
-CFLAGS+=	$(shell pkg-config --cflags gthread-2.0)
-CFLAGS+=	$(shell pkg-config --cflags libavcodec)
-CFLAGS+=	$(shell pkg-config --cflags libavformat)
-CFLAGS+=	$(shell pkg-config --cflags libavutil)
-CFLAGS+=	$(shell pkg-config --cflags libswresample)
-CFLAGS+=	$(shell pkg-config --cflags libavfilter)
-CFLAGS+=	$(shell pkg-config --cflags opus)
-CFLAGS+=	$(shell mysql_config --cflags)
-CFLAGS+=	$(shell pkg-config --cflags openssl)
-CFLAGS+=	$(shell pkg-config --cflags libcurl)
+CFLAGS+=	$(CFLAGS_LIBPCRE)
+CFLAGS+=	$(CFLAGS_GLIB)
+CFLAGS+=	$(CFLAGS_JSON_GLIB)
+CFLAGS+=	$(CFLAGS_GTHREAD)
+CFLAGS+=	$(CFLAGS_LIBAVCODEC)
+CFLAGS+=	$(CFLAGS_LIBAVFORMAT)
+CFLAGS+=	$(CFLAGS_LIBAVUTIL)
+CFLAGS+=	$(CFLAGS_LIBSWRESAMPLE)
+CFLAGS+=	$(CFLAGS_LIBAVFILTER)
+CFLAGS+=	$(CFLAGS_OPUS)
+CFLAGS+=	$(CFLAGS_MYSQL)
+CFLAGS+=	$(CFLAGS_OPENSSL)
+CFLAGS+=	$(CFLAGS_LIBCURL)
 
-LDLIBS=		-lm -ldl
-LDLIBS+=	$(shell pkg-config --libs glib-2.0)
-LDLIBS+=	$(shell pkg-config --libs gthread-2.0)
-LDLIBS+=	$(shell pkg-config --libs libavcodec)
-LDLIBS+=	$(shell pkg-config --libs libavformat)
-LDLIBS+=	$(shell pkg-config --libs libavutil)
-LDLIBS+=	$(shell pkg-config --libs libswresample)
-LDLIBS+=	$(shell pkg-config --libs libavfilter)
-LDLIBS+=	$(shell pkg-config --libs opus)
-LDLIBS+=	$(shell mysql_config --libs)
-LDLIBS+=	$(shell pkg-config --libs openssl)
-LDLIBS+=	$(shell pkg-config --libs libcurl)
+LDLIBS:=	-lm -ldl
+LDLIBS+=	$(LDLIBS_GLIB)
+LDLIBS+=	$(LDLIBS_JSON_GLIB)
+LDLIBS+=	$(LDLIBS_GTHREAD)
+LDLIBS+=	$(LDLIBS_LIBAVCODEC)
+LDLIBS+=	$(LDLIBS_LIBAVFORMAT)
+LDLIBS+=	$(LDLIBS_LIBAVUTIL)
+LDLIBS+=	$(LDLIBS_LIBSWRESAMPLE)
+LDLIBS+=	$(LDLIBS_LIBAVFILTER)
+LDLIBS+=	$(LDLIBS_OPUS)
+LDLIBS+=	$(LDLIBS_MYSQL)
+LDLIBS+=	$(LDLIBS_OPENSSL)
+LDLIBS+=	$(LDLIBS_LIBCURL)
 
-include ../lib/g729.Makefile
+CFLAGS+=	$(CFLAGS_BCG729)
+LDLIBS+=	$(LDLIBS_BCG729)
 
 SRCS=		epoll.c garbage.c inotify.c main.c metafile.c stream.c recaux.c packet.c \
 		decoder.c output.c mix.c db.c log.c forward.c tag.c poller.c notify.c
 LIBSRCS=	loglib.c auxlib.c rtplib.c codeclib.strhash.c resample.c str.c socket.c streambuf.c ssllib.c \
-		dtmflib.c
-OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o)
+		dtmflib.c bufferpool.c bencode.c
+LIBASM=		mvr2s_x64_avx2.S mvr2s_x64_avx512.S mix_in_x64_avx2.S mix_in_x64_avx512bw.S mix_in_x64_sse2.S
+OBJS=		$(SRCS:.c=.o) $(LIBSRCS:.c=.o) $(LIBASM:.S=.o)
 
-PODS=		rtpengine-recording.pod
-MANS=		$(PODS:.pod=.8)
+MDS=		rtpengine-recording.ronn
+MANS=		$(MDS:.ronn=.8)
 
 include ../lib/common.Makefile
 

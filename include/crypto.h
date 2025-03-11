@@ -1,13 +1,13 @@
 #ifndef _CRYPTO_H_
 #define _CRYPTO_H_
 
-
-
 #include <sys/types.h>
 #include <glib.h>
+
 #include "compat.h"
 #include "str.h"
-#include "aux.h"
+#include "helpers.h"
+#include "containers.h"
 
 #define SRTP_MAX_MASTER_KEY_LEN 32
 #define SRTP_MAX_MASTER_SALT_LEN 14
@@ -15,15 +15,13 @@
 #define SRTP_MAX_SESSION_SALT_LEN 14
 #define SRTP_MAX_SESSION_AUTH_LEN 20
 
-
-
 struct crypto_context;
 struct rtp_header;
 struct rtcp_packet;
 
-typedef int (*crypto_func_rtp)(struct crypto_context *, struct rtp_header *, str *, uint64_t);
-typedef int (*crypto_func_rtcp)(struct crypto_context *, struct rtcp_packet *, str *, uint64_t);
-typedef int (*hash_func_rtp)(struct crypto_context *, char *out, str *in, uint64_t);
+typedef int (*crypto_func_rtp)(struct crypto_context *, struct rtp_header *, str *, uint32_t);
+typedef int (*crypto_func_rtcp)(struct crypto_context *, struct rtcp_packet *, str *, uint32_t);
+typedef int (*hash_func_rtp)(struct crypto_context *, char *out, str *in, uint32_t);
 typedef int (*hash_func_rtcp)(struct crypto_context *, char *out, str *in);
 typedef int (*session_key_init_func)(struct crypto_context *);
 typedef int (*session_key_cleanup_func)(struct crypto_context *);
@@ -81,6 +79,8 @@ struct crypto_params_sdes {
 	unsigned int tag;
 };
 
+TYPED_GQUEUE(sdes, struct crypto_params_sdes)
+
 struct crypto_context {
 	struct crypto_params params;
 
@@ -106,8 +106,8 @@ extern __thread GString *crypto_debug_string;
 
 void crypto_init_main(void);
 
-const struct crypto_suite * crypto_find_suite(const str *);
-int crypto_gen_session_key(struct crypto_context *, str *, unsigned char, int);
+const struct crypto_suite *crypto_find_suite(const str *);
+int crypto_gen_session_key(struct crypto_context *, str *, unsigned char, unsigned int);
 void crypto_dump_keys(struct crypto_context *in, struct crypto_context *out);
 char *crypto_params_sdes_dump(const struct crypto_params_sdes *, char **);
 
@@ -116,31 +116,29 @@ char *crypto_params_sdes_dump(const struct crypto_params_sdes *, char **);
  * Recommended to be used in combination with:
  * g_queue_find_custom() or g_list_find_custom()
  */
-INLINE int crypto_params_sdes_cmp(gconstpointer a, gconstpointer b)
+INLINE int crypto_params_sdes_cmp(const struct crypto_params_sdes *cs, gconstpointer b)
 {
-	const struct crypto_params_sdes * cs = a;
-
 	return str_cmp_str(&cs->params.crypto_suite->name_str, (str *) b);
 }
 
 
 INLINE int crypto_encrypt_rtp(struct crypto_context *c, struct rtp_header *rtp,
-		str *payload, uint64_t index)
+		str *payload, uint32_t index)
 {
 	return c->params.crypto_suite->encrypt_rtp(c, rtp, payload, index);
 }
 INLINE int crypto_decrypt_rtp(struct crypto_context *c, struct rtp_header *rtp,
-		str *payload, uint64_t index)
+		str *payload, uint32_t index)
 {
 	return c->params.crypto_suite->decrypt_rtp(c, rtp, payload, index);
 }
 INLINE int crypto_encrypt_rtcp(struct crypto_context *c, struct rtcp_packet *rtcp,
-		str *payload, uint64_t index)
+		str *payload, uint32_t index)
 {
 	return c->params.crypto_suite->encrypt_rtcp(c, rtcp, payload, index);
 }
 INLINE int crypto_decrypt_rtcp(struct crypto_context *c, struct rtcp_packet *rtcp,
-		str *payload, uint64_t index)
+		str *payload, uint32_t index)
 {
 	return c->params.crypto_suite->decrypt_rtcp(c, rtcp, payload, index);
 }
@@ -213,25 +211,25 @@ INLINE void crypto_params_sdes_free(struct crypto_params_sdes *cps) {
 	crypto_params_cleanup(&cps->params);
 	g_slice_free1(sizeof(*cps), cps);
 }
-INLINE void crypto_params_sdes_queue_clear(GQueue *q) {
-	g_queue_clear_full(q, (GDestroyNotify) crypto_params_sdes_free);
+INLINE void crypto_params_sdes_queue_clear(sdes_q *q) {
+	t_queue_clear_full(q, crypto_params_sdes_free);
 }
-INLINE void crypto_params_sdes_queue_copy(GQueue *dst, const GQueue *src) {
-	for (const GList *l = src->head; l; l = l->next) {
+INLINE void crypto_params_sdes_queue_copy(sdes_q *dst, const sdes_q *src) {
+	for (auto_iter(l, src->head); l; l = l->next) {
 		struct crypto_params_sdes *cps = l->data;
 		struct crypto_params_sdes *cpy = g_slice_alloc(sizeof(*cpy));
 		*cpy = *cps;
 		cpy->params.mki = NULL;
 		crypto_params_copy(&cpy->params, &cps->params, 1);
-		g_queue_push_tail(dst, cpy);
+		t_queue_push_tail(dst, cpy);
 	}
 }
 /**
  * Checks whether to apply policies according to: sdes_no / sdes_only
  * returns: 1 - to not apply / 0 - to apply
  */
-INLINE int crypto_params_sdes_check_limitations(GHashTable * sdes_only,
-			GHashTable * sdes_no,
+INLINE int crypto_params_sdes_check_limitations(str_case_ht sdes_only,
+			str_case_ht sdes_no,
 			const struct crypto_suite *cps) {
 
 	/* if 'SDES-only-' flag(s) present, then
@@ -240,16 +238,16 @@ INLINE int crypto_params_sdes_check_limitations(GHashTable * sdes_only,
 	 * This takes precedence over 'SDES-no-'.
 	 *
 	 * We mustn't check the 'flags->sdes_no' at all, if 'flags->sdes_only' is set. */
-	if (sdes_only)
+	if (t_hash_table_is_set(sdes_only))
 	{
-		if (!g_hash_table_lookup(sdes_only, &cps->name_str))
+		if (!t_hash_table_lookup(sdes_only, &cps->name_str))
 			return 1;
 	}
 
 	/* if 'SDES-no-' flag(s) present, then
 		* remove SDES-no suites from offered ones */
-	else if (sdes_no &&
-		g_hash_table_lookup(sdes_no, &cps->name_str))
+	else if (t_hash_table_is_set(sdes_no) &&
+		t_hash_table_lookup(sdes_no, &cps->name_str))
 	{
 		return 1;
 	}

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "str.h"
+#include "containers.h"
 
 
 
@@ -66,6 +67,23 @@ union codec_format_options {
 		// AMR bit options
 		unsigned int mode_change_neighbor:1;
 	} evs;
+
+	struct {
+		// 0 = default, 1 = set, -1 = not set (0)
+		int stereo_recv:2;
+		int stereo_send:2;
+		int fec_recv:2;
+		int fec_send:2;
+
+		// these are parsed out but ignored
+		int cbr:2;
+		int usedtx:2;
+		int maxplaybackrate;
+		int sprop_maxcapturerate;
+		int maxaveragebitrate;
+
+		int minptime; // obsolete
+	} opus;
 };
 
 struct rtp_codec_format {
@@ -73,8 +91,14 @@ struct rtp_codec_format {
 	unsigned int fmtp_parsed:1; // set if fmtp string was successfully parsed
 };
 
+
+struct rtp_payload_type;
+TYPED_GQUEUE(rtp_pt, struct rtp_payload_type)
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(rtp_pt_q, rtp_pt_q_clear)
+
 struct rtp_payload_type {
 	int payload_type;
+	int reverse_payload_type;
 	str encoding_with_params; // "opus/48000/2"
 	str encoding_with_full_params; // "opus/48000/1"
 	str encoding; // "opus"
@@ -89,12 +113,13 @@ struct rtp_payload_type {
 	int bitrate;
 
 	codec_def_t *codec_def;
-	GList *prefs_link; // link in `codec_prefs` list
+	rtp_pt_list *prefs_link; // link in `codec_prefs` list
 	struct rtp_codec_format format; // parsed out fmtp
 
 	unsigned int for_transcoding:1;
 	unsigned int accepted:1;
 };
+
 
 
 extern const struct rtp_payload_type rfc_rtp_payload_types[];
@@ -108,13 +133,22 @@ const struct rtp_payload_type *rtp_get_rfc_codec(const str *codec);
 
 // if not `exact` then also returns true if `a` is compatible with `b`
 // matches all params
+__attribute__((nonnull(1, 2)))
 bool rtp_payload_type_eq_exact(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
+__attribute__((nonnull(1, 2)))
 bool rtp_payload_type_eq_compat(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
+// matches only basic params but not payload type number
+__attribute__((nonnull(1, 2)))
+bool rtp_payload_type_fmt_eq_nf(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
 // matches only basic params and payload type number
+__attribute__((nonnull(1, 2)))
 bool rtp_payload_type_eq_nf(const struct rtp_payload_type *, const struct rtp_payload_type *);
 // matches all params except payload type number
-int rtp_payload_type_fmt_eq(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
+__attribute__((nonnull(1, 2)))
+int rtp_payload_type_fmt_cmp(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
+__attribute__((nonnull(1, 2)))
 bool rtp_payload_type_fmt_eq_exact(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
+__attribute__((nonnull(1, 2)))
 bool rtp_payload_type_fmt_eq_compat(const struct rtp_payload_type *a, const struct rtp_payload_type *b);
 
 

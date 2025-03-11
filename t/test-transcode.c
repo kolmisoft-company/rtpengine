@@ -4,28 +4,32 @@
 #include "log.h"
 #include "main.h"
 #include "ssrc.h"
-#include "aux.h"
+#include "helpers.h"
+#include "bufferpool.h"
 
 int _log_facility_rtcp;
 int _log_facility_cdr;
 int _log_facility_dtmf;
 struct rtpengine_config rtpe_config;
 struct rtpengine_config initial_rtpe_config;
-struct poller *rtpe_poller;
-struct poller_map *rtpe_poller_map;
+struct poller **rtpe_pollers;
+struct poller *rtpe_control_poller;
+struct poller *uring_poller;
+unsigned int num_media_pollers;
+unsigned int rtpe_poller_rr_iter;
 GString *dtmf_logs;
-struct control_ng *rtpe_control_ng[2];
+GQueue rtpe_control_ng = G_QUEUE_INIT;
+struct bufferpool *shm_bufferpool;
 
 static str *sdup(char *s) {
-	str r;
-	str_init(&r, s);
+	str r = STR(s);
 	return str_dup(&r);
 }
-static void queue_dump(GString *s, GQueue *q) {
-	for (GList *l = q->head; l; l = l->next) {
+static void queue_dump(GString *s, rtp_pt_q *q) {
+	for (__auto_type l = q->head; l; l = l->next) {
 		if (s->len)
 			g_string_append(s, " ");
-		struct rtp_payload_type *pt = l->data;
+		rtp_payload_type *pt = l->data;
 		g_string_append_printf(s, "%i/%s", pt->payload_type, pt->encoding_with_params.s);
 		if (pt->format_parameters.len)
 			g_string_append_printf(s, "/%s", pt->format_parameters.s);
@@ -37,31 +41,27 @@ static GHashTable *rtp_ts_ht;
 static GHashTable *rtp_seq_ht;
 static uint32_t ssrc_A;
 static uint32_t ssrc_B;
-static struct call call;
-static struct sdp_ng_flags flags;
+static call_t call;
+static sdp_ng_flags flags;
 static struct call_media *media_A;
 static struct call_media *media_B;
-struct call_monologue ml_A;
-struct call_monologue ml_B;
+struct call_monologue *ml_A;
+struct call_monologue *ml_B;
 struct stream_params rtp_types_sp;
 
 #define start() __start(__FILE__, __LINE__)
 
 static void __cleanup(void) {
-	if (flags.codec_except)
-		g_hash_table_destroy(flags.codec_except);
-	if (flags.codec_set)
-		g_hash_table_destroy(flags.codec_set);
-	if (flags.sdes_no)
-		g_hash_table_destroy(flags.sdes_no);
-	g_queue_clear_full(&flags.codec_offer, free);
-	g_queue_clear_full(&flags.codec_transcode, free);
-	g_queue_clear_full(&flags.codec_strip, free);
-	g_queue_clear_full(&flags.codec_accept, free);
-	g_queue_clear_full(&flags.codec_consume, free);
-	g_queue_clear_full(&flags.codec_mask, free);
-	free_ssrc_hash(&ml_A.ssrc_hash);
-	free_ssrc_hash(&ml_B.ssrc_hash);
+	str_case_ht_destroy_ptr(&flags.codec_except);
+	str_case_value_ht_destroy_ptr(&flags.codec_set);
+	str_case_ht_destroy_ptr(&flags.sdes_no);
+	t_queue_clear_full(&flags.codec_offer, str_free);
+	t_queue_clear_full(&flags.codec_transcode, str_free);
+	t_queue_clear_full(&flags.codec_strip, str_free);
+	t_queue_clear_full(&flags.codec_accept, str_free);
+	t_queue_clear_full(&flags.codec_consume, str_free);
+	t_queue_clear_full(&flags.codec_mask, str_free);
+	t_queue_clear(&call.monologues);
 
 	codec_store_cleanup(&rtp_types_sp.codecs);
 	memset(&flags, 0, sizeof(flags));
@@ -70,12 +70,10 @@ static void __init(void) {
 	__cleanup();
 	codec_store_init(&rtp_types_sp.codecs, NULL);
 	rtp_types_sp.rtp_endpoint.port = 9;
-	flags.codec_except = g_hash_table_new_full(str_case_hash, str_case_equal, free, NULL);
-	flags.codec_set = g_hash_table_new_full(str_case_hash, str_case_equal, free, free);
-	ml_A.ssrc_hash = create_ssrc_hash_call();
-	ml_B.ssrc_hash = create_ssrc_hash_call();
+	flags.codec_except = str_case_ht_new();
+	flags.codec_set = str_case_value_ht_new();
 }
-static struct packet_stream *ps_new(struct call *c) {
+static struct packet_stream *ps_new(call_t *c) {
 	struct packet_stream *ps = malloc(sizeof(*ps));
 	assert(ps != NULL);
 	memset(ps, 0, sizeof(*ps));
@@ -90,44 +88,47 @@ static void __start(const char *file, int line) {
 	ssrc_B = 2345;
 	ZERO(call);
 	obj_hold(&call);
-	call.tags = g_hash_table_new(g_str_hash, g_str_equal);
-	str_init(&call.callid, "test-call");
+	call.tags = tags_ht_new();
+	call.callid = STR("test-call");
 	bencode_buffer_init(&call.buffer);
+	call_memory_arena_set(&call);
+	ml_A = __monologue_create(&call);
+	ml_B = __monologue_create(&call);
 	media_A = call_media_new(&call); // originator
 	media_B = call_media_new(&call); // output destination
-	g_queue_push_tail(&media_A->streams, ps_new(&call));
-	g_queue_push_tail(&media_B->streams, ps_new(&call));
-	ZERO(ml_A);
-	ZERO(ml_B);
-	str_init(&ml_A.tag, "tag_A");
-	media_A->monologue = &ml_A;
+	t_queue_push_tail(&media_A->streams, ps_new(&call));
+	t_queue_push_tail(&media_B->streams, ps_new(&call));
+	ml_A->tag = STR("tag_A");
+	ml_A->label = STR("label_A");
+	media_A->monologue = ml_A;
 	media_A->protocol = &transport_protocols[PROTO_RTP_AVP];
-	str_init(&ml_B.tag, "tag_B");
-	media_B->monologue = &ml_B;
+	ml_B->tag = STR("tag_B");
+	ml_B->label = STR("label_B");
+	media_B->monologue = ml_B;
 	media_B->protocol = &transport_protocols[PROTO_RTP_AVP];
 	__init();
 }
 
-#define transcode(codec) g_queue_push_tail(&flags.codec_transcode, sdup(#codec))
-#define c_accept(codec) g_queue_push_tail(&flags.codec_accept, sdup(#codec))
-#define c_consume(codec) g_queue_push_tail(&flags.codec_consume, sdup(#codec))
-#define c_mask(codec) g_queue_push_tail(&flags.codec_mask, sdup(#codec))
+#define transcode(codec) t_queue_push_tail(&flags.codec_transcode, sdup(#codec))
+#define c_accept(codec) t_queue_push_tail(&flags.codec_accept, sdup(#codec))
+#define c_consume(codec) t_queue_push_tail(&flags.codec_consume, sdup(#codec))
+#define c_mask(codec) t_queue_push_tail(&flags.codec_mask, sdup(#codec))
 
 #ifdef WITH_AMR_TESTS
 static void codec_set(char *c) {
 	// from call_ng_flags_str_ht_split
 	c = strdup(c);
-	str s;
-	str_init(&s, c);
+	str s = STR(c);
 	str splitter = s;
 
 	while (1) {
-		g_hash_table_replace(flags.codec_set, str_dup(&splitter), str_dup(&s));
-		char *c = memrchr(splitter.s, '/', splitter.len);
-		if (!c)
+		t_hash_table_replace(flags.codec_set, str_dup(&splitter), str_dup(&s));
+		char *cp = memrchr(splitter.s, '/', splitter.len);
+		if (!cp)
 			break;
-		splitter.len = c - splitter.s;
+		splitter.len = cp - splitter.s;
 	}
+	free(c);
 }
 #endif
 
@@ -138,22 +139,23 @@ static void codec_set(char *c) {
 //#define ht_set(ht, s) __ht_set(flags.ht, #s)
 
 #define sdp_pt_fmt_ch(num, codec, clockrate, channels, fmt) \
-	__sdp_pt_fmt(num, (str) STR_CONST_INIT(#codec), clockrate, channels, (str) STR_CONST_INIT(#codec "/" #clockrate), \
-			(str) STR_CONST_INIT(#codec "/" #clockrate "/" #channels), (str) STR_CONST_INIT(fmt))
+	__sdp_pt_fmt(num, (str) STR_CONST(#codec), clockrate, channels, (str) STR_CONST(#codec "/" #clockrate), \
+			(str) STR_CONST(#codec "/" #clockrate "/" #channels), (str) STR_CONST(fmt))
 
 #define sdp_pt_fmt(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 1, fmt)
 #define sdp_pt_fmt_s(num, codec, clockrate, fmt) sdp_pt_fmt_ch(num, codec, clockrate, 2, fmt)
 
 static void __sdp_pt_fmt(int num, str codec, int clockrate, int channels, str full_codec, str full_full, str fmt) {
-	struct rtp_payload_type pt = (struct rtp_payload_type) {
+	str *fmtdup = str_dup(&fmt);
+	rtp_payload_type pt = (rtp_payload_type) {
 		.payload_type = num,
 		.encoding_with_params = full_codec,
 		.encoding_with_full_params = full_full,
 		.encoding = codec,
 		.clock_rate = clockrate,
-		.encoding_parameters = STR_CONST_INIT(""),
+		.encoding_parameters = STR_CONST(""),
 		.channels = channels,
-		.format_parameters = fmt,
+		.format_parameters = *fmtdup,
 		.codec_opts = STR_NULL,
 		.rtcp_fb = G_QUEUE_INIT,
 		.ptime = 0,
@@ -161,6 +163,7 @@ static void __sdp_pt_fmt(int num, str codec, int clockrate, int channels, str fu
 		.codec_def = NULL,
 	};
 	codec_store_add_raw(&rtp_types_sp.codecs, rtp_payload_type_dup(&pt));
+	free(fmtdup);
 }
 
 #define sdp_pt(num, codec, clockrate) sdp_pt_fmt(num, codec, clockrate, "")
@@ -169,6 +172,7 @@ static void __sdp_pt_fmt(int num, str codec, int clockrate, int channels, str fu
 static void offer(void) {
 	printf("offer\n");
 	flags.opmode = OP_OFFER;
+
 	codecs_offer_answer(media_B, media_A, &rtp_types_sp, &flags);
 	__init();
 }
@@ -176,6 +180,7 @@ static void offer(void) {
 static void answer(void) {
 	printf("answer\n");
 	flags.opmode = OP_ANSWER;
+
 	codecs_offer_answer(media_A, media_B, &rtp_types_sp, &flags);
 	__init();
 }
@@ -183,7 +188,7 @@ static void answer(void) {
 #define expect(side, exp_str) \
 	__expect(__FILE__, __LINE__, &media_ ## side->codecs.codec_prefs, exp_str)
 
-static void __expect(const char *file, int line, GQueue *dumper, const char *codecs) {
+static void __expect(const char *file, int line, rtp_pt_q *dumper, const char *codecs) {
 	printf("running test %s:%i\n", file, line);
 	GString *s = g_string_new("");
 	queue_dump(s, dumper);
@@ -198,14 +203,16 @@ static void __expect(const char *file, int line, GQueue *dumper, const char *cod
 }
 
 #ifdef WITH_AMR_TESTS
-#define check_encoder(side, in_pt, out_pt, out_bitrate) \
-	__check_encoder(__FILE__, __LINE__, media_ ## side, in_pt, out_pt, out_bitrate)
+#define check_encoder(side, otherside, in_pt, out_pt, out_bitrate) \
+	__check_encoder(__FILE__, __LINE__, media_ ## side, media_ ## otherside, in_pt, out_pt, out_bitrate)
 
-static void __check_encoder(const char *file, int line, struct call_media *m, int in_pt, int out_pt,
+static void __check_encoder(const char *file, int line, struct call_media *m,
+		struct call_media *out_m, int in_pt, int out_pt,
 		int out_bitrate)
 {
-	struct codec_handler *ch = g_hash_table_lookup(m->codec_handlers, GINT_TO_POINTER(in_pt));
+	struct codec_handler *ch = codec_handler_lookup(m->codec_handlers, in_pt, out_m);
 	printf("running test %s:%i\n", file, line);
+	assert(ch);
 	assert(ch->source_pt.payload_type == in_pt);
 	if (ch->dest_pt.payload_type != out_pt || ch->dest_pt.bitrate != out_bitrate) {
 		printf("test failed: %s:%i\n", file, line);
@@ -218,13 +225,13 @@ static void __check_encoder(const char *file, int line, struct call_media *m, in
 #endif
 
 #define packet_seq_ts(side, pt_in, pload, rtp_ts, rtp_seq, pt_out, pload_exp, ts_exp, fatal) \
-	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST_INIT(pload), \
-			(str) STR_CONST_INIT(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
+	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST(pload), \
+			(str) STR_CONST(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
 			ts_exp, 1, fatal)
 
 #define packet_seq_exp(side, pt_in, pload, rtp_ts, rtp_seq, pt_out, pload_exp, ts_diff_exp) \
-	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST_INIT(pload), \
-			(str) STR_CONST_INIT(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
+	__packet_seq_ts( __FILE__, __LINE__, media_ ## side, pt_in, (str) STR_CONST(pload), \
+			(str) STR_CONST(pload_exp), ssrc_ ## side, rtp_ts, rtp_seq, pt_out, \
 			-1, ts_diff_exp, 1)
 
 static void __packet_seq_ts(const char *file, int line, struct call_media *media, long long pt_in, str pload,
@@ -244,8 +251,9 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 	str pl_exp = pload_exp;
 
 	// from media_packet_rtp()
-	struct local_intf lif = { };
-	struct stream_fd sfd = {
+	struct interface_stats_block sblock;
+	struct local_intf lif = { .stats = &sblock };
+	stream_fd sfd = {
 		.local_intf = &lif,
 	};
 	struct media_packet mp = {
@@ -256,7 +264,7 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 		.sfd = &sfd,
 	};
 	// from __stream_ssrc()
-	if (!MEDIA_ISSET(media, TRANSCODE))
+	if (!MEDIA_ISSET(media, TRANSCODING))
 		mp.ssrc_in->ssrc_map_out = ntohl(ssrc);
 	mp.ssrc_out = get_ssrc_ctx(mp.ssrc_in->ssrc_map_out, other_media->monologue->ssrc_hash, SSRC_DIR_OUTPUT, NULL);
 	payload_tracker_add(&mp.ssrc_in->tracker, pt_in & 0x7f);
@@ -274,8 +282,7 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 	mp.payload = pl;
 	mp.payload.s = (packet + sizeof(struct rtp_header));
 	memcpy(mp.payload.s, pl.s, pl.len);
-	mp.raw.s = packet;
-	mp.raw.len = packet_len;
+	mp.raw = STR_LEN(packet, packet_len);
 	printf("send RTP SSRC %x seq %u TS %u PT %u\n", (unsigned int) ssrc,
 			(unsigned int) rtp_seq, (unsigned int) rtp_ts, (unsigned int) pt_in);
 	printf("send packet contents: ");
@@ -300,7 +307,7 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 			printf("no packet\n");
 			abort();
 		}
-		struct codec_packet *cp = g_queue_pop_head(&mp.packets_out);
+		struct codec_packet *cp = t_queue_pop_head(&mp.packets_out);
 		str cp_s = cp->s;
 		rtp = (void *) cp_s.s;
 		if (rtp->m_pt != (unsigned char) pt_out) {
@@ -317,9 +324,9 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 		printf("\n");
 		uint32_t ts = ntohl(rtp->timestamp);
 		uint16_t seq = ntohs(rtp->seq_num);
-		uint32_t ssrc = ntohl(rtp->ssrc);
-		uint32_t ssrc_pt = ssrc;
-		printf("recv RTP SSRC %x seq %u TS %u PT %u\n", (unsigned int) ssrc,
+		uint32_t rtp_ssrc = ntohl(rtp->ssrc);
+		uint32_t ssrc_pt = rtp_ssrc;
+		printf("recv RTP SSRC %x seq %u TS %u PT %u\n", (unsigned int) rtp_ssrc,
 				(unsigned int) seq, (unsigned int) ts, (unsigned int) rtp->m_pt);
 		if (g_hash_table_contains(rtp_ts_ht, GUINT_TO_POINTER(ssrc_pt))) {
 			uint32_t old_ts = GPOINTER_TO_UINT(g_hash_table_lookup(rtp_ts_ht,
@@ -365,14 +372,19 @@ static void __packet_seq_ts(const char *file, int line, struct call_media *media
 static void end(void) {
 	g_hash_table_destroy(rtp_ts_ht);
 	g_hash_table_destroy(rtp_seq_ht);
-	g_queue_clear_full(&media_A->streams, free);
-	g_queue_clear_full(&media_B->streams, free);
+	t_queue_clear_full(&media_A->streams, (void (*)(struct packet_stream *)) free);
+	t_queue_clear_full(&media_B->streams, (void (*)(struct packet_stream *)) free);
 	call_media_free(&media_A);
 	call_media_free(&media_B);
 	bencode_buffer_free(&call.buffer);
-	g_hash_table_destroy(call.tags);
-	g_queue_clear(&call.medias);
+	t_hash_table_destroy(call.tags);
+	t_queue_clear(&call.medias);
+	if (ml_A)
+		__monologue_free(ml_A);
+	if (ml_B)
+		__monologue_free(ml_B);
 	__cleanup();
+	call_memory_arena_release();
 	printf("\n");
 }
 
@@ -404,6 +416,9 @@ static void dtmf(const char *s) {
 
 int main(void) {
 	rtpe_common_config_ptr = &rtpe_config.common;
+	bufferpool_init();
+	media_bufferpool = bufferpool_new(g_malloc, g_free, 4096);
+	shm_bufferpool = bufferpool_new(g_malloc, g_free, 4096);
 
 	unsigned long random_seed = 0;
 
@@ -530,7 +545,7 @@ int main(void) {
 
 #ifdef WITH_AMR_TESTS
 	{
-		str codec_name = STR_CONST_INIT("AMR-WB");
+		str codec_name = STR_CONST("AMR-WB");
 		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
@@ -539,15 +554,11 @@ int main(void) {
 			sdp_pt(0, PCMU, 8000);
 			transcode(AMR-WB);
 			offer();
-			expect(A, "");
 			expect(A, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000 96/AMR-WB/16000/octet-align=1");
-			expect(B, "");
+			expect(B, "0/PCMU/8000 96/AMR-WB/16000/octet-align=1;mode-change-capability=2");
 			sdp_pt_fmt(96, AMR-WB, 16000, "octet-align=1");
 			answer();
 			expect(A, "0/PCMU/8000");
-			expect(A, "0/PCMU/8000");
-			expect(B, "96/AMR-WB/16000/octet-align=1");
 			expect(B, "96/AMR-WB/16000/octet-align=1");
 			packet_seq(A, 0, PCMU_payload, 0, 0, -1, ""); // nothing due to resampling buffer
 			packet_seq_nf(A, 0, PCMU_payload, 160, 1, 96, AMR_WB_payload);
@@ -560,15 +571,11 @@ int main(void) {
 			sdp_pt_fmt(96, AMR-WB, 16000, "octet-align=1");
 			transcode(PCMU);
 			offer();
-			expect(A, "");
 			expect(A, "96/AMR-WB/16000/octet-align=1");
 			expect(B, "96/AMR-WB/16000/octet-align=1 0/PCMU/8000");
-			expect(B, "");
 			sdp_pt(0, PCMU, 8000);
 			answer();
 			expect(A, "96/AMR-WB/16000/octet-align=1");
-			expect(A, "96/AMR-WB/16000/octet-align=1");
-			expect(B, "0/PCMU/8000");
 			expect(B, "0/PCMU/8000");
 			packet_seq(B, 0, PCMU_payload, 0, 0, -1, ""); // nothing due to resampling buffer
 			packet_seq_nf(B, 0, PCMU_payload, 160, 1, 96, AMR_WB_payload);
@@ -581,15 +588,11 @@ int main(void) {
 			sdp_pt(96, AMR-WB, 16000);
 			transcode(PCMU);
 			offer();
-			expect(A, "");
 			expect(A, "96/AMR-WB/16000");
 			expect(B, "96/AMR-WB/16000 0/PCMU/8000");
-			expect(B, "");
 			sdp_pt(0, PCMU, 8000);
 			answer();
 			expect(A, "96/AMR-WB/16000");
-			expect(A, "96/AMR-WB/16000");
-			expect(B, "0/PCMU/8000");
 			expect(B, "0/PCMU/8000");
 			packet_seq(B, 0, PCMU_payload, 0, 0, -1, ""); // nothing due to resampling buffer
 			packet_seq_nf(B, 0, PCMU_payload, 160, 1, 96, AMR_WB_payload_noe);
@@ -600,7 +603,7 @@ int main(void) {
 	}
 
 	{
-		str codec_name = STR_CONST_INIT("AMR");
+		str codec_name = STR_CONST("AMR");
 		codec_def_t *def = codec_find(&codec_name, MT_AUDIO);
 		assert(def);
 		if (def->support_encoding && def->support_decoding) {
@@ -609,18 +612,14 @@ int main(void) {
 			sdp_pt(0, PCMU, 8000);
 			transcode(AMR);
 			offer();
-			expect(A, "");
 			expect(A, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1");
-			expect(B, "");
+			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1;mode-change-capability=2");
 			sdp_pt_fmt(96, AMR, 8000, "octet-align=1");
 			answer();
 			expect(A, "0/PCMU/8000");
-			expect(A, "0/PCMU/8000");
 			expect(B, "96/AMR/8000/octet-align=1");
-			expect(B, "96/AMR/8000/octet-align=1");
-			check_encoder(A, 0, 96, 0); // uses codec default
-			check_encoder(B, 96, 0, 0);
+			check_encoder(A, B, 0, 96, 0); // uses codec default
+			check_encoder(B, A, 96, 0, 0);
 			end();
 
 			// default bitrate reverse
@@ -628,18 +627,14 @@ int main(void) {
 			sdp_pt(96, AMR, 8000);
 			transcode(PCMU);
 			offer();
-			expect(A, "");
 			expect(A, "96/AMR/8000");
 			expect(B, "96/AMR/8000 0/PCMU/8000");
-			expect(B, "");
 			sdp_pt(0, PCMU, 8000);
 			answer();
 			expect(A, "96/AMR/8000");
-			expect(A, "96/AMR/8000");
 			expect(B, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000");
-			check_encoder(A, 96, 0, 0);
-			check_encoder(B, 0, 96, 0); // uses codec default
+			check_encoder(A, B, 96, 0, 0);
+			check_encoder(B, A, 0, 96, 0); // uses codec default
 			end();
 
 			// specify forward bitrate
@@ -647,18 +642,14 @@ int main(void) {
 			sdp_pt(0, PCMU, 8000);
 			transcode(AMR/8000/1/6700);
 			offer();
-			expect(A, "");
 			expect(A, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1");
-			expect(B, "");
+			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1;mode-change-capability=2");
 			sdp_pt_fmt(96, AMR, 8000, "octet-align=1");
 			answer();
 			expect(A, "0/PCMU/8000");
-			expect(A, "0/PCMU/8000");
 			expect(B, "96/AMR/8000/octet-align=1");
-			expect(B, "96/AMR/8000/octet-align=1");
-			check_encoder(A, 0, 96, 6700);
-			check_encoder(B, 96, 0, 0);
+			check_encoder(A, B, 0, 96, 6700);
+			check_encoder(B, A, 96, 0, 0);
 			end();
 
 			// specify non-default forward bitrate
@@ -666,18 +657,14 @@ int main(void) {
 			sdp_pt(0, PCMU, 8000);
 			transcode(AMR/8000/1/7400);
 			offer();
-			expect(A, "");
 			expect(A, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1");
-			expect(B, "");
+			expect(B, "0/PCMU/8000 96/AMR/8000/octet-align=1;mode-change-capability=2");
 			sdp_pt_fmt(96, AMR, 8000, "octet-align=1");
 			answer();
 			expect(A, "0/PCMU/8000");
-			expect(A, "0/PCMU/8000");
 			expect(B, "96/AMR/8000/octet-align=1");
-			expect(B, "96/AMR/8000/octet-align=1");
-			check_encoder(A, 0, 96, 7400);
-			check_encoder(B, 96, 0, 0);
+			check_encoder(A, B, 0, 96, 7400);
+			check_encoder(B, A, 96, 0, 0);
 			end();
 
 			// specify reverse bitrate
@@ -686,18 +673,14 @@ int main(void) {
 			transcode(PCMU);
 			codec_set("AMR/8000/1/6700");
 			offer();
-			expect(A, "");
 			expect(A, "96/AMR/8000");
 			expect(B, "96/AMR/8000 0/PCMU/8000");
-			expect(B, "");
 			sdp_pt(0, PCMU, 8000);
 			answer();
 			expect(A, "96/AMR/8000");
-			expect(A, "96/AMR/8000");
 			expect(B, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000");
-			check_encoder(A, 96, 0, 0);
-			check_encoder(B, 0, 96, 6700);
+			check_encoder(A, B, 96, 0, 0);
+			check_encoder(B, A, 0, 96, 6700);
 			end();
 
 			// specify non-default reverse bitrate
@@ -706,18 +689,14 @@ int main(void) {
 			transcode(PCMU);
 			codec_set("AMR/8000/1/7400");
 			offer();
-			expect(A, "");
 			expect(A, "96/AMR/8000");
 			expect(B, "96/AMR/8000 0/PCMU/8000");
-			expect(B, "");
 			sdp_pt(0, PCMU, 8000);
 			answer();
 			expect(A, "96/AMR/8000");
-			expect(A, "96/AMR/8000");
 			expect(B, "0/PCMU/8000");
-			expect(B, "0/PCMU/8000");
-			check_encoder(A, 96, 0, 0);
-			check_encoder(B, 0, 96, 7400);
+			check_encoder(A, B, 96, 0, 0);
+			check_encoder(B, A, 0, 96, 7400);
 			end();
 		}
 	}
@@ -816,7 +795,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -832,7 +811,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	dtmf("");
@@ -865,7 +844,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -881,7 +860,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	dtmf("");
@@ -913,7 +892,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -929,7 +908,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, 101, "\x05\x8a\x02\x80", 0);
 	dtmf("");
@@ -961,7 +940,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -979,7 +958,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	dtmf("");
@@ -987,17 +966,17 @@ int main(void) {
 	packet_seq_exp(A, 8, PCMA_payload, 1000960, 212, 8, PCMA_payload, 5); // DTMF packets appear lost
 	packet_seq(A, 8, PCMA_payload, 1001120, 213, 8, PCMA_payload);
 	// media blocking
-	ml_A.block_media = 1;
+	ML_SET(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001280, 214, -1, "", 0);
 	packet_seq_exp(A, 8, PCMA_payload, 1001440, 215, -1, "", 0);
-	ml_A.block_media = 0;
+	ML_CLEAR(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001600, 216, 8, PCMA_payload, 3); // media packets appear lost
-	call.block_media = 1;
+	CALL_SET(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001760, 217, -1, "", 0);
 	packet_seq_exp(A, 8, PCMA_payload, 1001920, 218, -1, "", 0);
-	call.block_media = 0;
+	CALL_CLEAR(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1002080, 219, 8, PCMA_payload, 3); // media packets appear lost
-	ml_B.block_media = 1;
+	ML_SET(ml_B, BLOCK_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 1002240, 220, 8, PCMA_payload);
 	end();
 
@@ -1026,7 +1005,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -1044,7 +1023,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	dtmf("");
@@ -1052,17 +1031,17 @@ int main(void) {
 	packet_seq_exp(A, 8, PCMA_payload, 1000960, 212, 0, PCMU_payload, 5); // DTMF packets appear lost
 	packet_seq(A, 8, PCMA_payload, 1001120, 213, 0, PCMU_payload);
 	// media blocking
-	ml_A.block_media = 1;
+	ML_SET(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001280, 214, -1, "", 0);
 	packet_seq_exp(A, 8, PCMA_payload, 1001440, 215, -1, "", 0);
-	ml_A.block_media = 0;
+	ML_CLEAR(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001600, 214, 0, PCMU_payload, 1); // cheat with the seq here - 216 would get held by the jitter buffer
-	call.block_media = 1;
+	CALL_SET(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1001760, 215, -1, "", 0);
 	packet_seq_exp(A, 8, PCMA_payload, 1001920, 216, -1, "", 0);
-	call.block_media = 0;
+	CALL_CLEAR(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1002080, 215, 0, PCMU_payload, 1);
-	ml_B.block_media = 1;
+	ML_SET(ml_B, BLOCK_MEDIA);
 	packet_seq_exp(A, 8, PCMA_payload, 1002240, 216, 0, PCMU_payload, 1);
 	end();
 
@@ -1090,7 +1069,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":8,\"duration\":100,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	packet_seq_exp(A, 101, "\x08\x8a\x03\x20", 1000160, 205, 101, "\x08\x8a\x03\x20", 0);
 	dtmf("");
@@ -1108,7 +1087,7 @@ int main(void) {
 	dtmf("");
 	// end
 	packet_seq(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "");
-	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
+	dtmf("{\"callid\":\"test-call\",\"source_tag\":\"tag_A\",\"source_label\":\"label_A\",\"tags\":[],\"type\":\"DTMF\",\"timestamp\":0,\"source_ip\":\"\",\"event\":5,\"duration\":80,\"volume\":10}");
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	packet_seq_exp(A, 101, "\x05\x8a\x02\x80", 1001280, 211, -1, "", 0);
 	dtmf("");
@@ -1116,17 +1095,17 @@ int main(void) {
 	packet_seq_exp(A, 0, PCMU_payload, 1000960, 212, 0, PCMU_payload, 5); // DTMF packets appear lost
 	packet_seq(A, 0, PCMU_payload, 1001120, 213, 0, PCMU_payload);
 	// media blocking
-	ml_A.block_media = 1;
+	ML_SET(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 0, PCMU_payload, 1001280, 214, -1, "", 0);
 	packet_seq_exp(A, 0, PCMU_payload, 1001440, 215, -1, "", 0);
-	ml_A.block_media = 0;
+	ML_CLEAR(ml_A, BLOCK_MEDIA);
 	packet_seq_exp(A, 0, PCMU_payload, 1001600, 216, 0, PCMU_payload, 3); // media packets appear lost
-	call.block_media = 1;
+	CALL_SET(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 0, PCMU_payload, 1001760, 217, -1, "", 0);
 	packet_seq_exp(A, 0, PCMU_payload, 1001920, 218, -1, "", 0);
-	call.block_media = 0;
+	CALL_CLEAR(&call, BLOCK_MEDIA);
 	packet_seq_exp(A, 0, PCMU_payload, 1002080, 219, 0, PCMU_payload, 3); // media packets appear lost
-	ml_B.block_media = 1;
+	ML_SET(ml_B, BLOCK_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 1002240, 220, 0, PCMU_payload);
 	end();
 
@@ -1391,7 +1370,7 @@ int main(void) {
 
 	// CN transcoding
 	rtpe_config.silence_detect_int = 10 << 16;
-	str_init_len(&rtpe_config.cn_payload, "\x40", 1);
+	rtpe_config.cn_payload = STR_LEN("\x40", 1);
 	// CN transcoding - forward
 	start();
 	sdp_pt(8, PCMA, 8000);
@@ -1453,7 +1432,7 @@ int main(void) {
 	transcode(PCMA);
 	transcode(telephone-event);
 	offer();
-	expect(B, "96/opus/48000 8/PCMA/8000 97/telephone-event/48000/0-15 101/telephone-event/8000");
+	expect(B, "96/opus/48000/useinbandfec=1 8/PCMA/8000 97/telephone-event/48000/0-15 101/telephone-event/8000");
 	sdp_pt(96, opus, 48000);
 	sdp_pt(97, telephone-event, 48000);
 	flags.single_codec = 1;
@@ -1615,32 +1594,32 @@ int main(void) {
 	packet_seq(B, 8, PCMA_payload, 0, 0, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 160, 1, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 160, 1, 8, PCMA_payload);
-	call.silence_media = 1;
+	CALL_SET(&call, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 320, 2, 8, PCMA_silence);
 	packet_seq(B, 8, PCMA_payload, 320, 2, 8, PCMA_silence);
 	packet_seq(A, 8, PCMA_payload, 480, 3, 8, PCMA_silence);
 	packet_seq(B, 8, PCMA_payload, 480, 3, 8, PCMA_silence);
-	call.silence_media = 0;
+	CALL_CLEAR(&call, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 640, 4, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 640, 4, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 800, 5, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 800, 5, 8, PCMA_payload);
-	ml_A.silence_media = 1;
+	ML_SET(ml_A, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 960, 6, 8, PCMA_silence);
 	packet_seq(B, 8, PCMA_payload, 960, 6, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 1120, 7, 8, PCMA_silence);
 	packet_seq(B, 8, PCMA_payload, 1120, 7, 8, PCMA_payload);
-	ml_A.silence_media = 0;
+	ML_CLEAR(ml_A, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 1280, 8, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 1280, 8, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 1440, 9, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 1440, 9, 8, PCMA_payload);
-	ml_B.silence_media = 1;
+	ML_SET(ml_B, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 1600, 10, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 1600, 10, 8, PCMA_silence);
 	packet_seq(A, 8, PCMA_payload, 1760, 11, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 1760, 11, 8, PCMA_silence);
-	ml_B.silence_media = 0;
+	ML_CLEAR(ml_B, SILENCE_MEDIA);
 	packet_seq(A, 8, PCMA_payload, 1920, 12, 8, PCMA_payload);
 	packet_seq(B, 8, PCMA_payload, 1920, 12, 8, PCMA_payload);
 	packet_seq(A, 8, PCMA_payload, 2080, 13, 8, PCMA_payload);
@@ -1661,32 +1640,32 @@ int main(void) {
 	packet_seq(B, 0, PCMU_payload, 0, 0, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 160, 1, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 160, 1, 0, PCMU_payload);
-	call.silence_media = 1;
+	CALL_SET(&call, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 320, 2, 0, PCMU_silence);
 	packet_seq(B, 0, PCMU_payload, 320, 2, 0, PCMU_silence);
 	packet_seq(A, 0, PCMU_payload, 480, 3, 0, PCMU_silence);
 	packet_seq(B, 0, PCMU_payload, 480, 3, 0, PCMU_silence);
-	call.silence_media = 0;
+	CALL_CLEAR(&call, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 640, 4, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 640, 4, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 800, 5, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 800, 5, 0, PCMU_payload);
-	ml_A.silence_media = 1;
+	ML_SET(ml_A, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 960, 6, 0, PCMU_silence);
 	packet_seq(B, 0, PCMU_payload, 960, 6, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 1120, 7, 0, PCMU_silence);
 	packet_seq(B, 0, PCMU_payload, 1120, 7, 0, PCMU_payload);
-	ml_A.silence_media = 0;
+	ML_CLEAR(ml_A, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 1280, 8, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 1280, 8, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 1440, 9, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 1440, 9, 0, PCMU_payload);
-	ml_B.silence_media = 1;
+	ML_SET(ml_B, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 1600, 10, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 1600, 10, 0, PCMU_silence);
 	packet_seq(A, 0, PCMU_payload, 1760, 11, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 1760, 11, 0, PCMU_silence);
-	ml_B.silence_media = 0;
+	ML_CLEAR(ml_B, SILENCE_MEDIA);
 	packet_seq(A, 0, PCMU_payload, 1920, 12, 0, PCMU_payload);
 	packet_seq(B, 0, PCMU_payload, 1920, 12, 0, PCMU_payload);
 	packet_seq(A, 0, PCMU_payload, 2080, 13, 0, PCMU_payload);
@@ -1744,6 +1723,11 @@ int main(void) {
 	expect(A, "96/opus/48000/2");
 	expect(B, "8/PCMA/8000");
 	end();
+
+	statistics_free();
+	bufferpool_destroy(media_bufferpool);
+	bufferpool_destroy(shm_bufferpool);
+	bufferpool_cleanup();
 
 	return 0;
 }

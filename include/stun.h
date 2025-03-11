@@ -1,19 +1,16 @@
 #ifndef _STUN_H_
 #define _STUN_H_
 
-
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
+
 #include "compat.h"
 #include "call.h"
 #include "str.h"
 #include "socket.h"
 
-
 #define STUN_COOKIE 0x2112A442UL
-
-
 
 struct stun_attrs {
 	str username;
@@ -49,7 +46,7 @@ INLINE int is_stun(const str *s) {
 }
 
 
-int stun(const str *, struct stream_fd *, const endpoint_t *);
+int stun(const str *, stream_fd *, const endpoint_t *);
 
 int stun_binding_request(const endpoint_t *dst, uint32_t transaction[3], str *pwd,
 		str ufrags[2], int controlling, uint64_t tiebreaker, uint32_t priority,

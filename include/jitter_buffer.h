@@ -5,12 +5,10 @@
 #include "socket.h"
 #include "timerthread.h"
 #include "media_socket.h"
-//#include "codec.h"
-//
-//struct packet_handler_ctx;
+
 struct jb_packet;
 struct media_packet;
-//
+
 struct jb_packet {
 	struct timerthread_queue_entry ttq_entry;
 	char *buf;
@@ -37,20 +35,20 @@ struct jitter_buffer {
 	unsigned int            dtmf_mult_factor;
 	int            		buffer_len;
 	int                     clock_drift_val;
-	struct call             *call;
+	call_t             *call;
 	int			disabled;
 };
 
 void jitter_buffer_init(void);
 void jitter_buffer_init_free(void);
 
-struct jitter_buffer *jitter_buffer_new(struct call *);
+struct jitter_buffer *jitter_buffer_new(call_t *);
 void jitter_buffer_free(struct jitter_buffer **);
 
 int buffer_packet(struct media_packet *mp, const str *s);
 void jb_packet_free(struct jb_packet **jbp);
 
-void jitter_buffer_loop(void *p);
+void jitter_buffer_launch(void);
 
 INLINE void jb_put(struct jitter_buffer **jb) {
 	if (!*jb)

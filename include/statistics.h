@@ -1,29 +1,10 @@
 #ifndef STATISTICS_H_
 #define STATISTICS_H_
 
-#include "aux.h"
+#include "helpers.h"
 #include "bencode.h"
-#include "rtpengine_config.h"
-
-struct call;
-struct packet_stream;
-
-struct stream_stats {
-	atomic64			packets;
-	atomic64			bytes;
-	atomic64			errors;
-#if RE_HAS_MEASUREDELAY
-	uint64_t			delay_min;
-	uint64_t			delay_avg;
-	uint64_t			delay_max;
-#endif
-};
-
-
-
 #include "control_ng.h"
 #include "graphite.h"
-
 
 // "gauge" style stats
 struct global_stats_gauge {
@@ -81,14 +62,6 @@ struct global_rate_min_max_avg {
 };
 
 
-struct rtp_stats {
-	unsigned int		payload_type;
-	atomic64		packets;
-	atomic64		bytes;
-	atomic64		kernel_packets;
-	atomic64		kernel_bytes;
-};
-
 struct codec_stats {
 	char			*chain;
 	char			*chain_brief;
@@ -120,6 +93,8 @@ struct stats_metric {
 	char *prom_label;
 };
 
+TYPED_GQUEUE(stats_metric, stats_metric)
+
 
 struct call_stats {
 	time_t		last_packet;
@@ -129,7 +104,7 @@ struct call_stats {
 extern struct timeval rtpe_started;
 
 extern mutex_t rtpe_codec_stats_lock;
-extern GHashTable *rtpe_codec_stats;
+extern codec_stats_ht rtpe_codec_stats;
 
 
 extern struct global_stats_gauge rtpe_stats_gauge;			// master values
@@ -142,14 +117,14 @@ extern struct global_gauge_min_max rtpe_gauge_min_max;			// master lifetime min/
 	} while (0)
 #define RTPE_GAUGE_SET(field, num) \
 	do { \
-		atomic64_set(&rtpe_stats_gauge.field, num); \
+		atomic64_set_na(&rtpe_stats_gauge.field, num); \
 		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_gauge_min_max, num); \
 		if (graphite_is_enabled()) \
 			RTPE_GAUGE_SET_MIN_MAX(field, rtpe_gauge_graphite_min_max, num); \
 	} while (0)
 #define RTPE_GAUGE_ADD(field, num) \
 	do { \
-		uint64_t __old = atomic64_add(&rtpe_stats_gauge.field, num); \
+		uint64_t __old = atomic64_add_na(&rtpe_stats_gauge.field, num); \
 		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_gauge_min_max, __old + num); \
 		if (graphite_is_enabled()) \
 			RTPE_GAUGE_SET_MIN_MAX(field, rtpe_gauge_graphite_min_max, __old + num); \
@@ -163,9 +138,9 @@ extern struct global_sampled_min_max rtpe_sampled_min_max;		// master lifetime m
 
 #define RTPE_STATS_SAMPLE(field, num) \
 	do { \
-		atomic64_add(&rtpe_stats_sampled.sums.field, num); \
-		atomic64_add(&rtpe_stats_sampled.sums_squared.field, num * num); \
-		atomic64_inc(&rtpe_stats_sampled.counts.field); \
+		atomic64_add_na(&rtpe_stats_sampled.sums.field, num); \
+		atomic64_add_na(&rtpe_stats_sampled.sums_squared.field, num * num); \
+		atomic64_inc_na(&rtpe_stats_sampled.counts.field); \
 		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_sampled_min_max, num); \
 		RTPE_GAUGE_SET_MIN_MAX(field, rtpe_sampled_graphite_min_max, num); \
 	} while (0)
@@ -175,29 +150,36 @@ extern struct global_sampled_min_max rtpe_sampled_min_max;		// master lifetime m
 		RTPE_STATS_SAMPLE(field, num); \
 		if (sfd) { \
 			struct local_intf *__intf = sfd->local_intf; \
-			atomic64_add(&__intf->stats.sampled.sums.field, num); \
-			atomic64_add(&__intf->stats.sampled.sums_squared.field, num * num); \
-			atomic64_inc(&__intf->stats.sampled.counts.field); \
+			atomic64_add_na(&__intf->stats->sampled.sums.field, num); \
+			atomic64_add_na(&__intf->stats->sampled.sums_squared.field, num * num); \
+			atomic64_inc_na(&__intf->stats->sampled.counts.field); \
 		} \
 	} while (0)
 
-extern struct global_stats_counter rtpe_stats;			// total, cumulative, master
+extern struct global_stats_counter *rtpe_stats;			// total, cumulative, master
 extern struct global_stats_counter rtpe_stats_rate;		// per-second, calculated once per timer run
+extern struct global_stats_counter rtpe_stats_intv;		// per-second, calculated once per timer run
 
-#define RTPE_STATS_ADD(field, num) atomic64_add(&rtpe_stats.field, num)
+#define RTPE_STATS_ADD(field, num) atomic64_add_na(&rtpe_stats->field, num)
 #define RTPE_STATS_INC(field) RTPE_STATS_ADD(field, 1)
 
 
 
-void statistics_update_oneway(struct call *);
-void statistics_update_ip46_inc_dec(struct call *, int op);
-void statistics_update_foreignown_dec(struct call *);
-void statistics_update_foreignown_inc(struct call* c);
+void statistics_update_oneway(call_t *);
+void statistics_update_ip46_inc_dec(call_t *, int op);
+void statistics_update_foreignown_dec(call_t *);
+void statistics_update_foreignown_inc(call_t * c);
 
-GQueue *statistics_gather_metrics(struct interface_sampled_rate_stats *);
-void statistics_free_metrics(GQueue **);
-const char *statistics_ng(bencode_item_t *input, bencode_item_t *output);
+stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *);
+void statistics_free_metrics(stats_metric_q *);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(stats_metric_q, statistics_free_metrics)
+const char *statistics_ng(ng_command_ctx_t *);
+enum thread_looper_action call_rate_stats_updater(void);
 
+/**
+ * Calculation of the call rate counters.
+ * If used with the `stats_rate_min_max()` must only be called in advance, so before that.
+ */
 INLINE void stats_counters_calc_rate(const struct global_stats_counter *stats, long long run_diff_us,
 		struct global_stats_counter *intv, struct global_stats_counter *rate)
 {
@@ -218,7 +200,10 @@ INLINE void stats_counters_calc_diff(const struct global_stats_counter *stats,
 #undef FA
 }
 
-// update the running min/max counter `mm` with the newly calculated per-sec rate values `inp`
+/**
+ * Update the running min/max counter `mm` with the newly calculated per-sec rate values `inp`.
+ * If used with the `stats_counters_calc_rate()`, it must be called only after that.
+ */
 INLINE void stats_rate_min_max(struct global_rate_min_max *mm, struct global_stats_counter *inp) {
 #define F(x) \
 	atomic64_mina(&mm->min.x, &inp->x); \

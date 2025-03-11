@@ -1,23 +1,18 @@
 #ifndef __REDIS_MOD_H__
 #define __REDIS_MOD_H__
 
-
-
-
 #include <sys/types.h>
-#include "compat.h"
-#include "socket.h"
-#include "aux.h"
-
 #include <glib.h>
 #include <sys/types.h>
 #include <hiredis/hiredis.h>
+
+#include "compat.h"
+#include "socket.h"
+#include "helpers.h"
 #include "call.h"
 #include "str.h"
 
-
 #define REDIS_RESTORE_NUM_THREADS 4
-
 
 enum redis_role {
 	MASTER_REDIS_ROLE = 0,
@@ -42,13 +37,13 @@ enum subscribe_action {
 	UNSUBSCRIBE_ALL,
 };
 
-struct call;
 
 
 
 struct redis {
 	endpoint_t	endpoint;
 	char		host[64];
+	const char	*hostname; /* can be a hostname or IP address */
 	enum redis_role	role;
 
 	redisContext	*ctx;
@@ -68,6 +63,8 @@ struct redis {
 	mutex_t                   async_lock;
 	GQueue                    async_queue;
 	int                       async_last;
+
+	bool update_resolve;
 };
 
 struct redis_hash {
@@ -83,21 +80,9 @@ struct redis_list {
 
 extern struct redis		*rtpe_redis;
 extern struct redis		*rtpe_redis_write;
+extern struct redis		*rtpe_redis_write_disabled;
 extern struct redis		*rtpe_redis_notify;
 
-
-
-#if !GLIB_CHECK_VERSION(2,40,0)
-INLINE gboolean g_hash_table_insert_check(GHashTable *h, gpointer k, gpointer v) {
-	gboolean ret = TRUE;
-	if (g_hash_table_contains(h, k))
-		ret = FALSE;
-	g_hash_table_insert(h, k, v);
-	return ret;
-}
-#else
-# define g_hash_table_insert_check g_hash_table_insert
-#endif
 
 
 #define rlog(l, x...) ilog(l | LOG_FLAG_RESTORE, x)
@@ -106,12 +91,12 @@ void redis_notify_loop(void *d);
 void redis_delete_async_loop(void *d);
 
 
-struct redis *redis_new(const endpoint_t *, int, const char *, enum redis_role, int);
+struct redis *redis_new(const endpoint_t *, int, const char *, const char *, enum redis_role, int, bool);
 struct redis *redis_dup(const struct redis *r, int db);
 void redis_close(struct redis *r);
 int redis_restore(struct redis *, bool foreign, int db);
-void redis_update_onekey(struct call *c, struct redis *r);
-void redis_delete(struct call *, struct redis *);
+void redis_update_onekey(call_t *c, struct redis *r);
+void redis_delete(call_t *, struct redis *);
 void redis_wipe(struct redis *);
 int redis_async_event_base_action(struct redis *r, enum event_base_action);
 int redis_notify_subscribe_action(struct redis *r, enum subscribe_action action, int keyspace);

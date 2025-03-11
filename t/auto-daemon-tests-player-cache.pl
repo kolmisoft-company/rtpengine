@@ -8,6 +8,10 @@ use NGCP::Rtpengine::AutoTest;
 use Test::More;
 use NGCP::Rtpclient::ICE;
 use POSIX;
+use JSON;
+
+
+$ENV{RTPENGINE_EXTENDED_TESTS} or exit(); # timing sensitive tests
 
 
 autotest_start(qw(--config-file=none -t -1 -i 203.0.113.1 -i 2001:db8:4321::1
@@ -30,7 +34,7 @@ my $pcma_5 = "\xad\xac\xa2\xa6\xbd\x9a\x06\x3f\x26\x2d\x2c\x2d\x26\x3f\x06\x9a\x
 
 
 my ($sock_a, $sock_b, $sock_c, $sock_d, $port_a, $port_b, $ssrc, $ssrc_b, $resp,
-	$sock_ax, $sock_bx, $port_ax, $port_bx,
+	$sock_ax, $sock_bx, $port_ax, $port_bx, @cids,
 	$srtp_ctx_a, $srtp_ctx_b, $srtp_ctx_a_rev, $srtp_ctx_b_rev, $ufrag_a, $ufrag_b,
 	@ret1, @ret2, @ret3, @ret4, $srtp_key_a, $srtp_key_b, $ts, $seq, $has_recv);
 
@@ -38,7 +42,48 @@ my ($sock_a, $sock_b, $sock_c, $sock_d, $port_a, $port_b, $ssrc, $ssrc_b, $resp,
 
 # media playback
 
+($sock_a) = new_call([qw(198.51.100.1 2040)]);
+
+push(@cids, cid());
+
+offer('media playback, opus', { ICE => 'remove', replace => ['origin'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio 2040 RTP/AVP 96
+c=IN IP4 198.51.100.1
+a=rtpmap:96 opus/48000/2
+a=fmtp:96 stereo=1;sprop-stereo=1;maxaveragebitrate=28000
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 203.0.113.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 96
+c=IN IP4 203.0.113.1
+a=rtpmap:96 opus/48000/2
+a=fmtp:96 stereo=1; sprop-stereo=1; maxaveragebitrate=28000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$resp = rtpe_req('play media', 'media playback, opus', { 'from-tag' => ft(), blob => $wav_file });
+is $resp->{duration}, 100, 'media duration';
+
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(96 | 0x80, -1, -1, -1, "\x0c\x87\xfc\xe4\x56\x0a\xeb\x0d\x24\x7f\x78\xee\xce\xcb\x95\x2c\x61\x03\xfc\xf4\xdd\xe8\x08\x74\x04\x18\x8d\xb0\xb8\x2b\x3b\x99\x13\xb0\x1c\x9f\xed\x35\xd1\x8c\x92\xac\xc1\xde\xc4\x7a\x3e\x80"));
+rcv($sock_a, -1, rtpm(96, $seq + 1, $ts + 960 * 1, $ssrc, "\x0c\x87\xff\xb6\xa5\x64\xf7\x07\x18\x5d\x50\x36\x1f\x82\x90\x9c\x83\xbd\x46\xc1\x43\xda\x5c\x18\x9e\x38\xcd\xd1\xf2\xcd\xc1\xaa\xf4\xe8\xe0"));
+rcv($sock_a, -1, rtpm(96, $seq + 2, $ts + 960 * 2, $ssrc, "\x0c\x88\x02\x73\x1d\x67\xea\xc9\xdd\x4f\x6c\x56\xb1\x30\x0a\x1d\x24\x12\x23\xa9\x6c\xe5\x96\x94\xe4\x59\xd4\xe0\x20"));
+rcv($sock_a, -1, rtpm(96, $seq + 3, $ts + 960 * 3, $ssrc, "\x0c\x88\x02\x70\xe2\xb8\x63\xcc\xbb\xa4\xab\x08\x28\xcf\xa7\x5d\x8d\x3e\xc2\x4d\x4d\x73\xc8\xba\xd8\xbd\xc8"));
+rcv($sock_a, -1, rtpm(96, $seq + 4, $ts + 960 * 4, $ssrc, "\x0c\x88\x02\x70\xe2\xb8\x69\xd0\x8d\x7c\x15\x5c\xc0\xa3\xea\xc5\xa1\xed\x34\x4e\xa5\x9b\x85\x3c\xea\xf2\x50"));
+
+
+
+
 ($sock_a) = new_call([qw(198.51.100.1 2020)]);
+
+push(@cids, cid());
 
 offer('media playback, offer only', { ICE => 'remove', replace => ['origin'] }, <<SDP);
 v=0
@@ -63,7 +108,7 @@ SDP
 $resp = rtpe_req('play media', 'media playback, offer only', { 'from-tag' => ft(), blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -73,6 +118,8 @@ rcv($sock_a, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 2020)], [qw(198.51.100.3 2022)]);
+
+push(@cids, cid());
 
 offer('media playback, side A', { ICE => 'remove', replace => ['origin'] }, <<SDP);
 v=0
@@ -118,7 +165,7 @@ SDP
 $resp = rtpe_req('play media', 'media playback, side A', { 'from-tag' => ft(), blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -128,6 +175,8 @@ rcv($sock_a, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 2100)], [qw(198.51.100.3 2102)]);
+
+push(@cids, cid());
 
 offer('media playback, side A, repeat', { ICE => 'remove', replace => ['origin'] }, <<SDP);
 v=0
@@ -173,7 +222,7 @@ SDP
 $resp = rtpe_req('play media', 'media playback, side A, repeat', { 'from-tag' => ft(), blob => $wav_file, 'repeat-times' => 2 });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -189,6 +238,8 @@ rcv($sock_a, -1, rtpm(8, $seq + 9, $ts + 160 * 9, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 2030)], [qw(198.51.100.3 2032)]);
+
+push(@cids, cid());
 
 offer('media playback, side B', { ICE => 'remove', replace => ['origin'] }, <<SDP);
 v=0
@@ -234,7 +285,7 @@ SDP
 $resp = rtpe_req('play media', 'media playback, side B', { 'from-tag' => tt(), blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_b, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_b, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_b, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -245,7 +296,7 @@ is $resp->{duration}, 100, 'media duration';
 
 $ts += 160 * 5;
 my $old_ts = $ts;
-(undef, $ts) = rcv($sock_b, -1, rtpm(8 | 0x80, $seq + 5, -1, $ssrc, $pcma_1));
+(undef, undef, $ts) = rcv($sock_b, -1, rtpm(8 | 0x80, $seq + 5, -1, $ssrc, $pcma_1));
 print("ts $ts old $old_ts\n");
 SKIP: {
 	skip 'random timestamp too close to margin', 2 if $old_ts < 500 or $old_ts > 4294966795;
@@ -261,6 +312,8 @@ rcv($sock_b, -1, rtpm(8, $seq + 9, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.9 2020)], [qw(198.51.100.9 2022)]);
+
+push(@cids, cid());
 
 offer('media playback, side A, select by label', { ICE => 'remove', replace => ['origin'],
 	label => 'foobar' }, <<SDP);
@@ -308,7 +361,7 @@ $resp = rtpe_req('play media', 'media playback, side A, select by label', { labe
 		blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -318,6 +371,8 @@ rcv($sock_a, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.9 2030)], [qw(198.51.100.9 2032)]);
+
+push(@cids, cid());
 
 offer('media playback, side B, select by label', { ICE => 'remove', replace => ['origin'],
 	label => 'quux' }, <<SDP);
@@ -364,7 +419,7 @@ SDP
 $resp = rtpe_req('play media', 'media playback, side B, select by label', { label => 'meh', blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_b, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_b, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_b, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
@@ -375,6 +430,8 @@ rcv($sock_b, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
 
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 2050)], [qw(198.51.100.3 2052)]);
+
+push(@cids, cid());
 
 offer('media playback, SRTP', { ICE => 'remove', replace => ['origin'], DTLS => 'off' }, <<SDP);
 v=0
@@ -439,7 +496,7 @@ my $srtp_ctx = {
 	cs => $NGCP::Rtpclient::SRTP::crypto_suites{AES_CM_128_HMAC_SHA1_80},
 	key => 'DVM+BTeYX2UI1LaA9bgXrcBEDBxoItA9/39fSoRF',
 };
-(undef, $seq, $ts, $ssrc) = srtp_rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1), $srtp_ctx);
+(undef, undef, $seq, $ts, $ssrc) = srtp_rcv($sock_a, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1), $srtp_ctx);
 srtp_rcv($sock_a, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2), $srtp_ctx);
 srtp_rcv($sock_a, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3), $srtp_ctx);
 srtp_rcv($sock_a, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4), $srtp_ctx);
@@ -454,6 +511,8 @@ srtp_rcv($sock_a, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5), $srtp_ct
 # media playback after a delete
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 3020)], [qw(198.51.100.3 3022)]);
+
+push(@cids, cid());
 
 offer('media playback after delete', { ICE => 'remove', replace => ['origin'],
 	'rtcp-mux' => ['demux'], 'via-branch' => 'xxxx', flags => ['strict-source', 'record-call'],
@@ -481,7 +540,6 @@ s=tester
 t=0 0
 m=audio PORT RTP/AVP 98 97 8 0 3 101
 c=IN IP4 203.0.113.1
-a=direction:both
 a=rtpmap:98 speex/16000
 a=rtpmap:97 speex/8000
 a=rtpmap:8 PCMA/8000
@@ -489,6 +547,7 @@ a=rtpmap:0 PCMU/8000
 a=rtpmap:3 GSM/8000
 a=rtpmap:101 telephone-event/8000
 a=fmtp:101 0-15
+a=direction:both
 a=sendrecv
 a=rtcp:PORT
 a=ptime:20
@@ -516,12 +575,12 @@ s=tester
 t=0 0
 m=audio PORT RTP/AVP 8 0 3 101
 c=IN IP4 203.0.113.1
-a=direction:both
 a=rtpmap:8 PCMA/8000
 a=rtpmap:0 PCMU/8000
 a=rtpmap:3 GSM/8000
 a=rtpmap:101 telephone-event/8000
 a=fmtp:101 0-15
+a=direction:both
 a=sendrecv
 a=rtcp:PORT
 a=ptime:20
@@ -558,7 +617,6 @@ s=tester
 t=0 0
 m=audio PORT RTP/AVP 98 97 8 0 3 101
 c=IN IP4 203.0.113.1
-a=direction:both
 a=rtpmap:98 speex/16000
 a=rtpmap:97 speex/8000
 a=rtpmap:8 PCMA/8000
@@ -566,6 +624,7 @@ a=rtpmap:0 PCMU/8000
 a=rtpmap:3 GSM/8000
 a=rtpmap:101 telephone-event/8000
 a=fmtp:101 0-15
+a=direction:both
 a=sendrecv
 a=rtcp:PORT
 a=ptime:20
@@ -590,11 +649,11 @@ s=tester
 t=0 0
 m=audio PORT RTP/AVP 8 0 101
 c=IN IP4 203.0.113.1
-a=direction:both
 a=rtpmap:8 PCMA/8000
 a=rtpmap:0 PCMU/8000
 a=rtpmap:101 telephone-event/8000
 a=fmtp:101 0-16
+a=direction:both
 a=sendrecv
 a=rtcp:PORT
 a=ptime:20
@@ -606,12 +665,31 @@ $resp = rtpe_req('play media', 'media playback after delete', { 'from-tag' => tt
 		blob => $wav_file });
 is $resp->{duration}, 100, 'media duration';
 
-(undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
+(undef, undef, $seq, $ts, $ssrc) = rcv($sock_b, -1, rtpm(8 | 0x80, -1, -1, -1, $pcma_1));
 rcv($sock_b, -1, rtpm(8, $seq + 1, $ts + 160 * 1, $ssrc, $pcma_2));
 rcv($sock_b, -1, rtpm(8, $seq + 2, $ts + 160 * 2, $ssrc, $pcma_3));
 rcv($sock_b, -1, rtpm(8, $seq + 3, $ts + 160 * 3, $ssrc, $pcma_4));
 rcv($sock_b, -1, rtpm(8, $seq + 4, $ts + 160 * 4, $ssrc, $pcma_5));
 
+
+$resp = rtpe_req('statistics', 'check stats', { });
+is $resp->{statistics}{currentstatistics}{mediacache}, 0, "no media cache";
+is $resp->{statistics}{currentstatistics}{playercache}, 966, "player cache size";
+
+$resp = rtpe_req('cli', 'clear cache', { body => 'media evict players' });
+
+$resp = rtpe_req('statistics', 'check stats again', { });
+is $resp->{statistics}{currentstatistics}{mediacache}, 0, "no media cache";
+is $resp->{statistics}{currentstatistics}{playercache}, 966, "references held by calls";
+
+
+for my $cid (@cids) {
+	rtpe_req("delete", "delete all calls", { 'call-id' => $cid, 'delete delay' => 0 });
+}
+
+$resp = rtpe_req('statistics', 'check stats again', { });
+is $resp->{statistics}{currentstatistics}{mediacache}, 0, "no media cache";
+is $resp->{statistics}{currentstatistics}{playercache}, 0, "no more player cache";
 
 
 

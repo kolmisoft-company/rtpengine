@@ -1,11 +1,11 @@
 #ifndef _RTCP_H_
 #define _RTCP_H_
 
+#include <glib.h>
+
 #include "str.h"
 #include "call.h"
 #include "media_socket.h"
-#include <glib.h>
-
 
 struct crypto_context;
 struct rtcp_packet;
@@ -15,7 +15,7 @@ struct call_monologue;
 
 
 struct rtcp_parse_ctx {
-	struct call *call;
+	call_t *call;
 	struct call_media *media;
 	const struct timeval *received;
 };

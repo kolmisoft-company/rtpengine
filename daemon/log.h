@@ -4,23 +4,25 @@
 
 #include "str.h"
 #include "loglib.h"
+#include "types.h"
 
 
 
-struct call;
-struct stream_fd;
 struct ice_agent;
 enum log_format;
 
 struct log_info {
 	union {
-		struct call *call;
-		struct stream_fd *stream_fd;
+		call_t *call;
+		stream_fd *stream_fd;
 		const str *str;
 		const char *cstr;
 		struct ice_agent *ice_agent;
 		void *ptr;
-	} u;
+	};
+	union {
+		struct call_media *media;
+	};
 	enum {
 		LOG_INFO_NONE = 0,
 		LOG_INFO_CALL,
@@ -28,6 +30,7 @@ struct log_info {
 		LOG_INFO_STR,
 		LOG_INFO_C_STRING,
 		LOG_INFO_ICE_AGENT,
+		LOG_INFO_MEDIA,
 	} e;
 };
 

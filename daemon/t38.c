@@ -1,10 +1,6 @@
 #include "t38.h"
 
-
-
 #ifdef WITH_TRANSCODING
-
-
 #include <assert.h>
 #include <spandsp/t30.h>
 #include <spandsp/logging.h>
@@ -15,6 +11,7 @@
 #include "str.h"
 #include "media_player.h"
 #include "log_funcs.h"
+#include "sdp.h"
 
 
 
@@ -108,7 +105,7 @@ static int t38_gateway_handler(t38_core_state_t *stat, void *user_data, const ui
 	g_string_append_len(s, (void *) &seq, 2);
 
 	// add primary IFP packet
-	str buf = STR_CONST_INIT_LEN((char *) b, len);
+	str buf = STR_LEN(b, len);
 	__add_udptl(s, &buf);
 
 	// add error correction packets
@@ -220,10 +217,10 @@ static int t38_gateway_handler(t38_core_state_t *stat, void *user_data, const ui
 		ps = tg->t38_media->streams.head->data;
 	if (ps)
 		mutex_lock(&ps->out_lock);
-	struct stream_fd *sfd = NULL;
+	stream_fd *sfd = NULL;
 	if (ps)
 		sfd = ps->selected_sfd;
-	if (sfd) {
+	if (sfd && sfd->socket.fd != -1 && ps->endpoint.address.family != NULL) {
 		for (int i = 0; i < count; i++) {
 			ilog(LOG_DEBUG, "Sending %u UDPTL bytes", (unsigned int) s->len);
 			socket_sendto(&sfd->socket, s->str, s->len, &ps->endpoint);
@@ -240,8 +237,7 @@ static int t38_gateway_handler(t38_core_state_t *stat, void *user_data, const ui
 	return 0;
 }
 
-void __t38_gateway_free(void *p) {
-	struct t38_gateway *tg = p;
+void __t38_gateway_free(struct t38_gateway *tg) {
 	ilog(LOG_DEBUG, "Destroying T.38 gateway");
 	if (tg->gw)
 		t38_gateway_free(tg->gw);
@@ -256,13 +252,13 @@ void __t38_gateway_free(void *p) {
 }
 
 // call is locked in R and mp is locked
-static void t38_pcm_player(struct media_player *mp) {
+static bool t38_pcm_player(struct media_player *mp) {
 	if (!mp || !mp->media)
-		return;
+		return true;
 
 	struct t38_gateway *tg = mp->media->t38_gateway;
 	if (!tg)
-		return;
+		return true;
 
 	if (tg->pcm_media && tg->pcm_media->streams.head
 			&& ((struct packet_stream *) tg->pcm_media->streams.head->data)->selected_sfd)
@@ -279,7 +275,7 @@ static void t38_pcm_player(struct media_player *mp) {
 		timeval_add_usec(&mp->next_run, 10000);
 		timerthread_obj_schedule_abs(&mp->tt_obj, &mp->next_run);
 		mutex_unlock(&tg->lock);
-		return;
+		return false;
 	}
 
 	ilog(LOG_DEBUG, "Generated %i T.38 PCM samples", num);
@@ -295,6 +291,8 @@ static void t38_pcm_player(struct media_player *mp) {
 	// this reschedules our player as well
 	media_player_add_packet(pcm_player, (char *) smp, num * 2, num * 1000000 / 8000, pts);
 	media_player_put(&pcm_player);
+
+	return false;
 }
 
 
@@ -334,6 +332,30 @@ static int span_log_level_map(int level) {
 	return level;
 }
 
+static void t38_insert_media_attributes(GString *gs, struct call_media *media, struct call_media *source_media,
+		const sdp_ng_flags *flags)
+{
+	struct t38_gateway *tg = media->t38_gateway;
+	if (!tg)
+		return;
+
+	sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxVersion", "%i", tg->options.version);
+	sdp_append_attr(gs, flags, MT_IMAGE, "T38MaxBitRate", "14400");
+	sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxRateManagement", "%s",
+				tg->options.local_tcf ? "localTFC" : "transferredTCF");
+	sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxMaxBuffer", "1800");
+	sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxMaxDatagram", "512");
+
+	if (tg->options.max_ec_entries == 0)
+		sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxUdpEC", "t38UDPNoEC");
+	else if (tg->options.fec_span > 1)
+		sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxUdpEC", "t38UDPFEC");
+	else
+		sdp_append_attr(gs, flags, MT_IMAGE, "T38FaxUdpEC", "t38UDPRedundancy");
+	// XXX more options possible here
+}
+
+
 // call is locked in W
 int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 		const struct t38_options *options)
@@ -361,7 +383,7 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	ilog(LOG_DEBUG, "Creating new T.38 gateway");
 
 	// create and init new
-	struct t38_gateway *tg = obj_alloc0("t38_gateway", sizeof(*tg), __t38_gateway_free);
+	__auto_type tg = obj_alloc0(struct t38_gateway, __t38_gateway_free);
 
 	tg->t38_media = t38_media;
 	tg->pcm_media = pcm_media;
@@ -371,7 +393,7 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	tg->options = opts;
 
 	tg->pcm_pt.payload_type = -1;
-	str_init(&tg->pcm_pt.encoding, "PCM-S16LE");
+	tg->pcm_pt.encoding = STR("PCM-S16LE");
 	tg->pcm_pt.encoding_with_params = tg->pcm_pt.encoding;
 	tg->pcm_pt.clock_rate = 8000;
 	tg->pcm_pt.channels = 1;
@@ -379,16 +401,16 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 
 	err = "Failed to init PCM codec";
 	ensure_codec_def(&tg->pcm_pt, pcm_media);
-	if (!tg->pcm_pt.codec_def)
+	if (!codec_def_supported(tg->pcm_pt.codec_def))
 		goto err;
 
 	err = "Failed to create spandsp T.38 gateway";
 	if (!(tg->gw = t38_gateway_init(NULL, t38_gateway_handler, tg)))
 		goto err;
 
-	err = "Failed to create media player";
-	if (!(tg->pcm_player = media_player_new(pcm_media->monologue)))
-		goto err;
+	media_player_new(&tg->pcm_player, pcm_media->monologue,
+			(pcm_media->streams.length ? pcm_media->streams.head->data->ssrc_out[0] : NULL),
+			NULL);
 	// even though we call media_player_set_media() here, we need to call it again in
 	// t38_gateway_start because our sink might not have any streams added here yet,
 	// leaving the media_player setup incomplete
@@ -425,22 +447,7 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	pcm_media->t38_gateway = obj_get(tg);
 
 	// add SDP options for T38
-	g_queue_clear_full(&t38_media->sdp_attributes, free);
-
-	g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxVersion:%i", tg->options.version));
-	g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38MaxBitRate:14400"));
-	g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxRateManagement:%s",
-				tg->options.local_tcf ? "localTFC" : "transferredTCF"));
-	g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxMaxBuffer:1800"));
-	g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxMaxDatagram:512"));
-
-	if (tg->options.max_ec_entries == 0)
-		g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxUdpEC:t38UDPNoEC"));
-	else if (tg->options.fec_span > 1)
-		g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxUdpEC:t38UDPFEC"));
-	else
-		g_queue_push_tail(&t38_media->sdp_attributes, str_sprintf("T38FaxUdpEC:t38UDPRedundancy"));
-	// XXX more options possible here
+	t38_media->sdp_attr_print = t38_insert_media_attributes;
 
 	return 0;
 
@@ -453,13 +460,13 @@ err:
 
 
 // call is locked in W
-void t38_gateway_start(struct t38_gateway *tg) {
+void t38_gateway_start(struct t38_gateway *tg, str_case_value_ht codec_set) {
 	if (!tg)
 		return;
 
 	// set up our player first
 	media_player_set_media(tg->pcm_player, tg->pcm_media);
-	if (media_player_setup(tg->pcm_player, &tg->pcm_pt, NULL))
+	if (media_player_setup(tg->pcm_player, &tg->pcm_pt, NULL, codec_set))
 		return;
 
 	// now start our player if we can or should
@@ -706,8 +713,8 @@ int t38_gateway_input_udptl(struct t38_gateway *tg, const str *buf) {
 					}
 
 					// XOR in packet
-					for (size_t j = 0; j < recp->s->len; j++)
-						rec_s->str[j] ^= recp->s->s[j];
+					for (size_t k = 0; k < recp->s->len; k++)
+						rec_s->str[k] ^= recp->s->s[k];
 				}
 
 				if (complete) {
@@ -715,7 +722,7 @@ int t38_gateway_input_udptl(struct t38_gateway *tg, const str *buf) {
 							"packet with seq %i from FEC",
 							seq_fec);
 
-					str rec_str = STR_CONST_INIT_LEN(rec_s->str, rec_s->len);
+					str rec_str = STR_GS(rec_s);
 					__fec_save(tg, &rec_str, seq_fec);
 					up = __make_udptl_packet(&rec_str, seq_fec);
 					packet_sequencer_insert(&tg->sequencer, &up->p);
@@ -773,7 +780,7 @@ void t38_gateway_stop(struct t38_gateway *tg) {
 	if (tg->pcm_player)
 		media_player_stop(tg->pcm_player);
 	if (tg->t38_media)
-		g_queue_clear_full(&tg->t38_media->sdp_attributes, free);
+		tg->t38_media->sdp_attr_print = sdp_insert_media_attributes;
 }
 
 

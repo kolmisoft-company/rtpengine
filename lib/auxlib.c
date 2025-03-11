@@ -12,6 +12,11 @@
 #endif
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
+#include <sys/epoll.h>
+#ifdef HAVE_CODEC_CHAIN
+#include <codec-chain/types.h>
+#endif
 #include "log.h"
 #include "loglib.h"
 
@@ -19,9 +24,9 @@ struct thread_buf {
 	char buf[THREAD_BUF_SIZE];
 };
 
-static int version;
 struct rtpengine_common_config *rtpe_common_config_ptr;
 __thread struct timeval rtpe_now;
+volatile bool rtpe_shutdown;
 
 static __thread struct thread_buf t_bufs[NUM_THREAD_BUFS];
 static __thread int t_buf_idx;
@@ -45,7 +50,7 @@ void daemonize(void) {
 	setpgrp();
 }
 
-void wpidfile() {
+void wpidfile(void) {
 	FILE *fp;
 
 	if (!rtpe_common_config_ptr->pidfile)
@@ -65,6 +70,54 @@ void service_notify(const char *message) {
 #ifdef HAVE_LIBSYSTEMD
 	sd_notify(0, message);
 #endif
+}
+
+
+int thread_create(void *(*func)(void *), void *arg, bool joinable, pthread_t *handle, const char *name) {
+	pthread_attr_t att;
+	pthread_t thr;
+	int ret;
+
+	if (pthread_attr_init(&att))
+		abort();
+	if (pthread_attr_setdetachstate(&att, joinable ? PTHREAD_CREATE_JOINABLE : PTHREAD_CREATE_DETACHED))
+		abort();
+	if (rtpe_common_config_ptr->thread_stack > 0) {
+		if (pthread_attr_setstacksize(&att, rtpe_common_config_ptr->thread_stack * 1024)) {
+			ilog(LOG_ERR, "Failed to set thread stack size to %llu",
+					(unsigned long long) rtpe_common_config_ptr->thread_stack * 1024);
+			abort();
+		}
+	}
+	ret = pthread_create(&thr, &att, func, arg);
+	pthread_attr_destroy(&att);
+	if (ret)
+		return ret;
+	if (handle)
+		*handle = thr;
+#ifdef __GLIBC__
+	if (name)
+		pthread_setname_np(thr, name);
+#endif
+
+	return 0;
+}
+
+
+void resources(void) {
+	struct rlimit rl;
+	int tryv;
+
+	rlim(RLIMIT_CORE, RLIM_INFINITY);
+
+	if (getrlimit(RLIMIT_NOFILE, &rl))
+		rl.rlim_cur = 0;
+	for (tryv = ((1<<20) - 1); tryv && tryv > rl.rlim_cur && rlim(RLIMIT_NOFILE, tryv) == -1; tryv >>= 1)
+		;
+
+	rlim(RLIMIT_DATA, RLIM_INFINITY);
+	rlim(RLIMIT_RSS, RLIM_INFINITY);
+	rlim(RLIMIT_AS, RLIM_INFINITY);
 }
 
 
@@ -102,34 +155,78 @@ void config_load_free(struct rtpengine_common_config *cconfig) {
 	g_free(cconfig->pidfile);
 }
 
-static void free_gkeyfile(GKeyFile **k) {
-	if (k && *k)
-		g_key_file_free(*k);
-}
-static void free_gopte(GOptionEntry **k) {
-	if (k && *k)
-		free(*k);
-}
-static void free_goptc(GOptionContext **k) {
-	if (k && *k)
-		g_option_context_free(*k);
-}
-static void free_gerror(GError **k) {
-	if (k && *k)
-		g_error_free(*k);
+static void section_keys_callback(GKeyFile *kf,
+		const char *section_name,
+		void (*callback)(const char *key, char *value, union rtpenging_config_callback_arg),
+		union rtpenging_config_callback_arg arg)
+{
+	if (!section_name)
+		return;
+
+	g_autoptr(GError) err = NULL;
+	g_autoptr(char_p) keys = g_key_file_get_keys(kf, section_name, NULL, &err);
+	if (err)
+		die("Failed to load keys from given config file section '%s': %s", section_name, err->message);
+	if (!keys)
+		return; // empty config section
+
+	for (char **key = keys; *key; key++) {
+		char *val = g_key_file_get_string(kf, section_name, *key, &err);
+		if (err)
+			die("Failed to read config value '%s' (section '%s') from config file: %s", *key, section_name, err->message);
+		callback(*key, val, arg);
+	}
 }
 
-void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char *description,
-		char *default_config, char *default_section,
-		struct rtpengine_common_config *cconfig)
+static void file_groups_callback(GKeyFile *kf,
+		const char *group_prefix,
+		void (*callback)(const char *name, charp_ht, union rtpenging_config_callback_arg),
+		union rtpenging_config_callback_arg arg)
 {
-	AUTO_CLEANUP_NULL(GOptionContext *c, free_goptc);
-	AUTO_CLEANUP_NULL(GError *er, free_gerror);
-	AUTO_CLEANUP_GBUF(use_section);
+	if (!group_prefix)
+		return;
+
+	size_t pref_len = strlen(group_prefix);
+
+	g_autoptr(char_p) groups = g_key_file_get_groups(kf, NULL);
+
+	for (char **group = groups; *group; group++) {
+		// check for groups starting with "PREFIX-.."
+		if (memcmp(*group, group_prefix, pref_len))
+			continue;
+		char *ident = *group + pref_len;
+		if (*ident != '-')
+			continue;
+		ident++;
+		if (*ident == '\0')
+			continue;
+
+		// read all keys and put them in a hash table
+		g_auto(charp_ht) ht = charp_ht_new();
+		section_keys_callback(kf, *group, add_c_str_to_ht, ht);
+		callback(ident, ht, arg);
+	}
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GOptionEntry, free)
+typedef char *char_p_shallow;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(char_p_shallow, g_free)
+
+void config_load_ext(int *argc, char ***argv, GOptionEntry *app_entries, const char *description,
+		char *default_config, char *default_section,
+		struct rtpengine_common_config *cconfig,
+		const struct rtpenging_config_callback *callbacks)
+{
+	g_autoptr(GOptionContext) c = NULL;
+	g_autoptr(GError) er = NULL;
+	g_autoptr(char) use_section = NULL;
 	const char *use_config;
 	int fatal = 0;
-	AUTO_CLEANUP(char **saved_argv, free_gvbuf) = g_strdupv(*argv);
+	g_autoptr(char_p) saved_argv_arr = g_strdupv(*argv);
+	g_autoptr(char_p_shallow) saved_argv = __g_memdup(saved_argv_arr, sizeof(char *) * (*argc + 1));
 	int saved_argc = *argc;
+	gboolean version = false;
+	g_autoptr(char) opus_application = NULL;
 
 	rtpe_common_config_ptr = cconfig;
 
@@ -139,15 +236,16 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 #else
 	rtpe_common_config_ptr->default_log_level = LOG_DEBUG;
 #endif
+	rtpe_common_config_ptr->codec_chain_opus_complexity = -1;
 
-	AUTO_CLEANUP(GKeyFile *kf, free_gkeyfile) = g_key_file_new();
+	g_autoptr(GKeyFile) kf = g_key_file_new();
 
 #define ll(system, descr) \
 		{ "log-level-" #system,	0, 0, G_OPTION_ARG_INT,	&rtpe_common_config_ptr->log_levels[log_level_index_ ## system],"Log level for: " descr,"INT"		},
 
 	GOptionEntry shared_options[] = {
 		{ "version",		'v', 0, G_OPTION_ARG_NONE,	&version,	"Print build time and exit",		NULL		},
-		{ "config-file",	0,   0, G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->config_file,	"Load config from this file",		"FILE"		},
+		{ "config-file",	0,   0, G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->config_file,	"Load config from this file",		"FILE"		},
 		{ "config-section",	0,   0, G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->config_section,"Config file section to use",		"STRING"	},
 		{ "log-facility",	0,   0,	G_OPTION_ARG_STRING,	&rtpe_common_config_ptr->log_facility,	"Syslog facility to use for logging",	"daemon|local0|...|local7"},
 		{ "log-level",		'L', 0, G_OPTION_ARG_INT,	&rtpe_common_config_ptr->default_log_level,"Default log level",			"INT"		},
@@ -162,7 +260,20 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 		{ "pidfile",		'p', 0, G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->pidfile,	"Write PID to file",			"FILE"		},
 		{ "foreground",		'f', 0, G_OPTION_ARG_NONE,	&rtpe_common_config_ptr->foreground,	"Don't fork to background",		NULL		},
 		{ "thread-stack",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->thread_stack,	"Thread stack size in kB",		"INT"		},
+		{ "poller-size",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->poller_size,	"Max poller items per iteration",	"INT"		},
+#ifdef HAVE_LIBURING
+		{ "io-uring",		0,0,	G_OPTION_ARG_NONE,	&rtpe_common_config_ptr->io_uring,	"Use io_uring",				NULL },
+		{ "io-uring-buffers",	0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->io_uring_buffers,"Number of io_uring entries per thread","INT" },
+#endif
 		{ "evs-lib-path",	0,0,	G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->evs_lib_path,	"Location of .so for 3GPP EVS codec",	"FILE"		},
+#ifdef HAVE_CODEC_CHAIN
+		{ "codec-chain-lib-path",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_common_config_ptr->codec_chain_lib_path,"Location of libcodec-chain.so",	"FILE"		},
+		{ "codec-chain-runners",0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_runners,"Number of chain runners per codec","INT"		},
+		{ "codec-chain-concurrency",0,0,G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_concurrency,"Max concurrent codec jobs per runner","INT"	},
+		{ "codec-chain-async",0,0,	G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_async,"Number of background callback threads","INT"	},
+		{ "codec-chain-opus-application",0,0,G_OPTION_ARG_STRING,&opus_application,			"Opus application",			"default|VoIP|audio|low-delay"	},
+		{ "codec-chain-opus-complexity",0,0,G_OPTION_ARG_INT,	&rtpe_common_config_ptr->codec_chain_opus_complexity,"Opus encoding complexity (0..10)","INT"	},
+#endif
 		{ NULL, }
 	};
 #undef ll
@@ -172,10 +283,10 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 	unsigned int app_len = options_length(app_entries);
 	size_t entries_size = sizeof(GOptionEntry) * (shared_len + app_len + 1);
 
-	AUTO_CLEANUP(GOptionEntry *entries, free_gopte) = malloc(entries_size);
+	g_autoptr(GOptionEntry) entries = malloc(entries_size);
 	memcpy(entries, shared_options, sizeof(*entries) * shared_len);
 	memcpy(&entries[shared_len], app_entries, sizeof(*entries) * (app_len + 1));
-	AUTO_CLEANUP(GOptionEntry *entries_copy, free_gopte) = malloc(entries_size);
+	g_autoptr(GOptionEntry) entries_copy = malloc(entries_size);
 	memcpy(entries_copy, entries, entries_size);
 
 	c = g_option_context_new(description);
@@ -234,9 +345,11 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				e->description = NULL;
 				CONF_OPTION_GLUE(string, char *);
 				e->description = (void *) *s;
+				*s = NULL;
 				break;
 			}
 
+			case G_OPTION_ARG_FILENAME_ARRAY:
 			case G_OPTION_ARG_STRING_ARRAY: {
 				char ***s = e->arg_data;
 				g_strfreev(*s);
@@ -244,6 +357,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				e->description = NULL;
 				CONF_OPTION_GLUE(string_list, char **, NULL);
 				e->description = (void *) *s;
+				*s = NULL;
 				break;
 			}
 
@@ -257,11 +371,7 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 	// process CLI arguments again so they override options from the config file
 	c = g_option_context_new(description);
 	g_option_context_add_main_entries(c, entries, NULL);
-#if !GLIB_CHECK_VERSION(2,40,0)
-	g_option_context_parse_strv(c, &saved_argv, &er);
-#else
 	g_option_context_parse(c, &saved_argc, &saved_argv, &er);
-#endif
 
 	// finally go through our list again to look for strings that were
 	// overwritten, and free the old values.
@@ -271,7 +381,9 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 			case G_OPTION_ARG_STRING:
 			case G_OPTION_ARG_FILENAME: {
 				char **s = e->arg_data;
-				if (*s != e->description)
+				if (!*s && e->description)
+					*s = (char *) e->description;
+				else if (*s != e->description)
 					g_free((void *) e->description);
 				if (*s) {
 					size_t len = strlen(*s);
@@ -281,9 +393,12 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 				break;
 			}
 
+			case G_OPTION_ARG_FILENAME_ARRAY:
 			case G_OPTION_ARG_STRING_ARRAY: {
 				char ***s = e->arg_data;
-				if (*s != (void *) e->description)
+				if (!*s && e->description)
+					*s = (char **) e->description;
+				else if (*s != (void *) e->description)
 					g_strfreev((void *) e->description);
 				if (*s) {
 					for (int i = 0; (*s)[i]; i++) {
@@ -299,6 +414,22 @@ void config_load(int *argc, char ***argv, GOptionEntry *app_entries, const char 
 			default:
 				break;
 		}
+	}
+
+	for (const struct rtpenging_config_callback *cb = callbacks; cb; cb++) {
+		switch (cb->type) {
+			case RCC_END:
+				break;
+
+			case RCC_SECTION_KEYS:
+				section_keys_callback(kf, *cb->section_keys.name, cb->section_keys.callback, cb->arg);
+				continue;
+
+			case RCC_FILE_GROUPS:
+				file_groups_callback(kf, *cb->file_groups.prefix, cb->file_groups.callback, cb->arg);
+				continue;
+		}
+		break;
 	}
 
 out:
@@ -341,6 +472,43 @@ out:
 	if (rtpe_common_config_ptr->thread_stack == 0)
 		rtpe_common_config_ptr->thread_stack = 2048;
 
+	if (rtpe_common_config_ptr->poller_size <= 0)
+		rtpe_common_config_ptr->poller_size = 128;
+
+#ifdef HAVE_CODEC_CHAIN
+	if (rtpe_common_config_ptr->codec_chain_runners <= 0)
+		rtpe_common_config_ptr->codec_chain_runners = 4;
+
+	if (rtpe_common_config_ptr->codec_chain_concurrency <= 0)
+		rtpe_common_config_ptr->codec_chain_concurrency = 256;
+
+	if (rtpe_common_config_ptr->codec_chain_async < 0)
+		rtpe_common_config_ptr->codec_chain_async = 0;
+
+	if (rtpe_common_config_ptr->codec_chain_opus_complexity == -1)
+		rtpe_common_config_ptr->codec_chain_opus_complexity = 10;
+	if (rtpe_common_config_ptr->codec_chain_opus_complexity < 0 || rtpe_common_config_ptr->codec_chain_opus_complexity > 10)
+		die("Invalid value for --codec-chain-opus-complexity");
+	if (opus_application) {
+		if (!strcmp(opus_application, "default") || !strcmp(opus_application, ""))
+			rtpe_common_config_ptr->codec_chain_opus_application = 0;
+		else if (!strcmp(opus_application, "voip") || !strcmp(opus_application, "speech"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_VOIP;
+		else if (!strcmp(opus_application, "audio") || !strcmp(opus_application, "music"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_AUDIO;
+		else if (!strcmp(opus_application, "low delay") || !strcmp(opus_application, "low-delay") || !strcmp(opus_application, "lowdelay"))
+			rtpe_common_config_ptr->codec_chain_opus_application = CC_OPUS_APP_LOWDELAY;
+		else
+			die("Invalid value for --codec-chain-opus-application");
+	}
+#endif
+
+#if HAVE_LIBURING
+	if (rtpe_common_config_ptr->io_uring_buffers == 0)
+		rtpe_common_config_ptr->io_uring_buffers = 16384;
+	else if (rtpe_common_config_ptr->io_uring_buffers < 0)
+		die("Invalid value for --io-uring-buffers");
+#endif
 
 	return;
 
@@ -406,29 +574,18 @@ int timeval_cmp_ptr(const void *a, const void *b) {
 	return 0;
 }
 
-void free_gbuf(char **p) {
-	g_free(*p);
-}
-
-void free_gvbuf(char ***p) {
-	g_strfreev(*p);
-}
-
-int g_tree_find_first_cmp(void *k, void *v, void *d) {
-	void **p = d;
-	GEqualFunc f = p[1];
-	if (!f || f(v, p[0])) {
-		p[2] = v;
+int rtpe_tree_find_first_cmp(void *k, void *v, void *d) {
+	struct rtpe_g_tree_find_helper *h = d;
+	if (!h->func || h->func(v, h->data)) {
+		h->out_p = v;
 		return TRUE;
 	}
 	return FALSE;
 }
-int g_tree_find_all_cmp(void *k, void *v, void *d) {
-	void **p = d;
-	GEqualFunc f = p[1];
-	GQueue *q = p[2];
-	if (!f || f(v, p[0]))
-		g_queue_push_tail(q, v);
+int rtpe_tree_find_all_cmp(void *k, void *v, void *d) {
+	struct rtpe_g_tree_find_helper *h = d;
+	if (!h->func || h->func(v, h->data))
+		g_queue_push_tail(h->out_q, v);
 	return FALSE;
 }
 

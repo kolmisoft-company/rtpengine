@@ -8,12 +8,13 @@
 #include <errno.h>
 
 #include "poller.h"
-#include "aux.h"
+#include "helpers.h"
 #include "str.h"
 #include "log.h"
 #include "obj.h"
 #include "socket.h"
 #include "log_funcs.h"
+#include "uring.h"
 
 struct udp_listener_callback {
 	struct obj obj;
@@ -22,11 +23,12 @@ struct udp_listener_callback {
 	struct obj *p;
 };
 
-static void udp_listener_closed(int fd, void *p, uintptr_t x) {
-	abort();
+static void udp_listener_closed(int fd, void *p) {
+	if (!rtpe_shutdown)
+		abort();
 }
 
-static void udp_listener_incoming(int fd, void *p, uintptr_t x) {
+static void udp_listener_incoming(int fd, void *p) {
 	struct udp_listener_callback *cb = p;
 	int len;
 	struct udp_buffer *udp_buf = NULL;
@@ -34,12 +36,13 @@ static void udp_listener_incoming(int fd, void *p, uintptr_t x) {
 	for (;;) {
 		if (!udp_buf) {
 			// initialise if we need to
-			udp_buf = obj_alloc0("udp_buffer", sizeof(*udp_buf), NULL);
+			udp_buf = obj_alloc0(struct udp_buffer, NULL);
 			udp_buf->str.s = udp_buf->buf + RTP_BUFFER_HEAD_ROOM;
 			udp_buf->listener = cb->ul;
 		}
 
-		len = socket_recvfrom(udp_buf->listener, udp_buf->str.s, MAX_UDP_LENGTH, &udp_buf->sin);
+		len = socket_recvfrom_to(udp_buf->listener, udp_buf->str.s, MAX_UDP_LENGTH, &udp_buf->sin,
+				&udp_buf->local_addr);
 		if (len < 0) {
 			if (errno == EINTR)
 				continue;
@@ -68,31 +71,32 @@ static void udp_listener_incoming(int fd, void *p, uintptr_t x) {
 	obj_put(udp_buf);
 }
 
-static void __ulc_free(void *p) {
-	struct udp_listener_callback *cb = p;
+static void __ulc_free(struct udp_listener_callback *cb) {
 	obj_put_o(cb->p);
 }
 
-int udp_listener_init(socket_t *sock, struct poller *p, const endpoint_t *ep,
+int udp_listener_init(socket_t *sock, const endpoint_t *ep,
 		udp_listener_callback_t func, struct obj *obj)
 {
 	struct poller_item i;
 	struct udp_listener_callback *cb;
 
-	cb = obj_alloc("udp_listener_callback", sizeof(*cb), __ulc_free);
+	cb = obj_alloc(struct udp_listener_callback, __ulc_free);
 	cb->func = func;
 	cb->p = obj_get_o(obj);
 	cb->ul = sock;
 
-	if (open_socket(sock, SOCK_DGRAM, ep->port, &ep->address))
+	if (!open_socket(sock, SOCK_DGRAM, ep->port, &ep->address))
 		goto fail;
+
+	socket_pktinfo(sock);
 
 	ZERO(i);
 	i.fd = sock->fd;
 	i.closed = udp_listener_closed;
 	i.readable = udp_listener_incoming;
 	i.obj = &cb->obj;
-	if (poller_add_item(p, &i))
+	if (!rtpe_poller_add_item(rtpe_control_poller, &i))
 		goto fail;
 
 	obj_put(cb);

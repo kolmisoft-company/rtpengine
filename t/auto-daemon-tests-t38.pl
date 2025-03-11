@@ -14,7 +14,7 @@ autotest_start(qw(--config-file=none -t -1 -i 203.0.113.1 -i 2001:db8:4321::1
 		or die;
 
 
-my ($sock_a, $sock_b, $port_a, $port_b, $ssrc, $resp, $srtp_ctx_a, $srtp_ctx_b, @ret1, @ret2);
+my ($sock_a, $sock_b, $port_a, $port_b, $resp, $srtp_ctx_a, $srtp_ctx_b, @ret1, @ret2);
 
 
 
@@ -66,6 +66,7 @@ sub t38_gw_test {
 	my $sqo = 1000;
 	my $tso = 3000;
 	my $ts = -1;
+	my $ssrc = -1;
 
 	my $rev = $opts{reverse} // 0;
 	my $pcm_sock = $rev ? $sock_a : $sock_b;
@@ -84,6 +85,9 @@ sub t38_gw_test {
 		# it will also have generated a block of PCM
 		if ($seq == -1) {
 			($seq, $ts, $ssrc, $buf) = rcv($pcm_sock, $pcm_port, rtpmre(8 | 0x80, -1, -1, -1, '(' . ("." x 160) . ')'));
+			if ($opts{seq}) {
+				is($seq, $opts{seq}, 'initial sequence number');
+			}
 		}
 		else {
 			($buf) = rcv($pcm_sock, $pcm_port, rtpmre(8, $seq += 1, $ts += 160, $ssrc, '(' . ("." x 160) . ')'));
@@ -302,6 +306,12 @@ a=sendrecv
 a=rtcp:PORT
 SDP
 
+snd($sock_a, $port_b,  rtp(8, 1000, 3000, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(8, 1000, 3000, 0x1234, "\x00" x 160));
+
+snd($sock_b, $port_a,  rtp(8, 4000, 6000, 0x2bc3, "\x00" x 160));
+rcv($sock_a, $port_b, rtpm(8, 4000, 6000, 0x2bc3, "\x00" x 160));
+
 ($port_a) = offer('T.38 after re-invite', { 'T.38' => [ 'force' ], ICE => 'remove',
 	 }, <<SDP);
 v=0
@@ -357,13 +367,8 @@ SDP
 t38_gw_test('T.38 after re-invite',
 	'./spandsp_send_fax_pcm test.tif',
 	'./spandsp_recv_fax_t38 out.tif',
-	reverse => 1);
+	reverse => 1, seq => 4001);
 
-
-
-
-done_testing();
-exit;
 
 
 
@@ -683,4 +688,5 @@ t38_gw_test('FEC span 5',
 
 
 
+#done_testing;NGCP::Rtpengine::AutoTest::terminate('f00');exit;
 done_testing();

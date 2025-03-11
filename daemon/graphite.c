@@ -1,9 +1,5 @@
-/*
- * graphite.c
- *
- *  Created on: Jan 19, 2015
- *      Author: fmetz
- */
+#include "graphite.h"
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -18,7 +14,6 @@
 
 #include "log.h"
 #include "call.h"
-#include "graphite.h"
 #include "socket.h"
 #include "statistics.h"
 #include "main.h"
@@ -74,7 +69,7 @@ static int connect_to_graphite_server(const endpoint_t *graphite_ep) {
 	rc = connect_socket_nb(&graphite_sock, SOCK_STREAM, graphite_ep);
 
 	if (rtpe_config.graphite_timeout > 0 && !(graphite_sock.fd < 0)) {
-		usertimeout(graphite_sock.fd, rtpe_config.graphite_timeout * 1000);
+		usertimeout(&graphite_sock, rtpe_config.graphite_timeout * 1000);
 	}
 
 	if (rc == -1) {
@@ -97,7 +92,7 @@ GString *print_graphite_data(void) {
 	long long time_diff_us = timeval_diff(&rtpe_now, &rtpe_latest_graphite_interval_start);
 	rtpe_latest_graphite_interval_start = rtpe_now;
 
-	stats_counters_calc_diff(&rtpe_stats, &rtpe_stats_graphite_intv, &rtpe_stats_graphite_diff);
+	stats_counters_calc_diff(rtpe_stats, &rtpe_stats_graphite_intv, &rtpe_stats_graphite_diff);
 	stats_rate_min_max_avg_sample(&rtpe_rate_graphite_min_max, &rtpe_rate_graphite_min_max_avg_sampled,
 			time_diff_us, &rtpe_stats_graphite_diff);
 
@@ -116,46 +111,46 @@ GString *print_graphite_data(void) {
 		g_string_append(graph_str, graphite_prefix); \
 	g_string_append_printf(graph_str, fmt " %llu\n", ##__VA_ARGS__, (unsigned long long)rtpe_now.tv_sec)
 
-	for (int i = 0; i < NGC_COUNT; i++) {
-		GPF("%s_time_min %.6f", ng_command_strings[i],
-				(double) atomic64_get(&rtpe_sampled_graphite_min_max_sampled.min.ng_command_times[i]) / 1000000.0);
-		GPF("%s_time_max %.6f", ng_command_strings[i],
-				(double) atomic64_get(&rtpe_sampled_graphite_min_max_sampled.max.ng_command_times[i]) / 1000000.0);
-		GPF("%s_time_avg %.6f", ng_command_strings[i],
-				(double) atomic64_get(&rtpe_sampled_graphite_avg.avg.ng_command_times[i]) / 1000000.0);
+	for (int i = 0; i < OP_COUNT; i++) {
+		GPF("%s_time_min %.6f", ng_command_strings_esc[i],
+				(double) atomic64_get_na(&rtpe_sampled_graphite_min_max_sampled.min.ng_command_times[i]) / 1000000.0);
+		GPF("%s_time_max %.6f", ng_command_strings_esc[i],
+				(double) atomic64_get_na(&rtpe_sampled_graphite_min_max_sampled.max.ng_command_times[i]) / 1000000.0);
+		GPF("%s_time_avg %.6f", ng_command_strings_esc[i],
+				(double) atomic64_get_na(&rtpe_sampled_graphite_avg.avg.ng_command_times[i]) / 1000000.0);
 
-		GPF("%ss_ps_min " UINT64F, ng_command_strings[i], atomic64_get(&rtpe_rate_graphite_min_max_avg_sampled.min.ng_commands[i]));
-		GPF("%ss_ps_max " UINT64F, ng_command_strings[i], atomic64_get(&rtpe_rate_graphite_min_max_avg_sampled.max.ng_commands[i]));
-		GPF("%ss_ps_avg " UINT64F, ng_command_strings[i], atomic64_get(&rtpe_rate_graphite_min_max_avg_sampled.avg.ng_commands[i]));
+		GPF("%ss_ps_min " UINT64F, ng_command_strings_esc[i], atomic64_get_na(&rtpe_rate_graphite_min_max_avg_sampled.min.ng_commands[i]));
+		GPF("%ss_ps_max " UINT64F, ng_command_strings_esc[i], atomic64_get_na(&rtpe_rate_graphite_min_max_avg_sampled.max.ng_commands[i]));
+		GPF("%ss_ps_avg " UINT64F, ng_command_strings_esc[i], atomic64_get_na(&rtpe_rate_graphite_min_max_avg_sampled.avg.ng_commands[i]));
 
 		ilog(LOG_DEBUG, "Min/Max/Avg %s processing delay: %.6f/%.6f/%.6f sec",
 			ng_command_strings[i],
-			(double) atomic64_get(&rtpe_sampled_graphite_min_max_sampled.min.ng_command_times[i]) / 1000000.0,
-			(double) atomic64_get(&rtpe_sampled_graphite_min_max_sampled.max.ng_command_times[i]) / 1000000.0,
-			(double) atomic64_get(&rtpe_sampled_graphite_avg.avg.ng_command_times[i]) / 1000000.0);
+			(double) atomic64_get_na(&rtpe_sampled_graphite_min_max_sampled.min.ng_command_times[i]) / 1000000.0,
+			(double) atomic64_get_na(&rtpe_sampled_graphite_min_max_sampled.max.ng_command_times[i]) / 1000000.0,
+			(double) atomic64_get_na(&rtpe_sampled_graphite_avg.avg.ng_command_times[i]) / 1000000.0);
 
-		GPF("%s_count %" PRIu64, ng_command_strings[i], atomic64_get(&rtpe_stats.ng_commands[i]));
+		GPF("%s_count %" PRIu64, ng_command_strings_esc[i], atomic64_get_na(&rtpe_stats->ng_commands[i]));
 	}
 
 	GPF("call_dur %.6f", (double) atomic64_get_na(&rtpe_stats_graphite_diff.total_calls_duration_intv) / 1000000.0);
 	struct timeval avg_duration;
 	uint64_t managed_sess = atomic64_get_na(&rtpe_stats_graphite_diff.managed_sess);
 	if (managed_sess)
-		timeval_from_us(&avg_duration, atomic64_get_na(&rtpe_stats_graphite_diff.call_duration) / managed_sess);
+		avg_duration = timeval_from_us(atomic64_get_na(&rtpe_stats_graphite_diff.call_duration) / managed_sess);
 	else
 		avg_duration = (struct timeval) {0,0};
 	GPF("average_call_dur %llu.%06llu",(unsigned long long)avg_duration.tv_sec,(unsigned long long)avg_duration.tv_usec);
 	GPF("forced_term_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.forced_term_sess));
-	GPF("managed_sess "UINT64F, atomic64_get(&rtpe_stats.managed_sess));
+	GPF("managed_sess "UINT64F, atomic64_get_na(&rtpe_stats->managed_sess));
 	GPF("managed_sess_min "UINT64F, atomic64_get_na(&rtpe_gauge_graphite_min_max_sampled.min.total_sessions));
 	GPF("managed_sess_max "UINT64F, atomic64_get_na(&rtpe_gauge_graphite_min_max_sampled.max.total_sessions));
-	GPF("current_sessions_total "UINT64F, atomic64_get(&rtpe_stats_gauge.total_sessions));
-	GPF("current_sessions_own "UINT64F, atomic64_get(&rtpe_stats_gauge.total_sessions) - atomic64_get(&rtpe_stats_gauge.foreign_sessions));
-	GPF("current_sessions_foreign "UINT64F, atomic64_get(&rtpe_stats_gauge.foreign_sessions));
-	GPF("current_transcoded_media "UINT64F, atomic64_get(&rtpe_stats_gauge.transcoded_media));
-	GPF("current_sessions_ipv4 "UINT64F, atomic64_get(&rtpe_stats_gauge.ipv4_sessions));
-	GPF("current_sessions_ipv6 "UINT64F, atomic64_get(&rtpe_stats_gauge.ipv6_sessions));
-	GPF("current_sessions_mixed "UINT64F, atomic64_get(&rtpe_stats_gauge.mixed_sessions));
+	GPF("current_sessions_total "UINT64F, atomic64_get_na(&rtpe_stats_gauge.total_sessions));
+	GPF("current_sessions_own "UINT64F, atomic64_get_na(&rtpe_stats_gauge.total_sessions) - atomic64_get_na(&rtpe_stats_gauge.foreign_sessions));
+	GPF("current_sessions_foreign "UINT64F, atomic64_get_na(&rtpe_stats_gauge.foreign_sessions));
+	GPF("current_transcoded_media "UINT64F, atomic64_get_na(&rtpe_stats_gauge.transcoded_media));
+	GPF("current_sessions_ipv4 "UINT64F, atomic64_get_na(&rtpe_stats_gauge.ipv4_sessions));
+	GPF("current_sessions_ipv6 "UINT64F, atomic64_get_na(&rtpe_stats_gauge.ipv6_sessions));
+	GPF("current_sessions_mixed "UINT64F, atomic64_get_na(&rtpe_stats_gauge.mixed_sessions));
 	GPF("nopacket_relayed_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.nopacket_relayed_sess));
 	GPF("oneway_stream_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.oneway_stream_sess));
 	GPF("regular_term_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.regular_term_sess));
@@ -177,7 +172,7 @@ GString *print_graphite_data(void) {
 	GPF("timeout_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.timeout_sess));
 	GPF("reject_sess "UINT64F, atomic64_get_na(&rtpe_stats_graphite_diff.rejected_sess));
 
-	for (GList *l = all_local_interfaces.head; l; l = l->next) {
+	for (__auto_type l = all_local_interfaces.head; l; l = l->next) {
 		struct local_intf *lif = l->data;
 		// only show first-order interface entries: socket families must match
 		if (lif->logical->preferred_family != lif->spec->local_address.addr.family)
@@ -185,20 +180,22 @@ GString *print_graphite_data(void) {
 		int num_ports = lif->spec->port_pool.max - lif->spec->port_pool.min + 1;
 		GPF("ports_free_%s_%s %i", lif->logical->name.s,
 				sockaddr_print_buf(&lif->spec->local_address.addr),
-				g_atomic_int_get(&lif->spec->port_pool.free_ports));
+				lif->spec->port_pool.free_ports_q.length);
 		GPF("ports_used_%s_%s %i", lif->logical->name.s,
 				sockaddr_print_buf(&lif->spec->local_address.addr),
-				num_ports - g_atomic_int_get(&lif->spec->port_pool.free_ports));
+				num_ports - lif->spec->port_pool.free_ports_q.length);
 	}
 
 	mutex_lock(&rtpe_codec_stats_lock);
 
-	GList *chains = g_hash_table_get_keys(rtpe_codec_stats);
 	int last_tv_sec = rtpe_now.tv_sec - 1;
 	unsigned int idx = last_tv_sec & 1;
-	for (GList *l = chains; l; l = l->next) {
-		char *chain = l->data;
-		struct codec_stats *stats_entry = g_hash_table_lookup(rtpe_codec_stats, chain);
+
+	codec_stats_ht_iter iter;
+	t_hash_table_iter_init(&iter, rtpe_codec_stats);
+	char *chain;
+	struct codec_stats *stats_entry;
+	while (t_hash_table_iter_next(&iter, &chain, &stats_entry)) {
 		GPF("transcoder_%s %i", stats_entry->chain_brief,
 				g_atomic_int_get(&stats_entry->num_transcoders));
 		if (g_atomic_int_get(&stats_entry->last_tv_sec[idx]) != last_tv_sec)
@@ -212,8 +209,6 @@ GString *print_graphite_data(void) {
 	}
 
 	mutex_unlock(&rtpe_codec_stats_lock);
-
-	g_list_free(chains);
 
 
 	ilog(LOG_DEBUG, "min_sessions:%llu max_sessions:%llu, call_dur_per_interval:%.6f at time %llu\n",
@@ -237,7 +232,7 @@ static int send_graphite_data(void) {
 	size_t sent = 0;
 	int blockings = 10; // let it block that many times
 	while (sent < graph_str->len) {
-		int rc = write(graphite_sock.fd, graph_str->str + sent, graph_str->len - sent);
+		ssize_t rc = write(graphite_sock.fd, graph_str->str + sent, graph_str->len - sent);
 		if (rc<0) {
 			if (blockings <= 0 || (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)) {
 				ilog(LOG_ERROR,"Could not write to graphite socket (%s). " \
