@@ -71,8 +71,13 @@ struct ice_candidate_pair;
 TYPED_GQUEUE(candidate_pair, struct ice_candidate_pair)
 
 struct codec_handler;
-TYPED_GHASHTABLE_PROTO(codec_handlers_ht, struct codec_handler, struct codec_handler)
+TYPED_GHASHTABLE_PROTO(codec_handlers_ht, struct codec_handler_index, struct codec_handler)
 TYPED_GQUEUE(codec_handlers, struct codec_handler)
+
+struct transcode_config;
+struct codec_pipeline_index;
+TYPED_GHASHTABLE_PROTO(transcode_config_ht, struct codec_pipeline_index, struct transcode_config)
+TYPED_GQUEUE(transcode_config, struct transcode_config)
 
 struct codec_packet;
 TYPED_GQUEUE(codec_packet, struct codec_packet)
@@ -96,5 +101,12 @@ TYPED_GQUEUE(sdp_attr, struct sdp_attr)
 
 struct intf_config;
 TYPED_GQUEUE(intf_config, struct intf_config)
+
+struct ng_codec;
+TYPED_GQUEUE(ng_codecs, struct ng_codec)
+
+struct ng_media;
+TYPED_GQUEUE(ng_medias, struct ng_media)
+
 
 #endif

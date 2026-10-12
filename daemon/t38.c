@@ -271,6 +271,7 @@ static bool t38_pcm_player(struct media_player *mp) {
 	int16_t smp[80];
 	int num = t38_gateway_tx(tg->gw, smp, 80);
 	if (num <= 0) {
+		ilog(LOG_DEBUG, "No T.38 PCM samples generated");
 		// use a fixed interval of 10 ms
 		timeval_add_usec(&mp->next_run, 10000);
 		timerthread_obj_schedule_abs(&mp->tt_obj, &mp->next_run);
@@ -285,6 +286,12 @@ static bool t38_pcm_player(struct media_player *mp) {
 	struct media_player *pcm_player = media_player_get(tg->pcm_player);
 	unsigned long long pts = tg->pts;
 	tg->pts += num;
+
+	// handle fill-in
+	if (timeval_diff(&rtpe_now, &tg->last_rx_ts) > 30000) {
+		ilog(LOG_DEBUG, "Adding T.38 fill-in samples");
+		t38_gateway_rx_fillin(tg->gw, 80);
+	}
 
 	mutex_unlock(&tg->lock);
 
@@ -439,6 +446,10 @@ int t38_gateway_pair(struct call_media *t38_media, struct call_media *pcm_media,
 	my_span_set_log(ls, spandsp_logging_func);
 	span_log_set_level(ls, span_log_level_map(get_log_level(spandsp)));
 
+	ls = t38_core_get_logging_state(t38);
+	my_span_set_log(ls, spandsp_logging_func);
+	span_log_set_level(ls, span_log_level_map(get_log_level(spandsp)));
+
 	packet_sequencer_init(&tg->sequencer, (GDestroyNotify) __udptl_packet_free);
 	tg->sequencer.seq = 0;
 
@@ -513,6 +524,8 @@ int t38_gateway_input_samples(struct t38_gateway *tg, int16_t amp[], int len) {
 	if (left)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "%i PCM samples were not processed by the T.38 gateway",
 				left);
+
+	tg->last_rx_ts = rtpe_now;
 
 	mutex_unlock(&tg->lock);
 

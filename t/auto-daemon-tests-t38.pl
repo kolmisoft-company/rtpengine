@@ -261,6 +261,203 @@ sub t38_gw_test {
 
 
 
+new_call;
+
+offer('codec selection after reinvite - control', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4056 RTP/AVP 8 0 18
+c=IN IP4 198.51.100.3
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8 0 18
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:18 G729/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('codec selection after reinvite - control', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4038 RTP/AVP 18
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 18
+c=IN IP4 203.0.113.1
+a=rtpmap:18 G729/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+reverse_tags;
+
+offer('codec selection after reinvite - control', { 'T.38' => ['decode'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image 4088 udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:0
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 18
+c=IN IP4 203.0.113.1
+a=rtpmap:18 G729/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('codec selection after reinvite - control', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4038 RTP/AVP 18
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image PORT udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:0
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+a=sendrecv
+SDP
+
+
+
+new_call;
+
+offer('codec selection after reinvite', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4056 RTP/AVP 8 0 18
+c=IN IP4 198.51.100.3
+a=sendrecv
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8 0 18
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:18 G729/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('codec selection after reinvite', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4038 RTP/AVP 18
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 18
+c=IN IP4 203.0.113.1
+a=rtpmap:18 G729/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+reverse_tags;
+
+offer('codec selection after reinvite', { 'T.38' => ['decode'],
+		codec => { strip => ['all'], transcode => ['PCMA', 'PCMU' ] } }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image 4088 udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:0
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 8 0
+c=IN IP4 203.0.113.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('codec selection after reinvite', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4038 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image PORT udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:0
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+a=sendrecv
+SDP
+
+
+
+
 ($sock_a, $sock_b) = new_call([qw(198.51.100.1 4020)], [qw(198.51.100.3 4022)]);
 
 ($port_a) = offer('T.38 after re-invite', { ICE => 'remove',
@@ -372,7 +569,7 @@ t38_gw_test('T.38 after re-invite',
 
 
 
-($sock_a, $sock_b) = new_call([qw(198.51.100.1 4016)], [qw(198.51.100.3 4018)]);
+($sock_a, $sock_b) = new_call([qw(198.51.100.3 4016)], [qw(198.51.100.1 4018)]);
 
 ($port_a) = offer('plain T.38, reverse invite', { 'T.38' => [ 'force' ], ICE => 'remove',
 	 }, <<SDP);
@@ -679,6 +876,114 @@ t38_gw_test('FEC span 5',
 	'./spandsp_recv_fax_t38 out.tif',
 	span => 5);
 
+
+
+new_call;
+
+offer('override T.38 version control', { 'T.38' => [ 'decode' ] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=image 4000 udptl t38
+c=IN IP4 198.51.100.1
+a=sendrecv
+a=T38FaxVersion:1
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:262
+a=T38FaxMaxDatagram:300
+a=T38FaxUdpEC:t38UDPRedundancy
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('override T.38 version control', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4002 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image PORT udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:1
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+a=sendrecv
+SDP
+
+
+new_call;
+
+offer('override T.38 version', { 'T.38' => [ 'decode' ], 'T.38 version' => 0 }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=image 4000 udptl t38
+c=IN IP4 198.51.100.1
+a=sendrecv
+a=T38FaxVersion:1
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:262
+a=T38FaxMaxDatagram:300
+a=T38FaxUdpEC:t38UDPRedundancy
+----------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('override T.38 version', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=audio 4002 RTP/AVP 8
+c=IN IP4 198.51.100.3
+a=sendrecv
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.3
+s=tester
+t=0 0
+m=image PORT udptl t38
+c=IN IP4 203.0.113.1
+a=T38FaxVersion:0
+a=T38MaxBitRate:14400
+a=T38FaxRateManagement:transferredTCF
+a=T38FaxMaxBuffer:1800
+a=T38FaxMaxDatagram:512
+a=T38FaxUdpEC:t38UDPRedundancy
+a=sendrecv
+SDP
 
 
 

@@ -476,9 +476,9 @@ struct re_hmac {
 };
 
 struct re_shm {
+	atomic_t			users;
 	void				*head;
-	size_t				size;
-	unsigned int			order;
+	struct rtpengine_table		*table;
 	struct list_head		list_entry;
 };
 
@@ -581,7 +581,7 @@ static struct proc_dir_entry *my_proc_root;
 static struct proc_dir_entry *proc_list;
 static struct proc_dir_entry *proc_control;
 
-static struct rtpengine_table *table[MAX_ID];
+static struct rtpengine_table *rtpe_table[MAX_ID];
 static rwlock_t table_lock;
 
 static struct re_auto_array calls;
@@ -954,7 +954,7 @@ static struct rtpengine_table *new_table_link(uint32_t id) {
 	}
 
 	write_lock_irqsave(&table_lock, flags);
-	if (table[id]) {
+	if (rtpe_table[id]) {
 		write_unlock_irqrestore(&table_lock, flags);
 		table_put(t);
 		printk(KERN_WARNING "xt_RTPENGINE duplicate ID %u\n", id);
@@ -962,7 +962,7 @@ static struct rtpengine_table *new_table_link(uint32_t id) {
 	}
 
 	ref_get(t);
-	table[id] = t;
+	rtpe_table[id] = t;
 	t->id = id;
 	write_unlock_irqrestore(&table_lock, flags);
 
@@ -1153,7 +1153,7 @@ static void table_put(struct rtpengine_table *t) {
 	while (!list_empty(&t->shm_list)) {
 		shm = list_first_entry(&t->shm_list, struct re_shm, list_entry);
 		list_del_init(&shm->list_entry);
-		free_pages((unsigned long) shm->head, shm->order);
+		vfree(shm->head);
 		kfree(shm);
 	}
 
@@ -1258,7 +1258,7 @@ static int unlink_table(struct rtpengine_table *t) {
 	DBG("Unlinking table %u\n", t->id);
 
 	write_lock_irqsave(&table_lock, flags);
-	if (t->id >= MAX_ID || table[t->id] != t) {
+	if (t->id >= MAX_ID || rtpe_table[t->id] != t) {
 		write_unlock_irqrestore(&table_lock, flags);
 		return -EINVAL;
 	}
@@ -1266,7 +1266,7 @@ static int unlink_table(struct rtpengine_table *t) {
 		write_unlock_irqrestore(&table_lock, flags);
 		return -EBUSY;
 	}
-	table[t->id] = NULL;
+	rtpe_table[t->id] = NULL;
 	t->id = -1;
 	write_unlock_irqrestore(&table_lock, flags);
 
@@ -1296,7 +1296,7 @@ static struct rtpengine_table *get_table(unsigned int id) {
 		return NULL;
 
 	read_lock_irqsave(&table_lock, flags);
-	t = table[id];
+	t = rtpe_table[id];
 	if (t)
 		ref_get(t);
 	read_unlock_irqrestore(&table_lock, flags);
@@ -1742,8 +1742,6 @@ static int proc_list_show(struct seq_file *f, void *v) {
 		seq_printf(f, " RTP-only");
 	if (g->target.rtcp)
 		seq_printf(f, " RTCP");
-	if (g->target.rtcp_mux)
-		seq_printf(f, " RTCP-mux");
 	if (g->target.dtls)
 		seq_printf(f, " DTLS");
 	if (g->target.stun)
@@ -1798,6 +1796,9 @@ static int proc_list_show(struct seq_file *f, void *v) {
 						g->target.pt_stats[j]->payload_type,
 						o->output.pt_output[j].replace_pattern_len,
 						o->output.pt_output[j].min_payload_len);
+			if (o->output.pt_output[j].blackhole)
+				seq_printf(f, "        RTP payload type %3u: blackhole\n",
+						g->target.pt_stats[j]->payload_type);
 		}
 
 		proc_list_crypto_print(f, &o->encrypt_rtp, &o->output.encrypt, "encryption");
@@ -1974,14 +1975,53 @@ static int is_valid_address(const struct re_address *rea) {
 	return 1;
 }
 
-static void vm_mmap_close(struct vm_area_struct *vma) {
-}
+static void vm_mmap_open(struct vm_area_struct *vma);
+static void vm_mmap_close(struct vm_area_struct *vma);
+
 static const struct vm_operations_struct vm_mmap_ops = {
+	.open = vm_mmap_open,
 	.close = vm_mmap_close,
 };
 
+static void vm_mmap_open(struct vm_area_struct *vma) {
+	struct re_shm *shm;
+
+	if (vma->vm_ops != &vm_mmap_ops)
+		return;
+	if (!(shm = vma->vm_private_data))
+		return;
+
+	atomic_inc(&shm->users);
+}
+
+static void vm_mmap_close(struct vm_area_struct *vma) {
+	struct re_shm *shm;
+	struct rtpengine_table *t;
+
+	if (vma->vm_ops != &vm_mmap_ops)
+		return;
+	if (!(shm = vma->vm_private_data))
+		return;
+
+	if (!atomic_dec_and_test(&shm->users))
+		return;
+
+	t = shm->table;
+
+	spin_lock(&t->shm_lock);
+	list_del_init(&shm->list_entry);
+	spin_unlock(&t->shm_lock);
+
+	vfree(shm->head);
+	kfree(shm);
+
+	vma->vm_private_data = NULL;
+}
+
 static void *shm_map_resolve(void *p, size_t size) {
 	struct vm_area_struct *vma;
+	struct re_shm *shm;
+
 	// XXX is there a better way to map this to the kernel address?
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
 	vma = vma_lookup(current->mm, (unsigned long) p);
@@ -1992,13 +2032,13 @@ static void *shm_map_resolve(void *p, size_t size) {
 #endif
 	if (!vma)
 		return NULL;
-	if (!vma->vm_private_data)
+	if (!(shm = vma->vm_private_data))
 		return NULL;
 	if ((unsigned long) p + size > vma->vm_end || (unsigned long) p + size < vma->vm_start)
 		return NULL;
 	if (vma->vm_ops != &vm_mmap_ops)
 		return NULL;
-	return vma->vm_private_data + ((unsigned long) p - (unsigned long) vma->vm_start);
+	return shm->head + ((unsigned long) p - (unsigned long) vma->vm_start);
 }
 
 
@@ -2785,15 +2825,15 @@ static ssize_t proc_main_control_write(struct file *file, const char __user *buf
 
 
 static int proc_control_mmap(struct file *file, struct vm_area_struct *vma) {
-	size_t size, order;
+	size_t size;
 	unsigned long pfn;
-	struct page *page;
 	void *pages;
 	uint32_t id;
 	struct rtpengine_table *t;
 	int ret;
 	struct re_shm *shm;
 	struct inode *inode;
+	size_t offset;
 
 	// verify arguments
 	if ((vma->vm_flags & VM_EXEC))
@@ -2811,57 +2851,66 @@ static int proc_control_mmap(struct file *file, struct vm_area_struct *vma) {
 	if ((size & (size - 1)) != 0)
 		return -EIO;
 
-	order = __fls((unsigned long) size); // size = 256 -> order = 8
-	if (1 << order != size)
-		return -ENXIO;
+	// is it a multiple of the page size?
+	if ((size & (PAGE_SIZE - 1)) != 0)
+		return -EIO;
 
-	// adjust order to page size
-	if (order < PAGE_SHIFT)
-		return -E2BIG;
-	order -= PAGE_SHIFT;
-
-	// ok, allocate pages
-	page = alloc_pages(GFP_KERNEL_ACCOUNT, order);
-	if (!page)
+	// ok, allocate
+	pages = vmalloc(size);
+	if (!pages)
 		return -ENOMEM;
 
-	pages = page_address(page);
+	// make sure what we got is page-aligned
+	if (((size_t) pages & (PAGE_SIZE - 1)) != 0) {
+		vfree(pages);
+		return -EAGAIN;
+	}
 
 	shm = kzalloc(sizeof(*shm), GFP_KERNEL);
 	if (!shm) {
-		free_pages((unsigned long) pages, order);
+		vfree(pages);
 		return -ENOMEM;
 	}
-
-	shm->head = pages;
-	shm->size = size;
-	shm->order = order;
 
 	// get our table
 	inode = file->f_path.dentry->d_inode;
 	id = (uint32_t) (unsigned long) PDE_DATA(inode);
 	t = get_table(id);
 	if (!t) {
-		free_pages((unsigned long) pages, order);
+		vfree(pages);
 		kfree(shm);
 		return -ENOENT;
 	}
 
-	pfn = virt_to_phys(pages) >> PAGE_SHIFT;
-	vma->vm_private_data = pages; // remember kernel-space address
+	shm->head = pages;
+	atomic_set(&shm->users, 1);
+	shm->table = t;
+
+	vma->vm_private_data = shm;
 	vma->vm_ops = &vm_mmap_ops;
 
-	ret = remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+	// remap to userspace, page by page
+	for (offset = 0; offset < size; offset += PAGE_SIZE) {
+		pfn = vmalloc_to_pfn(pages + offset);
+		ret = remap_pfn_range(vma, vma->vm_start + offset, pfn, PAGE_SIZE, vma->vm_page_prot);
 
-	if (ret == 0) {
-		spin_lock(&t->shm_lock);
-		list_add(&shm->list_entry, &t->shm_list);
-		spin_unlock(&t->shm_lock);
+		if (ret) {
+			vfree(pages);
+			kfree(shm);
+			table_put(t);
+			return ret;
+		}
 	}
+
+	// all done
+
+	spin_lock(&t->shm_lock);
+	list_add(&shm->list_entry, &t->shm_list);
+	spin_unlock(&t->shm_lock);
 
 	table_put(t);
 
-	return ret;
+	return 0;
 }
 
 static int proc_control_open(struct inode *inode, struct file *file) {
@@ -5826,17 +5875,17 @@ static inline int srtcp_decrypt(struct re_crypto_context *c,
 }
 
 
-static inline int is_muxed_rtcp(struct sk_buff *skb) {
+static inline bool is_muxed_rtcp(struct sk_buff *skb) {
 	// XXX shared code
 	unsigned char m_pt;
 	if (skb->len < 8) // minimum RTCP size
-		return 0;
+		return false;
 	m_pt = skb->data[1];
 	if (m_pt < 194)
-		return 0;
+		return false;
 	if (m_pt > 223)
-		return 0;
-	return 1;
+		return false;
+	return true;
 }
 static inline int is_rtcp_fb_packet(struct sk_buff *skb) {
 	unsigned char m_pt;
@@ -6025,8 +6074,12 @@ static bool proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_outpu
 		return true;
 	}
 
-	// pattern rewriting
 	if (rtp_pt_idx >= 0) {
+		// blackhole?
+		if (o->output.pt_output[rtp_pt_idx].blackhole)
+			return false;
+
+		// pattern rewriting
 		if (o->output.pt_output[rtp_pt_idx].min_payload_len
 				&& rtp->payload_len < o->output.pt_output[rtp_pt_idx].min_payload_len)
 			return false;
@@ -6270,21 +6323,8 @@ static unsigned int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 	rtp.rtcp = 0;
 	is_rtcp = NOT_RTCP;
 	if (g->target.rtp) {
-		if (g->target.rtcp) {
-			if (g->target.rtcp_mux) {
-				if (is_muxed_rtcp(skb))
-					is_rtcp = RTCP;
-			}
-			else
-				is_rtcp = RTCP;
-		}
-
-		if (is_rtcp == NOT_RTCP) {
-			parse_rtp(&rtp, skb);
-			if (!rtp.ok && g->target.rtp_only)
-				goto out; // pass to userspace
-		}
-		else {
+		if (is_muxed_rtcp(skb)) {
+			is_rtcp = RTCP;
 			if (g->target.rtcp_fb_fw && is_rtcp_fb_packet(skb))
 				; // forward and then drop
 			else if (g->target.rtcp_fw)
@@ -6295,6 +6335,12 @@ static unsigned int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 			parse_rtcp(&rtp, skb);
 			if (!rtp.rtcp)
 				goto out;
+		}
+		else {
+			// not RTCP
+			parse_rtp(&rtp, skb);
+			if (!rtp.ok && g->target.rtp_only)
+				goto out; // pass to userspace
 		}
 	}
 	if (rtp.ok) {

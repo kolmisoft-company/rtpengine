@@ -218,6 +218,7 @@ enum {
  * if not set, then inactive.
  */
 #define MEDIA_FLAG_REAL_SENDONLY		(1LL << 35)
+#define MEDIA_FLAG_SELECT_PT			(1LL << 36)
 
 /* struct call_monologue */
 #define ML_FLAG_REC_FORWARDING			(1LL << 16)
@@ -557,6 +558,7 @@ struct call_media {
 	int			maxptime;			/* from SDP */
 
 	atomic64		media_flags;
+	unsigned int		update_iter;
 };
 
 TYPED_GPTRARRAY(medias_arr, struct call_media)
@@ -798,6 +800,7 @@ struct call {
 	enum block_dtmf_mode	block_dtmf;
 
 	atomic64		call_flags;
+	unsigned int		update_iter;
 	unsigned int media_rec_slots;
 };
 
@@ -828,6 +831,7 @@ struct packet_stream *__packet_stream_new(call_t *call);
 __attribute__((nonnull(1, 2)))
 struct media_subscription *__add_media_subscription(struct call_media * which, struct call_media * to,
 		const struct sink_attrs *attrs);
+bool __unsubscribe_media(struct call_media * which, struct call_media * from);
 struct media_subscription *call_ml_get_top_ms(struct call_monologue *ml);
 bool call_ml_sendonly_inactive(struct call_monologue *ml);
 struct media_subscription *call_media_get_top_ms(struct call_media * cm);
@@ -851,6 +855,9 @@ int call_get_mono_dialogue(struct call_monologue *monologues[2], call_t *call,
 		sdp_ng_flags *);
 struct call_monologue *call_get_monologue(call_t *call, const str *fromtag);
 struct call_monologue *call_get_or_create_monologue(call_t *call, const str *fromtag);
+__attribute__((nonnull(1, 2, 4, 5, 6)))
+struct call_media *call_make_transform_media(struct call_monologue *ml, const str *type, enum media_type type_id,
+		const str *media_id, const endpoint_t *remote, const str *interface);
 __attribute__((nonnull(1)))
 call_t *call_get(const str *callid);
 typedef enum { CG2_OK, CG2_NF1, CG2_NF2, CG2_SAME } call_get2_ret_t;
@@ -869,6 +876,7 @@ int monologue_subscribe_answer(struct call_monologue *dst, sdp_ng_flags *flags,
 		sdp_streams_q *streams);
 int monologue_unsubscribe(struct call_monologue *dst, sdp_ng_flags *);
 void dialogue_connect(struct call_monologue *, struct call_monologue *, sdp_ng_flags *);
+bool monologue_transform(struct call_monologue *, sdp_ng_flags *, medias_q *);
 void monologue_destroy(struct call_monologue *ml);
 int call_delete_branch_by_id(const str *callid, const str *branch,
 	const str *fromtag, const str *totag, ng_command_ctx_t *, int delete_delay);
@@ -940,7 +948,7 @@ INLINE void call_memory_arena_release(void) {
 		return;
 	obj_put(call_memory_arena);
 	call_memory_arena = NULL;
-	memory_arena = NULL;
+	memory_arena = &rtpe_arena;
 }
 INLINE void call_memory_arena_set(call_t *c) {
 	call_memory_arena_release();

@@ -31,9 +31,25 @@ struct sink_handler;
 typedef int codec_handler_func(struct codec_handler *, struct media_packet *);
 
 
+struct codec_handler_index {
+	int payload_type;
+	struct call_media *sink;
+};
+
+struct codec_pipeline_index {
+	rtp_payload_type src;
+	rtp_payload_type dst;
+};
+
 struct codec_handler {
-	rtp_payload_type source_pt; // source_pt.payload_type = hashtable index
-	rtp_payload_type dest_pt;
+	union {
+		struct codec_pipeline_index pi;
+		struct {
+			rtp_payload_type source_pt;
+			rtp_payload_type dest_pt;
+		};
+	};
+	struct codec_handler_index i;
 	int dtmf_payload_type;
 	int real_dtmf_payload_type;
 	int cn_payload_type;
@@ -42,6 +58,7 @@ struct codec_handler {
 	bool kernelize:1;
 	bool transcoder:1;
 	bool pcm_dtmf_detect:1;
+	bool blackhole:1;
 
 	size_t payload_len; // for short-packet blocking
 
@@ -49,7 +66,6 @@ struct codec_handler {
 	struct codec_handler *input_handler; // == main handler for supp codecs
 	struct codec_handler *output_handler; // == self, or other PT handler
 	struct call_media *media;
-	struct call_media *sink;
 #ifdef WITH_TRANSCODING
 	int (*packet_encoded)(encoder_t *enc, void *u1, void *u2);
 	int (*packet_decoded)(decoder_t *, AVFrame *, void *, void *);
@@ -60,8 +76,13 @@ struct codec_handler {
 	// for DTMF injection
 	struct codec_handler *dtmf_injector;
 	struct delay_buffer *delay_buffer;
+	// for remote transcoding
+	struct transcode_config *tcc;
+	struct transform_handler *transform;
 
 	// stats entry
+	const char *stats_chain_suffix;
+	const char *stats_chain_suffix_brief;
 	char *stats_chain;
 	struct codec_stats *stats_entry;
 };
@@ -84,6 +105,21 @@ struct codec_scheduler {
 	struct timeval first_send;
 	unsigned long first_send_ts;
 	long output_skew;
+};
+
+struct transcode_config {
+	char *src; // unparsed
+	char *dst; // unparsed
+
+	char *name; // of the config section
+
+	struct codec_pipeline_index i; // parsed
+
+	// verdict
+	endpoint_t transform;
+	str local_interface;
+	str remote_interface;
+	//const sockfamily_t *address_family;
 };
 
 typedef union {
@@ -190,6 +226,8 @@ struct chu_args {
 #define codec_handlers_update(r, s, ...) \
 	__codec_handlers_update(r, s, (struct chu_args) {__VA_ARGS__})
 
+bool codec_handler_transform(struct call_media *r, ng_codecs_q *);
+
 #ifdef WITH_TRANSCODING
 
 void ensure_codec_def(rtp_payload_type *pt, struct call_media *media);
@@ -218,19 +256,20 @@ void codec_output_rtp(struct media_packet *mp, struct codec_scheduler *,
 		unsigned long ts_delay);
 
 
-INLINE struct codec_handler __codec_handler_lookup_struct(int pt, struct call_media *sink) {
-	struct codec_handler lookup = {
-		.source_pt = {
-			.payload_type = pt,
-		},
+INLINE struct codec_handler_index __codec_handler_lookup_struct(int pt, struct call_media *sink) {
+	struct codec_handler_index lookup = {
+		.payload_type = pt,
 		.sink = sink,
 	};
 	return lookup;
 }
 INLINE struct codec_handler *codec_handler_lookup(codec_handlers_ht ht, int pt, struct call_media *sink) {
-	struct codec_handler lookup = __codec_handler_lookup_struct(pt, sink);
+	struct codec_handler_index lookup = __codec_handler_lookup_struct(pt, sink);
 	return t_hash_table_lookup(ht, &lookup);
 }
+
+
+extern transcode_config_ht rtpe_transcode_config;
 
 
 

@@ -78,6 +78,7 @@ struct rtpengine_pt_output {
 	unsigned int min_payload_len;
 	char replace_pattern[16];
 	unsigned char replace_pattern_len;
+	unsigned int blackhole:1;
 };
 
 struct rtpengine_target_info {
@@ -98,7 +99,7 @@ struct rtpengine_target_info {
 	struct interface_stats_block	*iface_stats; // for ingress stats
 	struct stream_stats		*stats; // for ingress stats
 
-	unsigned int			rtcp_mux:1,
+	unsigned int			__unused1:1,
 					dtls:1,
 					stun:1,
 					rtp:1,

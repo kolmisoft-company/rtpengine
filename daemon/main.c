@@ -60,6 +60,7 @@
 #include "bufferpool.h"
 #include "log_funcs.h"
 #include "uring.h"
+#include "ng_client.h"
 
 
 
@@ -79,6 +80,7 @@ static GQueue rtpe_cli = G_QUEUE_INIT;
 GQueue rtpe_control_ng = G_QUEUE_INIT;
 GQueue rtpe_control_ng_tcp = G_QUEUE_INIT;
 struct bufferpool *shm_bufferpool;
+memory_arena_t rtpe_arena;
 
 struct rtpengine_config rtpe_config = {
 	// non-zero defaults
@@ -122,6 +124,8 @@ struct rtpengine_config rtpe_config = {
 	.max_recv_iters = MAX_RECV_ITERS,
 	.kernel_player_media = 128,
 	.timer_accuracy = 500,
+	.ng_client_timeout = 50, // ms, will be scaled to us by *1000
+	.ng_client_retries = 5,
 };
 
 struct interface_config_callback_arg {
@@ -410,6 +414,46 @@ static void add_if_from_config(const char *name, charp_ht ht, struct interface_c
 		die("Failed to parse interface information '%s' from config file", orig_name);
 }
 
+struct transcode_config_callback_arg {
+	transcode_config_q q;
+};
+
+static void do_transcode_config(const char *name, charp_ht ht, struct transcode_config_callback_arg *a) {
+	char *src = t_hash_table_lookup(ht, "source");
+	if (!src)
+		die("Transcode config '%s' has no 'source' set", name);
+	char *dst = t_hash_table_lookup(ht, "destination");
+	if (!dst)
+		die("Transcode config '%s' has no 'destination' set", name);
+
+	__auto_type tc = g_new0(struct transcode_config, 1);
+	tc->name = g_strdup(name);
+	t_queue_push_tail(&a->q, tc);
+
+	tc->src = g_strdup(src);
+	tc->dst = g_strdup(dst);
+
+	if (!codec_parse_payload_type(&tc->i.src, STR_PTR(tc->src)))
+		die("Failed to parse source codec '%s' in transcode config '%s'", src, name);
+	if (!codec_parse_payload_type(&tc->i.dst, STR_PTR(tc->dst)))
+		die("Failed to parse source codec '%s' in transcode config '%s'", src, name);
+
+	char *tfm = t_hash_table_lookup(ht, "transform");
+	if (tfm) {
+		if (!endpoint_parse_any_getaddrinfo_full(&tc->transform, tfm))
+			die("Failed to parse transform endpoint '%s' in transcode config '%s'", tfm, name);
+		char *iface = t_hash_table_lookup(ht, "local-interface");
+		if (iface)
+			tc->local_interface = STR(iface);
+		iface = t_hash_table_lookup(ht, "remote-interface");
+		if (iface)
+			tc->remote_interface = STR(iface);
+		return;
+	}
+	else
+		die("Transcode config '%s' has no verdict", name);
+}
+
 static bool if_addr_parse(intf_config_q *q, char *s, struct ifaddrs *ifas) {
 	str name;
 	char *c;
@@ -618,6 +662,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	g_autoptr(char) redis_format = NULL;
 	g_autoptr(char) templates_section = NULL;
 	g_autoptr(char) interfaces_config = NULL;
+	g_autoptr(char) transcode_config = NULL;
 
 	GOptionEntry e[] = {
 		{ "table",	't', 0, G_OPTION_ARG_INT,	&rtpe_config.kernel_table,		"Kernel table to use",		"INT"		},
@@ -768,6 +813,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "audio-buffer-length",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_length,"Length in milliseconds of audio buffer","INT"},
 		{ "audio-buffer-delay",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_delay,"Initial delay in milliseconds for buffered audio","INT"},
 		{ "audio-player",0,0,	G_OPTION_ARG_STRING,	&use_audio_player,	"When to enable the internal audio player","on-demand|play-media|transcoding|always"},
+		{ "transcode-config",0,0,G_OPTION_ARG_STRING,	&transcode_config,	"Config section to use for transcoding rules","STR"},
 #endif
 #ifdef HAVE_MQTT
 		{ "mqtt-host",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.mqtt_host,	"Mosquitto broker host or address",	"HOST|IP"},
@@ -804,6 +850,8 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "vsc-pause-resume-rec",0,0,G_OPTION_ARG_STRING,&rtpe_config.vsc_pause_resume_rec.s,"DTMF VSC to pause/resume recording.", "STRING"},
 		{ "vsc-start-pause-resume-rec",0,0,G_OPTION_ARG_STRING,&rtpe_config.vsc_start_pause_resume_rec.s,"DTMF VSC to start/pause/resume recording.", "STRING"},
 
+		{ "ng-client-timeout",0,0,G_OPTION_ARG_INT,	&rtpe_config.ng_client_timeout,"Timeout in milliseconds for outgoing NG requests","INT"},
+		{ "ng-client-retries",0,0,G_OPTION_ARG_INT,	&rtpe_config.ng_client_retries,"How often to retry a timed-out NG request","INT"},
 		{ NULL, }
 	};
 
@@ -817,6 +865,8 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	// rtpe_config.interface. This is to ensure predictable ordering, and also because
 	// global port-min/max may not be set yet.
 	intf_config_q icq = TYPED_GQUEUE_INIT;
+
+	struct transcode_config_callback_arg tcca = { .q = TYPED_GQUEUE_INIT };
 
 	config_load_ext(argc, argv, e, " - next-generation media proxy",
 			"/etc/rtpengine/rtpengine.conf", "rtpengine", &rtpe_config.common,
@@ -838,6 +888,14 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 					.file_groups = {
 						.prefix = &interfaces_config,
 						.callback = add_if_from_config,
+					},
+				},
+				{
+					.type = RCC_FILE_GROUPS,
+					.arg.tcca = &tcca,
+					.file_groups = {
+						.prefix = &transcode_config,
+						.callback = do_transcode_config,
 					},
 				},
 				{ 0 },
@@ -1285,8 +1343,15 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	if (rtpe_config.timer_accuracy < 0)
 		die("Invalid --timer-accuracy value (%d)", rtpe_config.timer_accuracy);
 
-	// everything OK, do post-processing
+	if (rtpe_config.ng_client_timeout <= 0)
+		die("Invalid value for 'ng-client-timeout'");
+	rtpe_config.ng_client_timeout *= 1000; // from ms to us
+	if (rtpe_config.ng_client_retries <= 0)
+		die("Invalid value for 'ng-client-retries'");
 
+	rtpe_config.transcode_config = tcca.q;
+
+	// everything OK, do post-processing
 }
 
 static void fill_initial_rtpe_cfg(struct rtpengine_config* ini_rtpe_cfg) {
@@ -1387,6 +1452,8 @@ RTPE_CONFIG_CHARPP_PARAMS
 
 static void early_init(void) {
 	socket_init(); // needed for socktype_udp
+	memory_arena_init(&rtpe_arena);
+	memory_arena = &rtpe_arena;
 }
 
 #ifdef WITH_TRANSCODING
@@ -1634,6 +1701,8 @@ static void create_everything(void) {
 			die("Failed to preload media from database into cache");
 
 	}
+
+	ng_client_init();
 }
 
 
@@ -1863,10 +1932,12 @@ int main(int argc, char **argv) {
 	nftables_shutdown(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
 			(nftables_args){.family = rtpe_config.nftables_family});
 #endif
+	ng_client_cleanup();
 	bufferpool_destroy(shm_bufferpool);
 	kernel_shutdown_table();
 	options_free();
 	bufferpool_cleanup();
+	memory_arena_free(&rtpe_arena);
 
 	return 0;
 }

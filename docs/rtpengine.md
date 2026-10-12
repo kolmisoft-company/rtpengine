@@ -1496,6 +1496,19 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     affinity). If this option is set to a negative number, then the number of
     available CPU cores will be used.
 
+- __\-\ng-client-timeout=__*INT*
+- __\-\ng-client-retries=__*INT*
+
+    For requests sent to another NG peer, configure timeout and maximum number
+    of retries. The timeout is in milliseconds, must be larger than zero, and
+    defaults to 50. The number of retries must be larger than zero and defaults
+    to 5.
+
+- __\-\-transcode-config=__*STR*
+
+    Sets the prefix for sections in the config file to use for transcode
+    configurations. See section *TRANSCODE CONFIG* below.
+
 ## INTERFACES
 
 This section describes the legacy syntax for configuring interfaces, which can
@@ -1816,6 +1829,43 @@ __offer__ or __start recording__), or the special name __default__ which is a
 template that is applied to all signalling messages. These templates are
 automatically applied without needing to refer to them by name using
 __template=...__ from within the signalling message.
+
+## TRANSCODE CONFIG
+
+If the setting __transcode-config__ is set to a non-empty string, then
+*rtpengine* will look for sections in the configuration file starting with the
+given prefix strings (plus a dash) to use as transcode configurations. For
+example, if __transcode-config = tx__ is set, then sections in the config file
+such as __tx-1__ or __tx-foobar__ will be considered as transcode
+configurations. The names of all sections in the config file must be unique.
+
+Each transcoding section must list a source codec as __source=...__ and a
+destination codec as __destination=...__. Codecs can be named simply by their
+basic name (such as __PCMA__) or with a complete SDP-like definition (such as
+__opus/48000/2__). Each section must also list an action or a verdict.
+
+For example, if __source=PCMU__ and __destination=PCMA__ are set, then this
+particular transcoding config section would be considered if the received codec
+is PCMU and the requested output codec is PCMA.
+
+### __transform__ Verdict
+
+To use the __transform__ verdict, the config key __transform=...__ must be set.
+The value is a remote NG peer endpoint, such as the NG control port of another
+*rtpengine* instance, in the usual *address:port* notation. This tells
+*rtpengine* to send a __transform__ NG request to the remote peer, to request
+remotely transcoding the media. If successful, *rtpengine* will forward the
+unmodified media stream to the remote peer, to the address and port received
+from the NG response, and will expect the transcoded media to be sent back in
+return, which it will then forward to its appropriate destination. In other
+words, it facilitates a designated remote transcoding node, instead of doing
+the transcoding locally.
+
+Optional config keys that can be set are __local-interface=...__ to select the
+local interface to use to communicate with the remote transform gateway,
+__remote-interface=...__ to tell the remote gateway to use a particular
+interface on its side, and __address-family=...__ to select between IPv4 and
+IPv6.
 
 ## EXIT STATUS
 

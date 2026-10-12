@@ -1438,13 +1438,6 @@ static void stream_fd_closed(int fd, void *p) {
 
 
 
-/* returns: 0 = not a muxed stream, 1 = muxed, RTP, 2 = muxed, RTCP */
-static int rtcp_demux(const str *s, struct call_media *media) {
-	if (!MEDIA_ISSET(media, RTCP_MUX))
-		return 0;
-	return rtcp_demux_is_rtcp(s) ? 2 : 1;
-}
-
 static int call_avp2savp_rtp(str *s, struct packet_stream *stream, struct ssrc_ctx *ssrc_ctx)
 {
 	return rtp_avp2savp(s, &stream->crypto, ssrc_ctx);
@@ -1516,60 +1509,43 @@ static int __rtp_stats_pt_sort(const struct rtp_stats **a, const struct rtp_stat
 }
 
 
-/**
- * The linkage between userspace and kernel module is in the kernelize_one().
- * 
- * Called with in_lock held.
- * sink_handler can be NULL.
- */
-static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *outputs,
-		struct packet_stream *stream, struct sink_handler *sink_handler, sink_handler_q *sinks,
-		rtp_stats_arr **payload_types)
-{
-	struct rtpengine_destination_info *redi = NULL;
-	call_t *call = stream->call;
-	struct call_media *media = stream->media;
-	struct packet_stream *sink = sink_handler ? sink_handler->sink : NULL;
-	bool non_forwarding = false;
-	bool blackhole = false;
+TYPED_GQUEUE(kernel_output, struct rtpengine_destination_info)
 
-	if (sink_handler) {
-		if (MEDIA_ISSET(sink->media, BLOCK_EGRESS))
-			return NULL;
-		sink_handler->kernel_output_idx = -1;
-	}
+typedef struct {
+	struct rtpengine_target_info reti;
+	kernel_output_q outputs;
+	rtp_stats_arr *payload_types;
+	bool blackhole;
+	bool non_forwarding;
+	bool silenced;
+	bool manipulate_pt;
+} kernelize_state;
+
+static void kernelize_state_clear(kernelize_state *s) {
+	rtp_stats_arr_destroy_ptr(s->payload_types);
+	t_queue_clear_full(&s->outputs,
+			(void (*)(struct rtpengine_destination_info *)) g_free); // should always be empty
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(kernelize_state, kernelize_state_clear)
+
+
+__attribute__((nonnull(1, 2)))
+static const char *kernelize_target(kernelize_state *s, struct packet_stream *stream) {
+	struct call_media *media = stream->media;
 
 	if (MEDIA_ISSET(media, BLACKHOLE))
-		blackhole = true;
-	else if (!sink_handler)
-		blackhole = true;
+		s->blackhole = true;
 
-	if (blackhole)
-		non_forwarding = true;
+	if (s->blackhole)
+		s->non_forwarding = true;
 
-	if (sink && !sink->endpoint.address.family)
-		return NULL;
+	ilog(LOG_INFO, "Kernelizing media stream: remote %s%s%s -> local %s",
+			FMT_M(endpoint_print_buf(&stream->endpoint)),
+			endpoint_print_buf(&stream->selected_sfd->socket.local));
 
-	if (sink && sink->selected_sfd)
-		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s | %s -> %s%s%s",
-				FMT_M(endpoint_print_buf(&stream->endpoint)),
-				endpoint_print_buf(&stream->selected_sfd->socket.local),
-				endpoint_print_buf(&sink->selected_sfd->socket.local),
-				FMT_M(endpoint_print_buf(&sink->endpoint)));
-	else
-		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s -> void",
-				FMT_M(endpoint_print_buf(&stream->endpoint)),
-				endpoint_print_buf(&stream->selected_sfd->socket.local));
-
-	const struct streamhandler *handler = __determine_handler(stream, sink_handler);
-
-	if (!handler->in->kernel || !handler->out->kernel)
-		return "protocol not supported by kernel module";
-
-	// fill input if needed
-
-	if (reti->local.family)
-		goto output;
+	// fill input
+	__auto_type reti = &s->reti;
 
 	if (PS_ISSET2(stream, STRICT_SOURCE, MEDIA_HANDOVER)) {
 		mutex_lock(&stream->out_lock);
@@ -1584,18 +1560,49 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 	__re_address_translate_ep(&reti->local, &stream->selected_sfd->socket.local);
 	reti->iface_stats = stream->selected_sfd->local_intf->stats;
 	reti->stats = stream->stats_in;
-	reti->rtcp_mux = MEDIA_ISSET(media, RTCP_MUX);
 	reti->rtcp = PS_ISSET(stream, RTCP);
 	reti->dtls = MEDIA_ISSET(media, DTLS);
 	reti->stun = media->ice_agent ? 1 : 0;
-	reti->non_forwarding = non_forwarding ? 1 : 0;
-	reti->blackhole = blackhole ? 1 : 0;
+	reti->non_forwarding = s->non_forwarding ? 1 : 0;
+	reti->blackhole = s->blackhole ? 1 : 0;
 	reti->rtp_stats = (rtpe_config.measure_rtp
 			|| MEDIA_ISSET(media, RTCP_GEN) || (mqtt_publish_scope() != MPS_NONE)) ? 1 : 0;
+
+	// Grab the first stream handler for our decryption function.
+	// __determine_handler is in charge of only returning a NULL decrypter if it is
+	// in fact a pure passthrough for all sinks.
+	const struct streamhandler *handler = NULL;
+
+	for (__auto_type l = stream->rtp_sinks.head; l; l = l->next) {
+		handler = __determine_handler(stream, l->data);
+		if (handler)
+			break;
+	}
+
+	if (!handler) {
+		for (__auto_type l = stream->rtcp_sinks.head; l; l = l->next) {
+			handler = __determine_handler(stream, l->data);
+			if (handler)
+				break;
+		}
+	}
+
+	if (!handler) {
+		// nothing to forward
+		s->non_forwarding = true;
+		s->blackhole = true;
+		return NULL;
+	}
+
+	if (!handler->in->kernel)
+		return "protocol not supported by kernel module";
 
 	handler->in->kernel(&reti->decrypt, stream);
 	if (!reti->decrypt.cipher || !reti->decrypt.hmac)
 		return "decryption cipher or HMAC not supported by kernel module";
+
+	s->silenced = CALL_ISSET(media->call, SILENCE_MEDIA) || ML_ISSET(media->monologue, SILENCE_MEDIA);
+	s->manipulate_pt = s->silenced || ML_ISSET(media->monologue, BLOCK_SHORT);
 
 	reti->track_ssrc = 1;
 	for (unsigned int u = 0; u < G_N_ELEMENTS(stream->ssrc_in); u++) {
@@ -1605,87 +1612,127 @@ static const char *kernelize_one(struct rtpengine_target_info *reti, GQueue *out
 		}
 	}
 
-	if (proto_is_rtp(media->protocol)) {
-		reti->rtp = 1;
-		reti->ssrc_req = 1;
-		if (!MEDIA_ISSET(media, TRANSCODING)) {
-			reti->rtcp_fw = 1;
-			if (media->protocol->avpf)
-				reti->rtcp_fb_fw = 1;
-		}
-	}
-
-	if (reti->rtp && sinks && sinks->length && payload_types) {
-		struct rtp_stats *rs;
-
-		// this code is execute only once: list therefore must be empty
-		assert(*payload_types == NULL);
-		// create sorted list of payload types
-		unsigned int num_pts = t_hash_table_size(stream->rtp_stats);
-		*payload_types = rtp_stats_arr_new_sized(num_pts);
-		(*payload_types)->len = num_pts;
-		rtp_stats_ht_iter iter;
-		t_hash_table_iter_init(&iter, stream->rtp_stats);
-		unsigned int i = 0;
-		while (t_hash_table_iter_next(&iter, NULL, &rs))
-			(*payload_types)->pdata[i++] = rs;
-		t_ptr_array_sort(*payload_types, __rtp_stats_pt_sort);
-		for (i = 0; i < num_pts; i++) {
-			if (reti->num_payload_types >= G_N_ELEMENTS(reti->pt_stats)) {
-				ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Too many RTP payload types for kernel module");
-				break;
-			}
-			rs = (*payload_types)->pdata[i];
-			// only add payload types that are passthrough for all sinks
-			bool can_kernelize = true;
-			for (__auto_type k = sinks->head; k; k = k->next) {
-				struct sink_handler *ksh = k->data;
-				struct packet_stream *ksink = ksh->sink;
-				struct codec_handler *ch = codec_handler_get(media, rs->payload_type,
-						ksink->media, ksh);
-				if (ch->kernelize)
-					continue;
-				can_kernelize = false;
-				break;
-			}
-			if (!can_kernelize) {
-				reti->pt_filter = 1;
-				// ensure that the final list in *payload_types reflects the payload
-				// types populated in reti->payload_types
-				t_ptr_array_remove_index(*payload_types, i);
-				continue;
-			}
-
-			reti->pt_stats[reti->num_payload_types] = rs;
-			reti->num_payload_types++;
-		}
-	}
-	else {
-		if (sink_handler && sink_handler->attrs.transcoding)
-			return NULL;
-	}
-
 	recording_stream_kernel_info(stream, reti);
 
-output:
-	// output section: any output at all?
-	if (non_forwarding || !sink || !sink->selected_sfd)
+	if (!proto_is_rtp(media->protocol))
+		return NULL; // everything below is RTP-specific
+
+	reti->rtp = 1;
+	reti->ssrc_req = 1;
+	if (!MEDIA_ISSET(media, TRANSCODING)) {
+		reti->rtcp_fw = 1;
+		if (media->protocol->avpf)
+			reti->rtcp_fb_fw = 1;
+	}
+
+	// handle known RTP payload types:
+	// create sorted list of payload types
+	unsigned int num_pts = t_hash_table_size(stream->rtp_stats);
+	s->payload_types = rtp_stats_arr_new_sized(num_pts);
+	s->payload_types->len = num_pts;
+
+	rtp_stats_ht_iter iter;
+	t_hash_table_iter_init(&iter, stream->rtp_stats);
+	unsigned int i = 0;
+	struct rtp_stats *rs;
+	while (t_hash_table_iter_next(&iter, NULL, &rs))
+		s->payload_types->pdata[i++] = rs;
+	t_ptr_array_sort(s->payload_types, __rtp_stats_pt_sort);
+
+	i = 0;
+	while (i < num_pts) {
+		if (reti->num_payload_types >= G_N_ELEMENTS(reti->pt_stats)) {
+			ilog(LOG_WARNING | LOG_FLAG_LIMIT, "Too many RTP payload types for kernel module");
+			break;
+		}
+		rs = s->payload_types->pdata[i];
+		// only add payload types that are passthrough for all sinks
+		bool can_kernelize = true;
+		for (__auto_type k = stream->rtp_sinks.head; k; k = k->next) {
+			struct sink_handler *ksh = k->data;
+
+			if (ksh->attrs.silence_media)
+				s->manipulate_pt = true;
+
+			struct packet_stream *ksink = ksh->sink;
+			struct codec_handler *ch = codec_handler_get(media, rs->payload_type,
+					ksink->media, ksh);
+
+			if (ch->blackhole)
+				s->manipulate_pt = true;
+			if (ch->kernelize)
+				continue;
+
+			can_kernelize = false;
+			break;
+		}
+		if (!can_kernelize) {
+			reti->pt_filter = 1;
+			// ensure that the final list in *payload_types reflects the payload
+			// types populated in reti->payload_types
+			t_ptr_array_remove_index(s->payload_types, i);
+			num_pts--;
+			continue;
+		}
+
+		reti->pt_stats[i] = rs;
+		i++;
+	}
+
+	reti->num_payload_types = num_pts;
+
+	return NULL;
+}
+
+__attribute__((nonnull(1, 2, 3)))
+static const char *kernelize_one(kernelize_state *s,
+		struct packet_stream *stream, struct sink_handler *sink_handler)
+{
+	call_t *call = stream->call;
+	struct call_media *media = stream->media;
+	struct packet_stream *sink = sink_handler->sink;
+
+	if (MEDIA_ISSET(sink->media, BLOCK_EGRESS))
+		return NULL;
+	sink_handler->kernel_output_idx = -1;
+
+	if (!sink->endpoint.address.family)
+		return NULL;
+
+	if (sink->selected_sfd)
+		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s | %s -> %s%s%s",
+				FMT_M(endpoint_print_buf(&stream->endpoint)),
+				endpoint_print_buf(&stream->selected_sfd->socket.local),
+				endpoint_print_buf(&sink->selected_sfd->socket.local),
+				FMT_M(endpoint_print_buf(&sink->endpoint)));
+	else
+		ilog(LOG_INFO, "Kernelizing media stream: %s%s%s -> %s -> void",
+				FMT_M(endpoint_print_buf(&stream->endpoint)),
+				endpoint_print_buf(&stream->selected_sfd->socket.local));
+
+	const struct streamhandler *handler = __determine_handler(stream, sink_handler);
+
+	if (!handler->out->kernel)
+		return "protocol not supported by kernel module";
+
+	__auto_type reti = &s->reti;
+
+	// any output at all?
+	if (s->non_forwarding || !sink->selected_sfd)
 		return NULL; // no output
 	if (!PS_ISSET(sink, FILLED))
 		return NULL;
 
 	// fill output struct
-	redi = g_slice_alloc0(sizeof(*redi));
+	__auto_type redi = g_new0(struct rtpengine_destination_info, 1);
 	redi->local = reti->local;
 	redi->output.tos = call->tos;
 
 	// PT manipulations
-	bool silenced = CALL_ISSET(call, SILENCE_MEDIA) || ML_ISSET(media->monologue, SILENCE_MEDIA)
-			|| sink_handler->attrs.silence_media;
-	bool manipulate_pt = silenced || ML_ISSET(media->monologue, BLOCK_SHORT);
-	if (manipulate_pt && payload_types) {
-		for (unsigned int i = 0; i < (*payload_types)->len; i++) {
-			__auto_type rs = (*payload_types)->pdata[i];
+	bool silenced = s->silenced || sink_handler->attrs.silence_media;
+	if (s->manipulate_pt && s->payload_types) {
+		for (unsigned int i = 0; i < s->payload_types->len; i++) {
+			__auto_type rs = s->payload_types->pdata[i];
 			struct rtpengine_pt_output *rpt = &redi->output.pt_output[i];
 			struct codec_handler *ch = codec_handler_get(media, rs->payload_type,
 					sink->media, sink_handler);
@@ -1703,17 +1750,14 @@ output:
 
 			if (ML_ISSET(media->monologue, BLOCK_SHORT) && ch->payload_len)
 				rpt->min_payload_len = ch->payload_len;
+
+			rpt->blackhole = ch->blackhole;
 		}
 
 	}
 
-	if (MEDIA_ISSET(media, ECHO))
+	if (MEDIA_ISSET(media, ECHO) || sink_handler->attrs.transcoding)
 		redi->output.ssrc_subst = 1;
-
-	if (sink_handler->attrs.transcoding) {
-		redi->output.ssrc_subst = 1;
-		reti->pt_filter = 1;
-	}
 
 	mutex_lock(&sink->out_lock);
 
@@ -1740,7 +1784,7 @@ output:
 	mutex_unlock(&sink->out_lock);
 
 	if (!redi->output.encrypt.cipher || !redi->output.encrypt.hmac) {
-		g_slice_free1(sizeof(*redi), redi);
+		g_free(redi);
 		return "encryption cipher or HMAC not supported by kernel module";
 	}
 
@@ -1748,21 +1792,19 @@ output:
 	redi->num = reti->num_destinations;
 	reti->num_destinations++;
 	sink_handler->kernel_output_idx = redi->num;
-	g_queue_push_tail(outputs, redi);
-	assert(outputs->length == reti->num_destinations);
+	t_queue_push_tail(&s->outputs, redi);
+	assert(s->outputs.length == reti->num_destinations);
 
 	return NULL;
 }
 // helper function for kernelize()
-static void kernelize_one_sink_handler(struct rtpengine_target_info *reti, GQueue *outputs,
-		struct packet_stream *stream, struct sink_handler *sink_handler, sink_handler_q *sinks,
-		rtp_stats_arr **payload_types)
+static void kernelize_one_sink_handler(kernelize_state *s,
+		struct packet_stream *stream, struct sink_handler *sink_handler)
 {
 	struct packet_stream *sink = sink_handler->sink;
 	if (PS_ISSET(sink, NAT_WAIT) && !PS_ISSET(sink, RECEIVED))
 		return;
-	const char *err = kernelize_one(reti, outputs, stream, sink_handler, &stream->rtp_sinks,
-			payload_types);
+	const char *err = kernelize_one(s, stream, sink_handler);
 	if (err)
 		ilog(LOG_WARNING, "No support for kernel packet forwarding available (%s)", err);
 }
@@ -1771,7 +1813,7 @@ void kernelize(struct packet_stream *stream) {
 	call_t *call = stream->call;
 	const char *nk_warn_msg;
 	struct call_media *media = stream->media;
-	g_autoptr(rtp_stats_arr) payload_types = NULL;
+	g_auto(kernelize_state) s = {0};
 
 	if (PS_ISSET(stream, KERNELIZED))
 		return;
@@ -1792,54 +1834,49 @@ void kernelize(struct packet_stream *stream) {
 	if (!stream->endpoint.address.family)
 		goto no_kernel;
 
-	struct rtpengine_target_info reti;
-	ZERO(reti); // reti.local.family determines if anything can be done
-	GQueue outputs = G_QUEUE_INIT;
+	const char *err = kernelize_target(&s, stream);
+	if (err)
+		ilog(LOG_WARNING, "No support for kernel packet forwarding available (%s)", err);
 
-	unsigned int num_sinks = stream->rtp_sinks.length + stream->rtcp_sinks.length;
-
-	if (num_sinks == 0) {
-		// add blackhole kernel rule
-		const char *err = kernelize_one(&reti, &outputs, stream, NULL, NULL, &payload_types);
-		if (err)
-			ilog(LOG_WARNING, "No support for kernel packet forwarding available (%s)", err);
+	// primary RTP sinks
+	for (__auto_type l = stream->rtp_sinks.head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		if (sh->attrs.block_media)
+			continue;
+		kernelize_one_sink_handler(&s, stream, sh);
 	}
-	else {
-		for (__auto_type l = stream->rtp_sinks.head; l; l = l->next) {
-			struct sink_handler *sh = l->data;
-			if (sh->attrs.block_media)
-				continue;
-			kernelize_one_sink_handler(&reti, &outputs, stream, sh, &stream->rtp_sinks,
-					&payload_types);
-		}
-		for (__auto_type l = stream->rtp_mirrors.head; l; l = l->next) {
-			struct sink_handler *sh = l->data;
-			kernelize_one_sink_handler(&reti, &outputs, stream, sh, &stream->rtp_sinks,
-					&payload_types);
-		}
-		// record number of RTP destinations
-		unsigned int num_rtp_dests = reti.num_destinations;
-		for (__auto_type l = stream->rtcp_sinks.head; l; l = l->next) {
-			struct sink_handler *sh = l->data;
-			kernelize_one_sink_handler(&reti, &outputs, stream, sh, &stream->rtp_sinks, NULL);
-		}
-		reti.num_rtcp_destinations = reti.num_destinations - num_rtp_dests;
+	// RTP egress mirrors
+	for (__auto_type l = stream->rtp_mirrors.head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		kernelize_one_sink_handler(&s, stream, sh);
 	}
+	// RTP -> RTCP sinks
+	// record number of RTP destinations up to now
+	unsigned int num_rtp_dests = s.reti.num_destinations;
+	// ignore RTP payload types
+	rtp_stats_arr_destroy_ptr(s.payload_types);
+	s.payload_types = NULL;
+	for (__auto_type l = stream->rtcp_sinks.head; l; l = l->next) {
+		struct sink_handler *sh = l->data;
+		kernelize_one_sink_handler(&s, stream, sh);
+	}
+	// mark the start of RTCP outputs
+	s.reti.num_rtcp_destinations = s.reti.num_destinations - num_rtp_dests;
 
-	if (!reti.local.family)
+	if (!s.reti.local.family)
 		goto no_kernel;
 
-	if (!outputs.length && !reti.non_forwarding) {
-		reti.non_forwarding = 1;
+	if (!s.outputs.length && !s.reti.non_forwarding) {
+		s.reti.non_forwarding = 1;
 		ilog(LOG_NOTICE | LOG_FLAG_LIMIT, "Setting 'non-forwarding' flag for kernel stream due to "
 				"lack of sinks");
 	}
 
-	kernel_add_stream(&reti);
+	kernel_add_stream(&s.reti);
 	struct rtpengine_destination_info *redi;
-	while ((redi = g_queue_pop_head(&outputs))) {
+	while ((redi = t_queue_pop_head(&s.outputs))) {
 		kernel_add_destination(redi);
-		g_slice_free1(sizeof(*redi), redi);
+		g_free(redi);
 	}
 
 	stream->kernel_time = rtpe_now.tv_sec;
@@ -2201,23 +2238,17 @@ static void media_packet_rtcp_demux(struct packet_handler_ctx *phc)
 {
 	phc->in_srtp = phc->mp.stream;
 	phc->sinks = &phc->mp.stream->rtp_sinks;
+
 	// is this RTCP?
-	if (PS_ISSET(phc->mp.stream, RTCP)) {
-		int is_rtcp = 1;
-		// plain RTCP or are we muxing?
-		if (MEDIA_ISSET(phc->mp.media, RTCP_MUX)) {
-			is_rtcp = 0;
-			int muxed_rtcp = rtcp_demux(&phc->s, phc->mp.media);
-			if (muxed_rtcp == 2) {
-				is_rtcp = 1;
-				if (phc->mp.stream->rtcp_sibling)
-					phc->in_srtp = phc->mp.stream->rtcp_sibling; // use RTCP SRTP context
-			}
-		}
-		if (is_rtcp) {
-			phc->sinks = &phc->mp.stream->rtcp_sinks;
-			phc->rtcp = true;
-		}
+	if (!proto_is_rtp(phc->mp.media->protocol))
+		return; // no
+
+	bool is_rtcp = rtcp_demux_is_rtcp(&phc->s);
+	if (is_rtcp) {
+		if (phc->mp.stream->rtcp_sibling)
+			phc->in_srtp = phc->mp.stream->rtcp_sibling; // use RTCP SRTP context
+		phc->sinks = &phc->mp.stream->rtcp_sinks;
+		phc->rtcp = true;
 	}
 }
 // out_srtp is set to point to the SRTP context to use

@@ -7,6 +7,7 @@
 #include "socket.h"
 #include "auxlib.h"
 #include "types.h"
+#include "arena.h"
 
 enum xmlrpc_format {
 	XF_SEMS = 0,
@@ -100,6 +101,8 @@ enum endpoint_learning {
 	X(db_expire) \
 	X(cache_expire) \
 	X(timer_accuracy) \
+	X(ng_client_timeout) \
+	X(ng_client_retries) \
 
 #define RTPE_CONFIG_UINT64_PARAMS \
 	X(bw_limit)
@@ -255,6 +258,7 @@ RTPE_CONFIG_CHARPP_PARAMS
 	enum xmlrpc_format	fmt;
 	enum log_format		log_format;
 	intf_config_q		interfaces;
+	transcode_config_q	transcode_config;
 	enum {
 		REDIS_FORMAT_BENCODE = 0,
 		REDIS_FORMAT_JSON,
@@ -318,6 +322,7 @@ extern GQueue rtpe_control_ng;
 extern GQueue rtpe_control_ng_tcp;
 
 extern struct bufferpool *shm_bufferpool;
+extern memory_arena_t rtpe_arena;
 
 
 #endif

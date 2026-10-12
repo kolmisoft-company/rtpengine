@@ -87,7 +87,7 @@ DAEMONSRCS+=	control_ng_flags_parser.c codec.c call.c ice.c kernel.c media_socke
 		dtls.c recording.c statistics.c rtcp.c redis.c iptables.c graphite.c \
 		cookie_cache.c udp_listener.c homer.c load.c cdr.c dtmf.c timerthread.c \
 		media_player.c jitter_buffer.c t38.c tcp_listener.c mqtt.c websocket.c \
-		audio_player.c arena.c
+		audio_player.c arena.c ng_client.c
 HASHSRCS+=	call_interfaces.c control_ng.c sdp.c janus.c
 LIBASM=		mvr2s_x64_avx2.S mvr2s_x64_avx512.S mix_in_x64_avx2.S mix_in_x64_avx512bw.S mix_in_x64_sse2.S
 endif
@@ -106,7 +106,8 @@ include ../lib/common.Makefile
 	daemon-tests-intfs daemon-tests-stats daemon-tests-delay-buffer daemon-tests-delay-timing \
 	daemon-tests-evs daemon-tests-player-cache daemon-tests-redis daemon-tests-redis-json \
 	daemon-tests-measure-rtp daemon-tests-mos-legacy daemon-tests-mos-fullband daemon-tests-config-file \
-	daemon-tests-templ-def daemon-tests-templ-def-offer daemon-tests-t38 daemon-tests-evs-dtx
+	daemon-tests-templ-def daemon-tests-templ-def-offer daemon-tests-t38 daemon-tests-evs-dtx \
+	daemon-tests-transform
 
 TESTS=		test-bitstr aes-crypt aead-aes-crypt test-const_str_hash.strhash
 ifeq ($(with_transcoding),yes)
@@ -148,7 +149,8 @@ daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-pubsub daemon-tests
 	daemon-tests-mos-fullband daemon-tests-config-file \
 	daemon-tests-templ-def daemon-tests-templ-def-offer \
 	daemon-tests-sdp-manipulations daemon-tests-sdes-manipulations \
-	daemon-tests-sdp-orig-replacements daemon-tests-moh daemon-tests-evs-dtx
+	daemon-tests-sdp-orig-replacements daemon-tests-moh daemon-tests-evs-dtx daemon-tests-transform \
+	daemon-tests-transcode-config
 
 daemon-test-deps:	tests-preload.so
 	$(MAKE) -C ../daemon
@@ -167,6 +169,12 @@ daemon-tests-dtx-cn:	daemon-test-deps
 
 daemon-tests-pubsub:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-pubsub.pl
+
+daemon-tests-transform:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-transform.pl
+
+daemon-tests-transcode-config:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-transcode-config.pl
 
 daemon-tests-stats:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-stats.pl
@@ -281,7 +289,7 @@ test-stats:	test-stats.o $(COMMONOBJS) codeclib.strhash.o resample.o codec.o ssr
 	streambuf.o cookie_cache.o udp_listener.o homer.o load.o cdr.o dtmf.o timerthread.o \
 	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o \
 	websocket.o cli.strhash.o mvr2s_x64_avx2.o mvr2s_x64_avx512.o audio_player.o mix_buffer.o \
-	mix_in_x64_avx2.o mix_in_x64_sse2.o mix_in_x64_avx512bw.o bufferpool.o uring.o arena.o
+	mix_in_x64_avx2.o mix_in_x64_sse2.o mix_in_x64_avx512bw.o bufferpool.o uring.o arena.o ng_client.o
 
 test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.strhash.o resample.o codec.o ssrc.o call.o ice.o helpers.o \
 	kernel.o media_socket.o stun.o bencode.o socket.o poller.o dtls.o recording.o statistics.o \
@@ -290,7 +298,7 @@ test-transcode:	test-transcode.o $(COMMONOBJS) codeclib.strhash.o resample.o cod
 	streambuf.o cookie_cache.o udp_listener.o homer.o load.o cdr.o dtmf.o timerthread.o \
 	media_player.o jitter_buffer.o dtmflib.o t38.o tcp_listener.o mqtt.o janus.strhash.o websocket.o \
 	cli.strhash.o mvr2s_x64_avx2.o mvr2s_x64_avx512.o audio_player.o mix_buffer.o \
-	mix_in_x64_avx2.o mix_in_x64_sse2.o mix_in_x64_avx512bw.o bufferpool.o uring.o arena.o
+	mix_in_x64_avx2.o mix_in_x64_sse2.o mix_in_x64_avx512bw.o bufferpool.o uring.o arena.o ng_client.o
 
 test-resample:	test-resample.o $(COMMONOBJS) codeclib.strhash.o resample.o dtmflib.o mvr2s_x64_avx2.o \
 	mvr2s_x64_avx512.o bencode.o
